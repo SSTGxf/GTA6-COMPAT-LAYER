@@ -56,6 +56,12 @@ SC_API HRESULT WaitFrameEventX(UINT64 frameId, DWORD timeoutMs) {
     return HleWaitFrameEventX(frameId, timeoutMs);
 }
 
+// NOTE: the software ray tracing entry points (ScSoftwareRT_*) are
+// defined in src/software_rt.cpp and exported via defs/d3d12_xs.def —
+// no wrappers here (a second definition would collide at link time).
+// The HLE registry (hle_registry.cpp) calls them through the Hle
+// wrappers.
+
 }  // namespace sc
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {

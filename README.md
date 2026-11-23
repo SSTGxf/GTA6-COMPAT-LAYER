@@ -198,11 +198,37 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-23 (phase 4 complete: realistic proof guest)
+## Status — 2026-11-23 (phase 5 complete: ERA→GDK translation + ESRAM)
 
-**What works now (verified on the build machine, all three harness guests
+**What works now (verified on the build machine, all five harness guests
 ALL PASS):**
 
+- **Phase 5 — ERA→GDK translation (`src/era_to_gdk.cpp`,
+  `tests/guest_era.cpp`, `docs/ERA-GDK-MAPPING.md`):** an Xbox One (ERA)
+  title boots through the translation into the GDK layer and renders a
+  real frame. The era guest passes **20/20 boot stages**: profile
+  sign-in → profile save load early → package/DLC enumeration → memory
+  → D3D11.x device (real desktop D3D11 via `D3D11XCreateDeviceX` — the
+  entry the real FH2 exe imports, grounded 3-arg form) → D3D11 surface
+  → D3D12.x device → audio + input → WinRT routing → triangle scene
+  (center red 255,0,0,255, corner clear color 51,102,204,255,
+  pixel-verified) → 60-frame loop (avg **16.7 ms**, max 18.7,
+  **Present 60/60**) → **ESRAM** (`D3DMapEsramMemory`: real committed
+  memory at the requested VA, 32 MB arena budget, page validation;
+  ESRAM window → render target → staging → readback, center red) →
+  **DXGIXPresentArray** (real per-chain Present) → XGameSaveFiles →
+  package mount → protections → TLS → TLS worker thread. Counts: 4
+  ERA entry points mapped 1:1, 9 adapted, 1 shared, 16 with no GDK
+  equivalent (7 XG texture-tiling + 9 AcpHal audio-DSP, documented
+  E_NOTIMPL). The mapping doc is grounded in the **real FH2 exe's
+  import table** (648 imports, 14 modules, read read-only) — and a
+  real boot was attempted: the loader mapped the exe and resolved
+  203/648 imports (all 106 kernelx Win32 forwards), then stopped at
+  the first wall, the missing **VS2012 CRT** (MSVCR110/MSVCP110/
+  vccorlib110/EtwPlus; child exit 0xFF). All 3 existing guests still
+  ALL PASS (no regressions). Known intermittent: a TLS `__declspec
+  (thread)` init-value flake in full builds (never in isolated
+  re-runs) — see `docs/STATUS.md`.
 - **Phase 4 — realistic proof guest (`tests/guest_proof.cpp`):** a Game Core
   title shaped on FH2's boot order (service init order, what a real title
   touches at boot) translated into GDK equivalents — runtime init, profile
@@ -216,7 +242,9 @@ ALL PASS):**
   19.1) with **Present 60/60**. All **17/17 boot stages pass**, and
   `guest_minimal` / `guest_ordinal` still pass with no regressions. FH2 is
   an Xbox One / ERA title, so it only sets the boot *shape* — the guest
-  stays Game Core, no ERA support, no FH2 files loaded or run.
+  stays Game Core; ERA support arrived in phase 5 (above), grounded in
+  the real FH2 exe's import table and first boot attempt.
+- **Software ray tracing (`src/software_rt.cpp`, `tests/guest_software_rt.cpp`):** the layer replaces hardware DXR with a compute-shader ray tracer (raygen + stack BVH walk + Möller–Trumbore + closest-hit/miss) on GPUs with no RT cores — the RX 5700 XT reports `RaytracingTier == NOT_SUPPORTED`, so the layer takes the software path. `ScSoftwareRT_*` entry points (ScarlettCompat-defined, not Xbox APIs): path query, init (compute PSO), CPU BVH scene build, dispatch into the caller's UAV. Proof: a one-triangle scene ray-traced at 256x256, pixel-verified (center red 255,0,0,255; corner miss color 51,102,204,255), **6/6 stages pass** through the harness, and a standalone host test passes first. All 5 guests ALL PASS in the full build. Not covered: any-hit, procedural primitives, recursion, multi-BLAS TLAS, hardware DXR passthrough, the COM wrapper that would route a real title's `ID3D12Device5` RT calls here, mesh shaders. See `docs/SOFTWARE-RT.md`.
 - Xbox PE32+ loader: maps a native x86-64 PE into the host process,
   validates the `.xbld` section (GXDK build strings), applies base
   relocations, and resolves imports — Xbox DLLs to the HLE registry,
@@ -304,6 +332,9 @@ Steps 1, 2, and 2.5 are done and verified (above).
 - Hardware ray tracing / mesh shaders — desktop D3D12 supports both, but
   the build machine's RX 5700 XT (RDNA1) has neither, so the full GTA VI
   pipeline cannot be verified on it (9,282 mesh shaders + DXR in the game).
+  **Ray tracing has a software path now** (compute-shader replacement,
+  verified — see above); hardware DXR passthrough and mesh shaders are
+  still open.
 
 **Next steps:** shader lifting (DXIL route) and `d3d12_xs` → D3D12
 translation beyond the device-method surface (PSOs, resource views,

@@ -4,6 +4,7 @@
 #pragma once
 #include "scarlett.h"
 #include "xbox_shims.h"  // XAsyncBlock / XUser / XGameSave / XPackage types
+#include "software_rt.h"  // ScRtPath / ScRtTriangle / ScRtCamera types
 #include <d3d12.h>  // IUnknown + D3D_FEATURE_LEVEL for the device-creation shim
 
 namespace sc {
@@ -21,6 +22,23 @@ extern "C" HRESULT HleDStorageGetFactory(void** ppFactory);
 extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags);
 extern "C" HRESULT HleScheduleFrameEventX(UINT64 frameId);
 extern "C" HRESULT HleWaitFrameEventX(UINT64 frameId, DWORD timeoutMs);
+
+// Software ray tracing (software RT backend, see docs/SOFTWARE-RT.md).
+// ScarlettCompat-defined entry points in d3d12_xs.dll (not Xbox APIs).
+extern "C" HRESULT HleScSoftwareRTQueryPath(ID3D12Device* device,
+                                            ScRtPath* path, uint32_t* rtTier);
+extern "C" HRESULT HleScSoftwareRTInit(ID3D12Device* device);
+extern "C" HRESULT HleScSoftwareRTBuildScene(ID3D12Device* device,
+                                             const ScRtTriangle* tris,
+                                             uint32_t triCount,
+                                             ScSoftwareRTSceneHandle* scene);
+extern "C" void HleScSoftwareRTFreeScene(ScSoftwareRTSceneHandle scene);
+extern "C" HRESULT HleScSoftwareRTDispatchRays(ID3D12Device* device,
+                                               ID3D12GraphicsCommandList* cmdList,
+                                               ScSoftwareRTSceneHandle scene,
+                                               const ScRtCamera* camera,
+                                               ID3D12Resource* outputUav,
+                                               uint32_t width, uint32_t height);
 
 // XAsync / XUser / XGameSave / XPackage (phase 2, milestone E).
 // Types come from xbox_shims.h (shared with the guest).

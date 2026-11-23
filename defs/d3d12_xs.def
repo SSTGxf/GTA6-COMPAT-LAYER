@@ -4,3 +4,8 @@ EXPORTS
     SetFrameIntervalX
     ScheduleFrameEventX
     WaitFrameEventX
+    ScSoftwareRT_QueryPath
+    ScSoftwareRT_Init
+    ScSoftwareRT_BuildScene
+    ScSoftwareRT_FreeScene
+    ScSoftwareRT_DispatchRays

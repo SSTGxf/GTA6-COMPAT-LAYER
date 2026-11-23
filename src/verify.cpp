@@ -185,6 +185,63 @@ static int ParentRun(const wchar_t* guestPath, DWORD timeoutMs) {
                proofBlock.c_str(), proofPassed, proofTotal);
     }
 
+    // ERA report (phase 5): same shape as the proof block, for lines
+    // the ERA guest writes (era_<stage>). The verdict logic below
+    // already counts these lines, so this is presentation only.
+    int eraTotal = 0, eraPassed = 0;
+    std::string eraBlock;
+    {
+        size_t pos = 0;
+        while (pos < guestRep.size()) {
+            size_t eol = guestRep.find('\n', pos);
+            std::string line = guestRep.substr(
+                pos, eol == std::string::npos ? eol : eol - pos);
+            if (line.rfind("era", 0) == 0) {
+                eraBlock += line + "\n";
+                if (line.rfind("era_", 0) == 0 &&
+                    line.find("_detail") == std::string::npos) {
+                    eraTotal++;
+                    if (line.find("=PASS") != std::string::npos)
+                        eraPassed++;
+                }
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+    }
+    if (!eraBlock.empty()) {
+        printf("--- era report ---\n%sera stages: %d/%d pass\n",
+               eraBlock.c_str(), eraPassed, eraTotal);
+    }
+
+    // Software-RT report: same shape as the proof block, for lines the
+    // software-RT guest writes (srt_<stage>). Presentation only.
+    int srtTotal = 0, srtPassed = 0;
+    std::string srtBlock;
+    {
+        size_t pos = 0;
+        while (pos < guestRep.size()) {
+            size_t eol = guestRep.find('\n', pos);
+            std::string line = guestRep.substr(
+                pos, eol == std::string::npos ? eol : eol - pos);
+            if (line.rfind("srt", 0) == 0) {
+                srtBlock += line + "\n";
+                if (line.rfind("srt_", 0) == 0 &&
+                    line.find("_detail") == std::string::npos) {
+                    srtTotal++;
+                    if (line.find("=PASS") != std::string::npos)
+                        srtPassed++;
+                }
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+    }
+    if (!srtBlock.empty()) {
+        printf("--- software-rt report ---\n%ssrt stages: %d/%d pass\n",
+               srtBlock.c_str(), srtPassed, srtTotal);
+    }
+
     // Verdict: every reported line must be PASS.
     bool allPass = !timedOut && childCode == 0 &&
                    loadRep.find("loader=PASS") != std::string::npos;

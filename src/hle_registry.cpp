@@ -4,6 +4,8 @@
 // gets the E_NOTIMPL stub. Statuses are the project's tracking surface —
 // see docs/STATUS.md.
 #include "hle_registry.h"
+#include "era_to_gdk.h"  // ERA -> GDK translation (phase 5)
+#include "software_rt.h"  // Software ray tracing backend
 #include "xbox_shims.h"
 #include <mmsystem.h>  // timeBeginPeriod (frame pacing, phase 3)
 #include <string.h>
@@ -105,6 +107,39 @@ extern "C" HRESULT HleD3D12XboxCreateDevice(IUnknown* adapter,
             (unsigned)hr, (unsigned)minFL);
     }
     return hr;
+}
+
+// ---- software ray tracing (see docs/SOFTWARE-RT.md) ----
+// ScarlettCompat-defined entry points (not Xbox APIs): the flat surface
+// the synthetic guest exercises. Thin wrappers over src/software_rt.cpp.
+extern "C" HRESULT HleScSoftwareRTQueryPath(ID3D12Device* device,
+                                            ScRtPath* path, uint32_t* rtTier) {
+    return ScSoftwareRT_QueryPath(device, path, rtTier);
+}
+
+extern "C" HRESULT HleScSoftwareRTInit(ID3D12Device* device) {
+    return ScSoftwareRT_Init(device);
+}
+
+extern "C" HRESULT HleScSoftwareRTBuildScene(ID3D12Device* device,
+                                             const ScRtTriangle* tris,
+                                             uint32_t triCount,
+                                             ScSoftwareRTSceneHandle* scene) {
+    return ScSoftwareRT_BuildScene(device, tris, triCount, scene);
+}
+
+extern "C" void HleScSoftwareRTFreeScene(ScSoftwareRTSceneHandle scene) {
+    ScSoftwareRT_FreeScene(scene);
+}
+
+extern "C" HRESULT HleScSoftwareRTDispatchRays(ID3D12Device* device,
+                                               ID3D12GraphicsCommandList* cmdList,
+                                               ScSoftwareRTSceneHandle scene,
+                                               const ScRtCamera* camera,
+                                               ID3D12Resource* outputUav,
+                                               uint32_t width, uint32_t height) {
+    return ScSoftwareRT_DispatchRays(device, cmdList, scene, camera,
+                                     outputUav, width, height);
 }
 
 extern "C" HRESULT HleXAudio2Create(void** ppXAudio2, UINT32 flags,
@@ -971,9 +1006,169 @@ static const Export kExports[] = {
     {"d3d12_xs.dll", "WaitFrameEventX", Status::kImplemented,
      (void*)HleWaitFrameEventX,
      "IMPLEMENTED (phase 2). Real pacing: sleeps to the frame deadline."},
+    // Software ray tracing (see docs/SOFTWARE-RT.md). ScarlettCompat-
+    // defined entry points, not Xbox APIs: compute-shader ray tracing
+    // for GPUs with no RT cores (RX 5700 XT: tier 0 -> software path).
+    {"d3d12_xs.dll", "ScSoftwareRT_QueryPath", Status::kImplemented,
+     (void*)HleScSoftwareRTQueryPath,
+     "IMPLEMENTED. Reads the adapter RT tier; tier 0 -> software path."},
+    {"d3d12_xs.dll", "ScSoftwareRT_Init", Status::kImplemented,
+     (void*)HleScSoftwareRTInit,
+     "IMPLEMENTED. Compiles the compute ray-tracing PSO once, caches it."},
+    {"d3d12_xs.dll", "ScSoftwareRT_BuildScene", Status::kImplemented,
+     (void*)HleScSoftwareRTBuildScene,
+     "IMPLEMENTED. CPU BVH build + GPU upload; returns a scene handle."},
+    {"d3d12_xs.dll", "ScSoftwareRT_FreeScene", Status::kImplemented,
+     (void*)HleScSoftwareRTFreeScene,
+     "IMPLEMENTED. Releases a scene handle's GPU resources."},
+    {"d3d12_xs.dll", "ScSoftwareRT_DispatchRays", Status::kImplemented,
+     (void*)HleScSoftwareRTDispatchRays,
+     "IMPLEMENTED (software path). Runs the compute ray tracer into the "
+     "caller's UAV. Hardware path returns E_NOTIMPL (passthrough is "
+     "future work, unverifiable on this card)."},
     // Audio.
     {"XAudio2_9.dll", "XAudio2Create", Status::kStub, (void*)HleXAudio2Create,
      "STUB. XMA2 decode is 0% everywhere; stub only."},
+    // ---- ERA -> GDK translation (phase 5; see docs/ERA-GDK-MAPPING.md).
+    // kernelx XMemAlloc/Free are 1:1 maps to the GDK xmem functions
+    // (same API, different module). d3d11_x device creation adapts to a
+    // real desktop D3D11 device (GDK on Xbox does not support D3D11.x at
+    // all, so there is no d3d12_xs equivalent). d3d12_x device creation
+    // takes the same thin path as d3d12_xs D3D12XboxCreateDevice.
+    // xg_x.dll / AcpHal.dll functions have no GDK equivalent: they get
+    // explicit E_NOTIMPL stubs (logged) instead of the generic missing-
+    // import stub, so the log shows exactly which no-equivalent call
+    // the title hit. Ordinals below are WinDurango's shim-DLL
+    // ordinals (dumpbin /exports 2026-11-23) — see kOrdinalExports.
+    {"kernelx.dll", "XMemAlloc", Status::kImplemented, (void*)HleXMemAlloc,
+     "ERA 1:1 map (phase 5): same API as xmem.dll!XMemAlloc, real HeapAlloc."},
+    {"kernelx.dll", "XMemFree", Status::kImplemented, (void*)HleXMemFree,
+     "ERA 1:1 map (phase 5): same API as xmem.dll!XMemFree, real HeapFree."},
+    {"kernelx.dll", "XMemAllocDefault", Status::kImplemented,
+     (void*)EraXMemAllocDefault,
+     "ERA 1:1 map (phase 5, WinDurango ordinal 515): default CRT alloc "
+     "impl, "
+     "real HeapAlloc."},
+    {"kernelx.dll", "XMemFreeDefault", Status::kImplemented,
+     (void*)EraXMemFreeDefault,
+     "ERA 1:1 map (phase 5, WinDurango ordinal 518): default CRT free "
+     "impl, "
+     "real HeapFree."},
+    {"kernelx.dll", "XMemSetAllocationHooks", Status::kStub,
+     (void*)EraXMemSetAllocationHooks,
+     "ERA adaptation (phase 5, WinDurango ordinal 524): hooks accepted, "
+     "logged, not routed — layer allocations do not call title hooks."},
+    {"kernelx.dll", "TitleMemoryStatus", Status::kStub,
+     (void*)EraTitleMemoryStatus,
+     "ERA adaptation (phase 5, WinDurango ordinal 463): ASSUMED "
+     "signature "
+     "(one pointer); struct zero-filled, no fabricated budget."},
+    {"d3d11_x.dll", "D3D11XCreateDevice", Status::kImplemented,
+     (void*)EraD3D11XCreateDevice,
+     "ERA adaptation (phase 5): real desktop D3D11 device. Form "
+     "matches WinDurango's public EraD3D11CreateDevice (10-arg "
+     "D3D11CreateDevice shape); the real FH2 exe does NOT import this "
+     "entry (it imports D3D11XCreateDeviceX)."},
+    {"d3d11_x.dll", "D3D11XCreateDeviceAndSwapChain", Status::kImplemented,
+     (void*)EraD3D11XCreateDeviceAndSwapChain,
+     "ERA adaptation (phase 5): real desktop D3D11 device + DXGI "
+     "swapchain. Same form as D3D11XCreateDevice (WinDurango's public "
+     "EraD3D11CreateDeviceAndSwapChain is a stub, so this entry is the "
+     "layer's own adaptation)."},
+    {"d3d11_x.dll", "D3D11XCreateDeviceX", Status::kImplemented,
+     (void*)EraD3D11XCreateDeviceX,
+     "ERA adaptation (phase 5, WinDurango ordinal 4): the device entry "
+     "the real FH2 exe imports. Real desktop D3D11 device; GROUNDED "
+     "3-arg form (params struct, device, context — WinDurango's public "
+     "d3d11.x.cpp)."},
+    {"d3d11_x.dll", "D3DMapEsramMemory", Status::kImplemented,
+     (void*)EraD3DMapEsramMemory,
+     "ERA adaptation (phase 5, WinDurango ordinal 9): ESRAM mapping — "
+     "real committed memory at the requested VA, 32 MB arena budget "
+     "enforced; GROUNDED signature (WinDurango's public d3d11.x.cpp)."},
+    {"d3d11_x.dll", "DXGIXPresentArray", Status::kImplemented,
+     (void*)EraDXGIXPresentArray,
+     "ERA adaptation (phase 5, WinDurango ordinal 11): presents every "
+     "swapchain in the array; GROUNDED signature (WinDurango's public "
+     "d3d11.x.cpp)."},
+    {"d3d11_x.dll", "D3DAllocateGraphicsMemory", Status::kImplemented,
+     (void*)EraD3DAllocateGraphicsMemory,
+     "ERA adaptation (phase 5, supporting): graphics-memory allocator, "
+     "VirtualAlloc-backed; GROUNDED shape (WinDurango's public "
+     "d3d11.x.cpp). The real FH2 exe does not import it."},
+    {"d3d11_x.dll", "D3DFreeGraphicsMemory", Status::kImplemented,
+     (void*)EraD3DFreeGraphicsMemory,
+     "ERA adaptation (phase 5, supporting): frees a graphics-memory "
+     "allocation (VirtualFree); same source as above."},
+    {"xg_x.dll", "XGComputeOptimalDepthStencilTileModes",
+     Status::kNotImplemented, (void*)EraXGComputeOptimalDepthStencilTileModes,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 2): Xbox texture "
+     "tiling has no desktop equivalent; explicit E_NOTIMPL stub "
+     "(logged)."},
+    {"xg_x.dll", "XGComputeOptimalTileMode", Status::kNotImplemented,
+     (void*)EraXGComputeOptimalTileMode,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 3): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"xg_x.dll", "XGComputeTexture2DLayout", Status::kNotImplemented,
+     (void*)EraXGComputeTexture2DLayout,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 5): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"xg_x.dll", "XGComputeTexture3DLayout", Status::kNotImplemented,
+     (void*)EraXGComputeTexture3DLayout,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 6): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"xg_x.dll", "XGCreateTexture1DComputer", Status::kNotImplemented,
+     (void*)EraXGCreateTexture1DComputer,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 8): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"xg_x.dll", "XGCreateTexture2DComputer", Status::kNotImplemented,
+     (void*)EraXGCreateTexture2DComputer,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 9): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"xg_x.dll", "XGCreateTexture3DComputer", Status::kNotImplemented,
+     (void*)EraXGCreateTexture3DComputer,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 10): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "AcpHalAllocateShapeContexts", Status::kNotImplemented,
+     (void*)EraAcpHalAllocateShapeContexts,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 1): the ACP audio "
+     "DSP has no desktop equivalent; explicit E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "AcpHalCreate", Status::kNotImplemented,
+     (void*)EraAcpHalCreate,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 2): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "AcpHalReleaseShapeContexts", Status::kNotImplemented,
+     (void*)EraAcpHalReleaseShapeContexts,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 3): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "ApuAlloc", Status::kNotImplemented, (void*)EraApuAlloc,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 4): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "ApuCreateHeap", Status::kNotImplemented,
+     (void*)EraApuCreateHeap,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 5): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "ApuFree", Status::kNotImplemented, (void*)EraApuFree,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 6): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "ApuIsVirtualAddressValid", Status::kNotImplemented,
+     (void*)EraApuIsVirtualAddressValid,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 8): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "ApuMapApuAddress", Status::kNotImplemented,
+     (void*)EraApuMapApuAddress,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 9): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"AcpHal.dll", "ApuMapVirtualAddress", Status::kNotImplemented,
+     (void*)EraApuMapVirtualAddress,
+     "ERA no-equivalent (phase 5, WinDurango ordinal 10): explicit "
+     "E_NOTIMPL stub (logged)."},
+    {"d3d12_x.dll", "D3D12XCreateDevice", Status::kImplemented,
+     (void*)HleD3D12XboxCreateDevice,
+     "ERA adaptation (phase 5): same real-device passthrough as "
+     "d3d12_xs!D3D12XboxCreateDevice. Signature is D3D12CreateDevice-"
+     "shaped (ASSUMED) — the real FH2 exe does NOT import d3d12_x at "
+     "all (D3D11.x-only title), so no real ordinal is known."},
     // Input.
     {"gameinput.dll", "GameInputCreate", Status::kStub,
      (void*)HleGameInputCreate, "STUB."},
@@ -1077,6 +1272,10 @@ static const char* kShimModules[] = {
     "xgameruntime.dll", "xgameplatform.dll", "d3d12_xs.dll", "d3d12_x.dll",
     "xmem.dll", "XAudio2_9.dll", "dstorage_xs.dll", "gameinput.dll",
     "xgame_save.dll", "xstore.dll",
+    // ERA modules (phase 5): resolved through the HLE registry, never
+    // LoadLibrary'd — none of them exist on desktop Windows.
+    // (d3d12_x.dll was already in the list above.)
+    "d3d11_x.dll", "kernelx.dll", "xg_x.dll", "AcpHal.dll",
 };
 
 static bool CiEq(const char* a, const char* b) {
@@ -1098,8 +1297,19 @@ const Export* FindExport(const char* module, const char* name) {
     return nullptr;
 }
 
-// Ordinal table (synthetic ordinals — see scarlett.h). One entry per
-// registered export, numbered in .def order per module.
+// Ordinal table. GDK ordinals are synthetic (numbered in .def order
+// per module) — the GDK import libs have no real ordinal layout to
+// match. ERA ordinals are WinDurango's shim-DLL ordinals (dumpbin
+// /exports 2026-11-23) — the only real ordinal layout available. The
+// real FH2 exe imports by NAME, so its import table gives HINTS, not
+// ordinals: a hint is an index into the sorted export-name table, and
+// for every ERA module it differs from the ordinal (WinDurango's
+// ordinals run one higher than the exe's hints here, because
+// WinDurango numbers its exports sequentially from 1 in alphabetical
+// order). An earlier phase 5 pass wrote the hints into these rows by
+// mistake; the rows below are the corrected WinDurango ordinals. The
+// exe's name imports resolve through the name table and never touch
+// these rows — they only matter for a title that imports by ordinal.
 static const OrdinalExport kOrdinalExports[] = {
     {"xgameruntime.dll", 1, (void*)HleXGameRuntimeInitialize,
      "XGameRuntimeInitialize"},
@@ -1174,6 +1384,55 @@ static const OrdinalExport kOrdinalExports[] = {
     {"gameinput.dll", 1, (void*)HleGameInputCreate, "GameInputCreate"},
     {"dstorage_xs.dll", 1, (void*)HleDStorageGetFactory,
      "DStorageGetFactory"},
+    // ERA ordinals — WinDurango's shim-DLL ordinals (dumpbin
+    // /exports 2026-11-23). The exe itself imports by NAME, so its
+    // import table gives HINTS, not ordinals — and the hints DIFFER
+    // from WinDurango's ordinals: exe hints for kernelx are
+    // TitleMemoryStatus 433, XMemAlloc 479, XMemAllocDefault 480,
+    // XMemFree 482, XMemFreeDefault 483, XMemSetAllocationHooks 487,
+    // while WinDurango's ordinals are 463, 514, 515, 517, 518, 524
+    // below. That is expected: WinDurango's kernelx is a
+    // reimplementation with its own export layout, and a hint is an
+    // index into the sorted name table, not an ordinal. The rows below
+    // use WinDurango's ordinals (the only real ordinal layout
+    // available); the exe's name imports resolve through the name
+    // table and never touch these rows.
+    {"kernelx.dll", 463, (void*)EraTitleMemoryStatus, "TitleMemoryStatus"},
+    {"kernelx.dll", 514, (void*)HleXMemAlloc, "XMemAlloc"},
+    {"kernelx.dll", 515, (void*)EraXMemAllocDefault, "XMemAllocDefault"},
+    {"kernelx.dll", 517, (void*)HleXMemFree, "XMemFree"},
+    {"kernelx.dll", 518, (void*)EraXMemFreeDefault, "XMemFreeDefault"},
+    {"kernelx.dll", 524, (void*)EraXMemSetAllocationHooks,
+     "XMemSetAllocationHooks"},
+    {"d3d11_x.dll", 4, (void*)EraD3D11XCreateDeviceX, "D3D11XCreateDeviceX"},
+    {"d3d11_x.dll", 9, (void*)EraD3DMapEsramMemory, "D3DMapEsramMemory"},
+    {"d3d11_x.dll", 11, (void*)EraDXGIXPresentArray, "DXGIXPresentArray"},
+    {"xg_x.dll", 2, (void*)EraXGComputeOptimalDepthStencilTileModes,
+     "XGComputeOptimalDepthStencilTileModes"},
+    {"xg_x.dll", 3, (void*)EraXGComputeOptimalTileMode,
+     "XGComputeOptimalTileMode"},
+    {"xg_x.dll", 5, (void*)EraXGComputeTexture2DLayout,
+     "XGComputeTexture2DLayout"},
+    {"xg_x.dll", 6, (void*)EraXGComputeTexture3DLayout,
+     "XGComputeTexture3DLayout"},
+    {"xg_x.dll", 8, (void*)EraXGCreateTexture1DComputer,
+     "XGCreateTexture1DComputer"},
+    {"xg_x.dll", 9, (void*)EraXGCreateTexture2DComputer,
+     "XGCreateTexture2DComputer"},
+    {"xg_x.dll", 10, (void*)EraXGCreateTexture3DComputer,
+     "XGCreateTexture3DComputer"},
+    {"AcpHal.dll", 1, (void*)EraAcpHalAllocateShapeContexts,
+     "AcpHalAllocateShapeContexts"},
+    {"AcpHal.dll", 2, (void*)EraAcpHalCreate, "AcpHalCreate"},
+    {"AcpHal.dll", 3, (void*)EraAcpHalReleaseShapeContexts,
+     "AcpHalReleaseShapeContexts"},
+    {"AcpHal.dll", 4, (void*)EraApuAlloc, "ApuAlloc"},
+    {"AcpHal.dll", 5, (void*)EraApuCreateHeap, "ApuCreateHeap"},
+    {"AcpHal.dll", 6, (void*)EraApuFree, "ApuFree"},
+    {"AcpHal.dll", 8, (void*)EraApuIsVirtualAddressValid,
+     "ApuIsVirtualAddressValid"},
+    {"AcpHal.dll", 9, (void*)EraApuMapApuAddress, "ApuMapApuAddress"},
+    {"AcpHal.dll", 10, (void*)EraApuMapVirtualAddress, "ApuMapVirtualAddress"},
 };
 
 const OrdinalExport* FindOrdinalExport(const char* module, uint16_t ordinal) {
