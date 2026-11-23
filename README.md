@@ -198,10 +198,45 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-23 (optimizations items 1–9 verified 13/13; RT mode selector; FH2 VirtualAlloc fix — boot attempt #3 past the region builder; fixed-timestep 7/7; phase 5 complete: ERA→GDK translation + ESRAM)
+## Status — 2026-11-23 (WinRT CoreApplication shim built — proof guest RC8; optimizations items 1–9 verified 13/13; RT mode selector; FH2 VirtualAlloc fix — boot attempt #3 past the region builder; fixed-timestep 7/7; phase 5 complete: ERA→GDK translation + ESRAM)
 
-**What works now (verified on the build machine, all seven harness guests
+**What works now (verified on the build machine, all eight harness guests
 ALL PASS):**
+
+- **WinRT CoreApplication shim (`src/winrt_shim.cpp`,
+  `tests/guest_winrt.cpp`, `docs/WINRT-SHIM.md`):** FH2 boot attempt #3
+  died at the game's main-loop entry — the guest's
+  `CoreApplication::Run(viewSource)` got E_INVALIDARG from the real
+  desktop WinRT (no package identity for an unpackaged, manually-mapped
+  title) and threw an uncaught `Platform::InvalidArgumentException`.
+  The layer now intercepts activation both ways the guest can reach it
+  — the loader hooks the guest's `vccorlib110!GetActivationFactoryByPCWSTR`
+  IAT entry (the path FH2 actually uses; it never imports
+  `RoGetActivationFactory` directly, which is why the old loader warning
+  was misleading) and its `combase!RoGetActivationFactory` IAT entry —
+  and returns its own `ICoreApplication` singleton. `Run` drives the
+  guest view's lifecycle (`CreateView` → `Initialize` → `SetWindow` →
+  `Load` → `Run` → `Uninitialize`) through a real 1280×720 Win32
+  CoreWindow with a message-pump CoreDispatcher — and, critically, it
+  returns only when the view exits, because the guest's `Main` returns
+  0 right after `Run` returns (an early S_OK would end the game without
+  running it). Proof guest `guest_winrt.cpp` (RC8 in build.bat) passes
+  **9/9**: activation through both paths returning the same singleton,
+  `get_Id` marker, CoreWindow 1280×720 + Dispatcher, lifecycle in the
+  exact order, `Run` taking 516 ms (test view pumps ~500 ms then closes
+  its window). Clean full build **BUILD_EXIT=0, all 10 verify runs ALL
+  PASS** (proof 17/17, era 21/21, software-rt 7/7 ×3 modes, opt 13/13,
+  physics 7/7). **FH2 boot attempt #5 got past the boot #3 wall:**
+  loader PASS (647/648 — the 1 failure is now identified as
+  `MMDevAPI.DLL!SetWasapiThreadAffinityMask`), activation returned the
+  layer factory, `Run` drove the lifecycle, `CreateView` returned the
+  game's view, the layer CoreWindow was created — then the guest died
+  inside its own `IFrameworkView::Initialize` (child exit 0xe06d7363,
+  unhandled C++ exception; minidump preserved). The game still does not
+  run, but the failure moved from "Run rejected" to "Initialize threw".
+  Known gaps: `get_Properties` E_NOTIMPL, input events stored never
+  fired, hooks are ERA-only for now, the swapchain HWND question is
+  open. See `docs/WINRT-SHIM.md`.
 
 - **Optimizations (`docs/OPTIMIZATION.md`, `tests/guest_opt.cpp`):**
   all nine items built and measured on the RX 5700 XT — **13/13 stages

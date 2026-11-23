@@ -308,6 +308,34 @@ static int ParentRun(const wchar_t* guestPath, DWORD timeoutMs) {
                ftBlock.c_str(), ftPassed, ftTotal);
     }
 
+    // WinRT report: same shape as the fixed-timestep block, for lines
+    // the WinRT guest writes (winrt_<stage>). Presentation only.
+    int winrtTotal = 0, winrtPassed = 0;
+    std::string winrtBlock;
+    {
+        size_t pos = 0;
+        while (pos < guestRep.size()) {
+            size_t eol = guestRep.find('\n', pos);
+            std::string line = guestRep.substr(
+                pos, eol == std::string::npos ? eol : eol - pos);
+            if (line.rfind("winrt", 0) == 0) {
+                winrtBlock += line + "\n";
+                if (line.rfind("winrt_", 0) == 0 &&
+                    line.find("_detail") == std::string::npos) {
+                    winrtTotal++;
+                    if (line.find("=PASS") != std::string::npos)
+                        winrtPassed++;
+                }
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+    }
+    if (!winrtBlock.empty()) {
+        printf("--- winrt report ---\n%swinrt stages: %d/%d pass\n",
+               winrtBlock.c_str(), winrtPassed, winrtTotal);
+    }
+
     // Verdict: every reported line must be PASS.
     bool allPass = !timedOut && childCode == 0 &&
                    loadRep.find("loader=PASS") != std::string::npos;

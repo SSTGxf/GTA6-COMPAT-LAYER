@@ -4,6 +4,7 @@
 // WinDurango shim-DLL model). No CPU emulation, no JIT.
 #include "pe_loader.h"
 #include "era_to_gdk.h"  // ERA -> GDK translation (phase 5)
+#include "winrt_shim.h"  // WinRT CoreApplication shim (WinRT phase)
 #include "hle_registry.h"
 #include <cstring>
 #include <intrin.h>  // __readgsqword
@@ -329,16 +330,25 @@ void HookThreadCreation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
     }
 }
 
-// Hook the guest's RoGetActivationFactory import so ERA WinRT
-// activation routes through the layer (phase 5). Same IAT-hook
-// technique as HookThreadCreation: the FT entry is patched to
-// EraRoGetActivationFactory, which refuses Xbox-namespace classes
-// (no layer COM objects yet) and forwards everything else to the real
-// function. Only installed for ERA titles (see the call site). The
-// guest links combase.lib, so the descriptor says "combase.dll"; the
-// api-ms-win-core-com name is matched too, in case the linker recorded
-// the API-set name instead. Runs after import resolution (the FT holds
-// the real address) and before section protections (.rdata -> R).
+// Hook the guest's WinRT activation imports so activation routes
+// through the layer's CoreApplication shim (WinRT phase; replaces the
+// phase 5 RoGet-only hook). Two interception points, because the guest
+// reaches activation two ways:
+//   - combase!RoGetActivationFactory (direct WinRT call) -> patched to
+//     WinRtRoGetActivationFactory, which routes CoreApplication to the
+//     shim and delegates everything else to EraRoGetActivationFactory
+//     (phase 5 behaviour preserved).
+//   - vccorlib110!GetActivationFactoryByPCWSTR — THE path FH2 actually
+//     uses (the guest imports it from vccorlib110 and never imports
+//     RoGetActivationFactory directly; the old warning "no
+//     RoGetActivationFactory import found (WinRT routing not
+//     installed)" was therefore misleading — see the FH2 boot #3
+//     diagnosis). Patched to ScGetActivationFactoryByPCWSTR, with the
+//     real address stashed for forwarding non-CoreApplication classes.
+// Only installed for ERA titles (see the call site). Runs after import
+// resolution (the FT holds the real addresses) and before section
+// protections (.rdata -> R). A missing hook is logged, not fatal: the
+// guest may simply not use that path.
 void HookWinRtActivation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
                          void* base) {
     const IMAGE_DATA_DIRECTORY& impDir =
@@ -346,13 +356,25 @@ void HookWinRtActivation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
     if (!impDir.VirtualAddress || !impDir.Size) return;
     auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)RvaToFile(
         file, nt, impDir.VirtualAddress, nullptr);
+    bool hookedRoGet = false;
+    bool hookedVccorlib = false;
     for (; desc && desc->Name; ++desc) {
         const char* modName =
             (const char*)RvaToFile(file, nt, desc->Name, nullptr);
-        if (!modName ||
-            (!CiEq(modName, "combase.dll") &&
-             !CiEq(modName, "api-ms-win-core-com-l1-1-0.dll")))
-            continue;
+        if (!modName) continue;
+        // RoGetActivationFactory's import descriptor is recorded under
+        // the WinRT API set (api-ms-win-core-winrt-l1-1-0.dll) by
+        // runtimeobject.lib — NOT combase.dll. The first build proved
+        // it: dumpbin on the guest shows the RoGet import under that
+        // API-set name, and the hook missed it until the name was
+        // added here (the era guest's phase-5 WinRT stage was a false
+        // pass — the real RoGet refused the Xbox class on its own).
+        bool isCombase =
+            CiEq(modName, "combase.dll") ||
+            CiEq(modName, "api-ms-win-core-com-l1-1-0.dll") ||
+            CiEq(modName, "api-ms-win-core-winrt-l1-1-0.dll");
+        bool isVccorlib = CiEq(modName, "vccorlib110.dll");
+        if (!isCombase && !isVccorlib) continue;
         uint32_t oftRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
                                                    : desc->FirstThunk;
         auto* oft = (const IMAGE_THUNK_DATA64*)RvaToFile(file, nt, oftRva,
@@ -364,21 +386,58 @@ void HookWinRtActivation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
             auto* ibn = (const IMAGE_IMPORT_BY_NAME*)RvaToFile(
                 file, nt, (uint32_t)oft[k].u1.AddressOfData, nullptr);
             if (!ibn) continue;
-            if (CiEq((const char*)ibn->Name, "RoGetActivationFactory")) {
+            if (isCombase &&
+                CiEq((const char*)ibn->Name, "RoGetActivationFactory") &&
+                !hookedRoGet) {
                 EraSetRealRoGetActivationFactory(
                     (RoGetActivationFactoryFn)ft[k].u1.Function);
                 ft[k].u1.Function =
-                    (uint64_t)(void*)EraRoGetActivationFactory;
+                    (uint64_t)(void*)WinRtRoGetActivationFactory;
                 Log("loader",
-                    "hooked combase!RoGetActivationFactory for ERA "
-                    "WinRT routing");
-                return;
+                    "hooked combase!RoGetActivationFactory for WinRT "
+                    "routing");
+                hookedRoGet = true;
+            } else if (isVccorlib &&
+                       (CiEq((const char*)ibn->Name,
+                             "GetActivationFactoryByPCWSTR") ||
+                        // The real vccorlib110.dll exports
+                        // GetActivationFactoryByPCWSTR ONLY under its
+                        // C++ mangled name (undname: long __cdecl
+                        // GetActivationFactoryByPCWSTR(void*,
+                        // Platform::Guid&, void**)) — that is the name
+                        // the real FH2 exe imports, so the hook must
+                        // match it too. The plain name is kept for
+                        // robustness (a title could import it that way
+                        // through a different import lib).
+                        CiEq((const char*)ibn->Name,
+                             "?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid"
+                             "@Platform@@PEAPEAX@Z")) &&
+                       !hookedVccorlib) {
+                WinRtSetRealGetActivationFactoryByPCWSTR(
+                    (WinRtGetActivationFactoryByPCWSTRFn)ft[k].u1.Function);
+                ft[k].u1.Function =
+                    (uint64_t)(void*)ScGetActivationFactoryByPCWSTR;
+                Log("loader",
+                    "hooked vccorlib110!GetActivationFactoryByPCWSTR "
+                    "for WinRT routing (the FH2 activation path)");
+                hookedVccorlib = true;
             }
         }
     }
-    Log("loader",
-        "WARNING: ERA title but no RoGetActivationFactory import found "
-        "(WinRT routing not installed)");
+    if (!hookedRoGet)
+        Log("loader",
+            "note: no RoGetActivationFactory import found — the guest "
+            "activates via vccorlib110's GetActivationFactoryByPCWSTR "
+            "instead (see FH2 boot #3); WinRT routing is installed "
+            "there when that import exists");
+    if (!hookedVccorlib)
+        Log("loader",
+            "note: no vccorlib110!GetActivationFactoryByPCWSTR import "
+            "found");
+    if (!hookedRoGet && !hookedVccorlib)
+        Log("loader",
+            "WARNING: ERA title but no WinRT activation import found "
+            "(WinRT routing not installed)");
 }
 
 // Set up TLS for the calling thread: allocate a TLS slot + block, copy
@@ -671,6 +730,13 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
             if (!oft || !ft) continue;
             for (size_t k = 0; oft[k].u1.Ordinal != 0; ++k) {
                 void* target = nullptr;
+                // Per-import failure logging (WinRT phase): the FH2 boot
+                // showed 647/648 resolved with the 1 failure
+                // unidentified. The name/ordinal is captured here so
+                // the failure branch below can name the exact import.
+                const char* curFnName = nullptr;
+                bool curIsOrdinal = false;
+                uint16_t curOrd = 0;
                 if (oft[k].u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
                     // Ordinal import (e.g. d3d12.dll!D3D12CreateDevice is
                     // ordinal 101 in the SDK import lib). Real modules
@@ -682,6 +748,8 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
                     // 2026-11-23).
                     uint16_t ord =
                         (uint16_t)(oft[k].u1.Ordinal & 0xFFFF);
+                    curIsOrdinal = true;
+                    curOrd = ord;
                     if (shim) {
                         const OrdinalExport* oe =
                             FindOrdinalExport(modName, ord);
@@ -706,6 +774,7 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
                         buf, nt, (uint32_t)oft[k].u1.AddressOfData, nullptr);
                     if (ibn) {
                         const char* fnName = (const char*)ibn->Name;
+                        curFnName = fnName;
                         if (shim) {
                             const Export* ex = FindExport(modName, fnName);
                             if (ex && ex->fn) {
@@ -773,6 +842,19 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
                     ft[k].u1.Function = (uint64_t)target;
                     out->importsResolved++;
                 } else {
+                    // Name the exact failed import (see the capture
+                    // above): 647/648 with an unidentified failure is
+                    // not debuggable.
+                    if (curIsOrdinal)
+                        Log("loader", "IMPORT FAILED: %s:#%u (no handler)",
+                            modName, curOrd);
+                    else if (curFnName)
+                        Log("loader", "IMPORT FAILED: %s!%s (no handler)",
+                            modName, curFnName);
+                    else
+                        Log("loader",
+                            "IMPORT FAILED: %s (unreadable import name)",
+                            modName);
                     ft[k].u1.Function = (uint64_t)(void*)ScNotImplementedStub;
                     out->importsFailed++;
                 }
@@ -792,9 +874,11 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     // real addresses) and before section protections (.rdata -> R).
     HookThreadCreation(buf, nt, base);
 
-    // WinRT activation hook (phase 5): only for ERA titles — routes
-    // Windows.Xbox.* class activation through the layer. Same window as
-    // the thread hooks (after imports, before protections).
+    // WinRT activation hooks (WinRT phase): only for ERA titles —
+    // routes CoreApplication activation through the layer's shim (both
+    // the direct RoGet path and the vccorlib110 path FH2 actually uses).
+    // Same window as the thread hooks (after imports, before
+    // protections).
     if (out->eraDetected) HookWinRtActivation(buf, nt, base);
 
     // Final page protections: per-section (text XR, rodata R, data RW).

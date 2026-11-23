@@ -22,7 +22,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OUT%\lib" mkdir "%OUT%\lib"
 
 echo === 1. ScarlettCompat.dll (layer) ===
-cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" "%ROOT%src\era_to_gdk.cpp" "%ROOT%src\software_rt.cpp" "%ROOT%src\fixed_timestep.cpp" "%ROOT%src\opt_pso_cache.cpp" "%ROOT%src\opt_detile.cpp" "%ROOT%src\opt_mesh_fallback.cpp" "%ROOT%src\opt_async_compute.cpp" "%ROOT%src\opt_desc_heap.cpp" "%ROOT%src\opt_dstorage.cpp" "%ROOT%src\opt_shader_cache.cpp" "%ROOT%src\opt_texcache.cpp" "%ROOT%src\opt_batching.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib d3d11.lib d3dcompiler.lib winmm.lib runtimeobject.lib
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" "%ROOT%src\era_to_gdk.cpp" "%ROOT%src\software_rt.cpp" "%ROOT%src\fixed_timestep.cpp" "%ROOT%src\winrt_shim.cpp" "%ROOT%src\opt_pso_cache.cpp" "%ROOT%src\opt_detile.cpp" "%ROOT%src\opt_mesh_fallback.cpp" "%ROOT%src\opt_async_compute.cpp" "%ROOT%src\opt_desc_heap.cpp" "%ROOT%src\opt_dstorage.cpp" "%ROOT%src\opt_shader_cache.cpp" "%ROOT%src\opt_texcache.cpp" "%ROOT%src\opt_batching.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib d3d11.lib d3dcompiler.lib winmm.lib runtimeobject.lib user32.lib ole32.lib
 if errorlevel 1 exit /b 1
 
 echo === 2. Shim import libs (Xbox DLL names mapped to layer exports) ===
@@ -33,6 +33,12 @@ REM Ordinal import libs (TEST ONLY — synthetic ordinals for the ordinal guest)
 for %%D in (xgameruntime_ord xmem_ord) do (
   lib /nologo /DEF:"%ROOT%defs\%%D.def" /OUT:"%OUT%\lib\%%D.lib" || exit /b 1
 )
+REM Real-DLL import lib for the WinRT proof guest only: vccorlib110.lib
+REM lets guest_winrt.cpp import GetActivationFactoryByPCWSTR by its
+REM MANGLED name (the only export the real vccorlib110.dll has for it)
+REM from the real vccorlib110.dll (VS2012 redist). NOT a shim — the
+REM layer never links it.
+lib /nologo /DEF:"%ROOT%defs\vccorlib110.def" /OUT:"%OUT%\lib\vccorlib110.lib" || exit /b 1
 
 echo === 3. Synthetic guest title (Xbox-style PE) ===
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_minimal.cpp" /Fe"%OUT%\guest_minimal.exe" /Fo%OUT%\ /Fd%OUT%\guest_minimal.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime.lib xmem.lib d3d12_xs.lib XAudio2_9.lib dstorage_xs.lib gameinput.lib d3d12.lib dxgi.lib
@@ -64,6 +70,13 @@ if errorlevel 1 exit /b 1
 REM Fixed-timestep physics proof guest (physics at a fixed 60 Hz
 REM while rendering at 30 and 120 FPS; see docs/FIXED-TIMESTEP.md).
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_physics.cpp" /Fe"%OUT%\guest_physics.exe" /Fo%OUT%\ /Fd%OUT%\guest_physics.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime.lib d3d12_xs.lib winmm.lib
+if errorlevel 1 exit /b 1
+REM WinRT shim proof guest (activation via vccorlib110 + direct RoGet,
+REM CoreApplication lifecycle through the layer's shim; see
+REM docs/WINRT-SHIM.md). Links kernelx.lib (one ERA import so the
+REM loader installs the WinRT hooks) + vccorlib110.lib (the FH2
+REM activation path) + runtimeobject.lib (RoGetActivationFactory).
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_winrt.cpp" /Fe"%OUT%\guest_winrt.exe" /Fo%OUT%\ /Fd%OUT%\guest_winrt.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" kernelx.lib vccorlib110.lib runtimeobject.lib
 if errorlevel 1 exit /b 1
 
 echo === 4. Verification harness ===
@@ -100,6 +113,8 @@ set SCARLETT_RT_MODE=
 set RC6=%ERRORLEVEL%
 "%OUT%\scarlett_verify.exe" "%OUT%\guest_physics.exe" 120000
 set RC7=%ERRORLEVEL%
+"%OUT%\scarlett_verify.exe" "%OUT%\guest_winrt.exe" 120000
+set RC8=%ERRORLEVEL%
 cd /d "%ROOT%"
 if %RC1% neq 0 (echo guest_minimal FAILED & exit /b 1)
 if %RC2% neq 0 (echo guest_ordinal FAILED & exit /b 1)
@@ -110,5 +125,6 @@ if %RC5b% neq 0 (echo guest_software_rt [off] FAILED & exit /b 1)
 if %RC5c% neq 0 (echo guest_software_rt [hardware] FAILED & exit /b 1)
 if %RC6% neq 0 (echo guest_opt FAILED & exit /b 1)
 if %RC7% neq 0 (echo guest_physics FAILED & exit /b 1)
+if %RC8% neq 0 (echo guest_winrt FAILED & exit /b 1)
 echo === verify exit code: 0 ===
 exit /b 0
