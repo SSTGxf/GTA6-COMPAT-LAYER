@@ -89,8 +89,8 @@ SC_API HRESULT XAudio2Create(void** ppXAudio2, UINT32 flags, DWORD proc) {
 SC_API HRESULT GameInputCreate(void** ppGameInput) {
     return HleGameInputCreate(ppGameInput);
 }
-SC_API HRESULT DStorageGetFactory(void** ppFactory) {
-    return HleDStorageGetFactory(ppFactory);
+SC_API HRESULT DStorageGetFactory(const void* riid, void** ppFactory) {
+    return HleDStorageGetFactory(riid, ppFactory);
 }
 SC_API HRESULT SetFrameIntervalX(UINT32 interval, UINT32 flags) {
     return HleSetFrameIntervalX(interval, flags);

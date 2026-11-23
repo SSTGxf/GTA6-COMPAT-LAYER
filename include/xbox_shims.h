@@ -98,8 +98,12 @@ HRESULT XAudio2Create(IXAudio2** ppXAudio2, UINT32 flags, DWORD processor);
 struct IGameInput;
 HRESULT GameInputCreate(IGameInput** ppGameInput);
 
-// DirectStorage factory — ASSUMED. Xbox variant is dstorage_xs.
-HRESULT DStorageGetFactory(void** ppFactory);
+// DirectStorage factory — real signature is TWO args: (REFIID riid,
+// void** ppFactory), per the desktop DirectStorage API and the Xbox
+// XCRDAPI/dstorage_xs versions. Boot #11 proved the 1-arg form wrong:
+// the game passes riid in rcx and ppFactory in rdx. The stub ignores
+// the riid and serves any IID.
+HRESULT DStorageGetFactory(const void* riid, void** ppFactory);
 
 // Frame pacing — real (phase 2): SetFrameIntervalX stores the present
 // interval (1 = 60 Hz), ScheduleFrameEventX stamps a frame, and

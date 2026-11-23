@@ -538,10 +538,13 @@ static bool TestProtections(char* detail, size_t n) {
         return false;
     }
     dataProt = mbi.Protect;
+    // Boot #10: an Xbox title keeps mutable globals in .rdata, so the
+    // loader maps data sections READWRITE for Xbox titles (see
+    // SectionProtection in pe_loader.cpp). Expect RW, not R.
     bool ok = (textProt == PAGE_EXECUTE_READ) &&
-              (rodataProt == PAGE_READONLY) && (dataProt == PAGE_READWRITE);
+              (rodataProt == PAGE_READWRITE) && (dataProt == PAGE_READWRITE);
     snprintf(detail, n,
-             "text=0x%x (want 0x20 XR) rdata=0x%x (want 0x2 R) "
+             "text=0x%x (want 0x20 XR) rdata=0x%x (want 0x4 RW) "
              "data=0x%x (want 0x4 RW)",
              textProt, rodataProt, dataProt);
     return ok;
@@ -1187,7 +1190,7 @@ int main() {
     allBoot &= ok;
 
     void* ds = nullptr;
-    hr = DStorageGetFactory(&ds);
+    hr = DStorageGetFactory(nullptr, &ds);
     ok = SUCCEEDED(hr);
     Report("storage", ok, nullptr);
     allBoot &= ok;

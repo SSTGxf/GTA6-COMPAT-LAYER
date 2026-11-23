@@ -886,8 +886,19 @@ extern "C" HRESULT HleGameInputCreate(void** ppGameInput) {
     return S_OK;
 }
 
-extern "C" HRESULT HleDStorageGetFactory(void** ppFactory) {
-    Log("dstorage", "DStorageGetFactory() -> S_OK (STUB, no queues yet)");
+extern "C" HRESULT HleDStorageGetFactory(const void* riid, void** ppFactory) {
+    // Real signature is TWO args: (REFIID riid, void** ppFactory) —
+    // the desktop DirectStorage API and the Xbox XCRDAPI/dstorage_xs
+    // versions all take (riid, ppv). Boot #11 proved the 1-arg stub
+    // was wrong: the game passes riid in rcx and ppFactory in rdx;
+    // the old stub wrote the factory pointer to *rcx (corrupting the
+    // riid in .rdata — boot #10's write AV) and never filled the real
+    // out-param, so the game's factory global stayed NULL and it hit
+    // a fatal int3 assert (boot #11, 0x141d8e505). The riid is logged
+    // and ignored; the stub factory serves any IID.
+    (void)riid;
+    Log("dstorage", "DStorageGetFactory(riid=%p) -> S_OK (STUB, no queues yet)",
+        riid);
     if (ppFactory) *ppFactory = MakeStubComObject("IDStorageFactory");
     return S_OK;
 }

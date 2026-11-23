@@ -684,7 +684,15 @@ static bool BuildFrameCtx11(FrameCtx11* ctx, char* detail, size_t n) {
     HWND hwnd = CreateWindowExW(0, kClass, L"ScarlettEra",
                                 WS_OVERLAPPEDWINDOW, 0, 0, 640, 360,
                                 nullptr, nullptr, hi, nullptr);
-    if (hwnd) ShowWindow(hwnd, SW_SHOW);
+    // NOTE: the window is intentionally NEVER shown. It was created
+    // without WS_VISIBLE so the swapchain has an HWND to present to,
+    // but a verify guest must not pop a visible window on the user's
+    // screen during builds — the red triangle used to show up as a
+    // small 640x360 window every verify run. Pixels are verified by
+    // readback from the offscreen RT, and Present still succeeds
+    // against a hidden window, so visibility buys nothing here.
+    // (The real game's window is ScCreateGameWindow in present.cpp,
+    // which is black-gated until the title submits a genuine frame.)
 
     D3D_FEATURE_LEVEL fls[] = {D3D_FEATURE_LEVEL_11_0};
     D3D_FEATURE_LEVEL fl = (D3D_FEATURE_LEVEL)0;
@@ -1566,10 +1574,13 @@ static bool TestProtections(char* detail, size_t n) {
         return false;
     }
     dataProt = mbi.Protect;
+    // Boot #10: an Xbox title keeps mutable globals in .rdata, so the
+    // loader maps data sections READWRITE for Xbox titles (see
+    // SectionProtection in pe_loader.cpp). Expect RW, not R.
     bool ok = (textProt == PAGE_EXECUTE_READ) &&
-              (rodataProt == PAGE_READONLY) && (dataProt == PAGE_READWRITE);
+              (rodataProt == PAGE_READWRITE) && (dataProt == PAGE_READWRITE);
     snprintf(detail, n,
-             "text=0x%x (want 0x20 XR) rdata=0x%x (want 0x2 R) "
+             "text=0x%x (want 0x20 XR) rdata=0x%x (want 0x4 RW) "
              "data=0x%x (want 0x4 RW)",
              textProt, rodataProt, dataProt);
     return ok;

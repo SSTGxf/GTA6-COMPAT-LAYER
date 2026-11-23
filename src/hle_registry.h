@@ -67,7 +67,7 @@ extern "C" void HleXMemTransferMemory(void* pDst, const void* pSrc,
                                       SIZE_T cbSize);
 extern "C" HRESULT HleXAudio2Create(void** ppXAudio2, UINT32 flags, DWORD proc);
 extern "C" HRESULT HleGameInputCreate(void** ppGameInput);
-extern "C" HRESULT HleDStorageGetFactory(void** ppFactory);
+extern "C" HRESULT HleDStorageGetFactory(const void* riid, void** ppFactory);
 extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags);
 extern "C" HRESULT HleScheduleFrameEventX(UINT64 frameId);
 extern "C" HRESULT HleWaitFrameEventX(UINT64 frameId, DWORD timeoutMs);

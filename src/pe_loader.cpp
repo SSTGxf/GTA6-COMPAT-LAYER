@@ -83,6 +83,16 @@ void ParseXbld(const uint8_t* data, size_t size, LoadedPe* out) {
 }
 
 // Translate PE section characteristics to a VirtualProtect protection.
+// NOTE (boot #10): a real Xbox title stores MUTABLE globals in .rdata
+// — the game passes a .rdata address (RVA 0x62fc7d8) as the out-param
+// of DStorageGetFactory, and PAGE_READONLY on .rdata faulted the write
+// (0xc0000005, write AV at 0x1462fc7d8, in MakeStubComObject). On Xbox
+// the data sections are effectively writable, so every non-executable
+// section with READ is mapped READWRITE here. .text stays execute-read
+// (or execute-readwrite if it carries WRITE). The synthetic guests
+// verify this policy (they expect .rdata RW, not R — updated in
+// build 19 alongside this change). This is a deliberate deviation from
+// the PE characteristics, grounded in the game's observed behaviour.
 DWORD SectionProtection(DWORD characteristics) {
     bool exec = (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
     bool read = (characteristics & IMAGE_SCN_MEM_READ) != 0;
@@ -91,8 +101,10 @@ DWORD SectionProtection(DWORD characteristics) {
     if (exec) {
         prot = write ? PAGE_EXECUTE_READWRITE
                      : (read ? PAGE_EXECUTE_READ : PAGE_EXECUTE);
-    } else if (read) {
-        prot = write ? PAGE_READWRITE : PAGE_READONLY;
+    } else if (read || write) {
+        // Data sections (.rdata, .data, .pdata, .reloc, .tls, .xbld)
+        // are writable: the game keeps mutable globals in .rdata.
+        prot = PAGE_READWRITE;
     } else {
         prot = PAGE_NOACCESS;
     }
