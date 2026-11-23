@@ -1114,7 +1114,9 @@ int main() {
     // The device from the shim must be a REAL ID3D12Device, not the old
     // fake pointer: prove it by calling methods on it.
     void* dev = nullptr;
-    hr = D3D12XboxCreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
+    D3D12XBOX_CREATE_DEVICE_PARAMETERS params = {};
+    params.Version = 0x20004;  // SDK 2.4, as the real exe passes
+    hr = D3D12XboxCreateDevice(nullptr, &params,
                                __uuidof(ID3D12Device), &dev);
     ok = false;
     if (SUCCEEDED(hr) && dev) {

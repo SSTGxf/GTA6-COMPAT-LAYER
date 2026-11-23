@@ -2,3 +2,13 @@ LIBRARY xmem
 EXPORTS
     XMemAlloc
     XMemFree
+    XMemAllocDefault
+    XMemFreeDefault
+    XMemVirtualAlloc
+    XMemGetWorkingSetStatistics
+    XMemIsToolsMemAvailable
+    XMemAllocatePhysicalPages
+    XMemFreePhysicalPages
+    XMemMapPhysicalPages
+    XMemMapPhysicalPagesScatter
+    XMemTransferMemory

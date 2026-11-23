@@ -84,6 +84,130 @@ extern "C" void HleXMemFree(void* p) {
     if (p) HeapFree(GetProcessHeap(), 0, p);
 }
 
+// ---- real-exe xmem additions (grounded 2026-11-23 from the exe's
+// import table; XMemVirtualAlloc's 5-arg form from its call site at
+// 0x14193e220, which passes type 0x20003000 and attributes 0x2004) ----
+extern "C" void* HleXMemAllocDefault(SIZE_T size) {
+    return HleXMemAlloc(size, 0);
+}
+
+extern "C" void HleXMemFreeDefault(void* p) { HleXMemFree(p); }
+
+extern "C" void* HleXMemVirtualAlloc(void* lpAddress, SIZE_T dwSize,
+                                     DWORD flAllocationType,
+                                     DWORD flProtect,
+                                     DWORD dwMemoryAttributes) {
+    // Same Xbox alloc-type bits as kernelx!VirtualAlloc (0x20003000),
+    // so the same stripping applies (HleVirtualAlloc). The protect
+    // value at the call site (0x283) is an Xbox protection encoding,
+    // not a desktop PAGE_* value — desktop VirtualAlloc rejects it, so
+    // the wrapper retries with PAGE_READWRITE when the given protect
+    // fails. Returns the allocated VA (NULL on failure).
+    void* p = HleVirtualAlloc(lpAddress, dwSize, flAllocationType,
+                              flProtect);
+    if (!p) {
+        p = HleVirtualAlloc(lpAddress, dwSize, flAllocationType,
+                            PAGE_READWRITE);
+    }
+    Log("xmem",
+        "XMemVirtualAlloc(%p, %llu, type 0x%08x, protect 0x%08x, "
+        "attrs 0x%08x) -> %p",
+        lpAddress, (unsigned long long)dwSize, flAllocationType,
+        flProtect, dwMemoryAttributes, p);
+    return p;
+}
+
+// XMemGetWorkingSetStatistics — S_OK stub. The stats struct layout is
+// GDKX-gated, so the layer does not fill it yet; the game only needs
+// the call to succeed at boot. (An earlier boot diagnosis proved the
+// game never calls the ERA TitleMemoryStatus before crashing, so a
+// zero-filled stats struct is not load-bearing here either.)
+extern "C" HRESULT HleXMemGetWorkingSetStatistics(void* pStats) {
+    Log("xmem",
+        "XMemGetWorkingSetStatistics(%p) -> S_OK (STUB: struct not "
+        "filled, layout GDKX-gated)",
+        pStats);
+    return S_OK;
+}
+
+// XMemIsToolsMemAvailable — FALSE: tools (devkit) memory does not
+// exist on a retail desktop. Correct answer, not a stub.
+extern "C" BOOL HleXMemIsToolsMemAvailable(void) {
+    Log("xmem", "XMemIsToolsMemAvailable() -> FALSE (no devkit memory)");
+    return FALSE;
+}
+
+// XMemAllocatePhysicalPages / XMemFreePhysicalPages — S_OK stubs.
+// Xbox physical pages (GPU memory) have no desktop equivalent; the
+// game allocates them for GPU-side use and the layer has no pool to
+// hand out yet. The signatures are GDKX-gated; the stubs ignore args
+// (x64 caller cleans the stack, so arg count does not matter).
+extern "C" HRESULT HleXMemAllocatePhysicalPages(void) {
+    Log("xmem",
+        "XMemAllocatePhysicalPages() -> S_OK (STUB: no desktop "
+        "physical-page pool)");
+    return S_OK;
+}
+
+extern "C" HRESULT HleXMemFreePhysicalPages(void) {
+    Log("xmem",
+        "XMemFreePhysicalPages() -> S_OK (STUB: no desktop "
+        "physical-page pool)");
+    return S_OK;
+}
+
+// XMemMapPhysicalPages / XMemMapPhysicalPagesScatter — map Xbox
+// physical pages into a desktop VA. On desktop there is no separate
+// physical-page pool, so this commits ordinary memory and returns its
+// VA. Signature ASSUMED (GDKX-gated): (pages, pageCount, attrs,
+// protect). The size is guarded: a bogus page count (wrong signature)
+// cannot reserve more than 256 MB or less than 64 KB.
+extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
+                                         uint32_t dwPageCount,
+                                         DWORD dwMemoryAttributes,
+                                         DWORD flProtect) {
+    SIZE_T bytes = (SIZE_T)dwPageCount * 4096;
+    if (bytes < 64 * 1024) bytes = 64 * 1024;
+    if (bytes > 256 * 1024 * 1024) bytes = 256 * 1024 * 1024;
+    void* p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
+                           PAGE_READWRITE);
+    Log("xmem",
+        "XMemMapPhysicalPages(pages %p, count %u, attrs 0x%x, protect "
+        "0x%x) -> %p (%llu bytes, ordinary memory)",
+        (const void*)pPhysicalPages, dwPageCount, dwMemoryAttributes,
+        flProtect, p, (unsigned long long)bytes);
+    return p;
+}
+
+extern "C" void* HleXMemMapPhysicalPagesScatter(
+    const uint64_t* pPhysicalPages, uint32_t dwPageCount,
+    DWORD dwMemoryAttributes, DWORD flProtect) {
+    // Same guarded ordinary-memory mapping as XMemMapPhysicalPages
+    // (scatter layout is GDKX-gated; the VA returned is one contiguous
+    // block the game can write to).
+    SIZE_T bytes = (SIZE_T)dwPageCount * 4096;
+    if (bytes < 64 * 1024) bytes = 64 * 1024;
+    if (bytes > 256 * 1024 * 1024) bytes = 256 * 1024 * 1024;
+    void* p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
+                           PAGE_READWRITE);
+    Log("xmem",
+        "XMemMapPhysicalPagesScatter(pages %p, count %u, attrs 0x%x, "
+        "protect 0x%x) -> %p (%llu bytes, ordinary memory)",
+        (const void*)pPhysicalPages, dwPageCount, dwMemoryAttributes,
+        flProtect, p, (unsigned long long)bytes);
+    return p;
+}
+
+// XMemTransferMemory — memcpy. First three args are (dst, src, size);
+// any further args (flags, physical addresses) are ignored — on x64
+// the caller cleans the stack, so extra args are harmless.
+extern "C" void HleXMemTransferMemory(void* pDst, const void* pSrc,
+                                      SIZE_T cbSize) {
+    if (pDst && pSrc && cbSize) memcpy(pDst, pSrc, cbSize);
+    Log("xmem", "XMemTransferMemory(%p <- %p, %llu bytes)", pDst, pSrc,
+        (unsigned long long)cbSize);
+}
+
 // ---- kernelx!VirtualAlloc (VirtualAlloc flag-translation fix, 2026-11-23) ----
 // The ERA guest's region-descriptor builder calls kernelx!VirtualAlloc
 // with Xbox-specific allocation-type bits (0x30002000 / 0x40002000).
@@ -130,29 +254,163 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
     return p;
 }
 
-extern "C" HRESULT HleD3D12XboxCreateDevice(IUnknown* adapter,
+extern "C" HRESULT HleD3D12XboxCreateDevice(
+    IUnknown* adapter,
+    const D3D12XBOX_CREATE_DEVICE_PARAMETERS* params, REFIID riid,
+    void** ppDevice) {
+    // REAL Xbox signature (grounded 2026-11-23 from the real exe's call
+    // site at 0x1424785b7): (adapter, &params, riid, &device). The game
+    // passes adapter=NULL (default) and params.Version = 0x20004 (SDK
+    // 2.4). The struct carries NO feature level — on Xbox the level is
+    // fixed at 12_2 (DirectX 12 Ultimate). On desktop the layer tries
+    // the levels from highest to lowest and takes the best the hardware
+    // offers (RX 5700 XT: 12_1). The created device is cached so later
+    // steps (swapchain, pacing) can use it.
+    if (params) {
+        Log("d3d12xs",
+            "D3D12XboxCreateDevice params: Version 0x%x, "
+            "GraphicsSwitchingMode %u, ProcessDebugFlags 0x%x",
+            params->Version, params->GraphicsSwitchingMode,
+            params->ProcessDebugFlags);
+    } else {
+        Log("d3d12xs",
+            "D3D12XboxCreateDevice params: NULL (guest passed no struct)");
+    }
+    static const D3D_FEATURE_LEVEL kLevels[] = {
+        D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1,
+        D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+    // The Xbox device IID the real exe passes (RE report, 2026-11-23):
+    // {5405C344-D457-444E-B4DD-2366E45AEE39}. It is NOT desktop
+    // IID_ID3D12Device (189819F1-1DB6-4B57-BE54-1821339B85F7) — the
+    // desktop driver does not know it, so passing it through to
+    // D3D12CreateDevice fails with E_NOINTERFACE and the game would
+    // die at device creation. Log it when seen; the retry below maps
+    // it to the desktop base device.
+    static const GUID kXboxDeviceIID = {
+        0x5405C344, 0xD457, 0x444E,
+        {0xB4, 0xDD, 0x23, 0x66, 0xE4, 0x5A, 0xEE, 0x39}};
+    if (memcmp(&riid, &kXboxDeviceIID, sizeof(GUID)) == 0) {
+        Log("d3d12xs",
+            "D3D12XboxCreateDevice riid is the Xbox device IID "
+            "{5405C344-D457-444E-B4DD-2366E45AEE39} (not desktop "
+            "IID_ID3D12Device) — will map to the desktop base device");
+    }
+    HRESULT hr = E_FAIL;
+    for (size_t i = 0; i < sizeof(kLevels) / sizeof(kLevels[0]); ++i) {
+        hr = D3D12CreateDevice(adapter, kLevels[i], riid, ppDevice);
+        if (SUCCEEDED(hr)) {
+            Log("d3d12xs",
+                "D3D12XboxCreateDevice -> REAL desktop device %p "
+                "(feature level 0x%x; Xbox fixed level is 12_2, best "
+                "available on this hardware)",
+                ppDevice ? *ppDevice : nullptr, (unsigned)kLevels[i]);
+            break;
+        }
+        if (hr == E_NOINTERFACE) {
+            // Unknown IID (the Xbox device IID, or another Xbox
+            // interface the desktop driver does not know) — retry
+            // with the desktop base IID_ID3D12Device. The Xbox device
+            // interface extends the desktop base, so the base methods
+            // are at the same vtable offsets; a base device is what
+            // the game can use at boot. (The game will QueryInterface
+            // for newer Xbox interfaces later — that needs the COM
+            // wrapper, which is future work; device creation itself
+            // must not fail here.)
+            hr = D3D12CreateDevice(adapter, kLevels[i],
+                                   __uuidof(ID3D12Device), ppDevice);
+            if (SUCCEEDED(hr)) {
+                Log("d3d12xs",
+                    "D3D12XboxCreateDevice -> REAL desktop device %p "
+                    "(feature level 0x%x; requested IID unknown to "
+                    "the desktop driver, mapped to IID_ID3D12Device)",
+                    ppDevice ? *ppDevice : nullptr,
+                    (unsigned)kLevels[i]);
+                break;
+            }
+        }
+    }
+    if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
+        if (g_xsDevice) g_xsDevice->Release();
+        g_xsDevice = (ID3D12Device*)*ppDevice;
+        g_xsDevice->AddRef();
+    } else {
+        Log("d3d12xs",
+            "D3D12XboxCreateDevice FAILED hr=0x%08x (no usable feature "
+            "level)",
+            (unsigned)hr);
+    }
+    return hr;
+}
+
+// ERA d3d12_x!D3D12XCreateDevice — D3D12CreateDevice-shaped (adapter,
+// minFL, riid, ppDevice). This is a DIFFERENT function from the GDK
+// d3d12_xs!D3D12XboxCreateDevice (which takes a
+// D3D12XBOX_CREATE_DEVICE_PARAMETERS struct). They shared one
+// implementation until 2026-11-23, when the GDK form was corrected to
+// the real 4-arg params signature — but the ERA guest calls
+// D3D12XCreateDevice as (adapter, minFL, riid, ppDevice), so sharing
+// the GDK function made it interpret the feature level (0xb000) as a
+// params pointer and dereference it -> 0xC0000005 in era_gfx12. The
+// ERA form keeps the old shape (ASSUMED, phase 5 — a D3D11.x-only
+// title does NOT import d3d12_x at all, so no real ordinal is known).
+// Real passthrough to desktop D3D12CreateDevice.
+extern "C" HRESULT HleEraD3D12XCreateDevice(IUnknown* adapter,
                                             D3D_FEATURE_LEVEL minFL,
                                             REFIID riid, void** ppDevice) {
-    // REAL translation (phase 2): the assumed signature is
-    // D3D12CreateDevice-shaped, so this is a thin passthrough to the
-    // desktop device. The REAL Xbox signature takes a
-    // D3D12XBOX_CREATE_DEVICE_PARAMETERS struct (GDKX-gated) — that form
-    // must be confirmed against the exe's import table once it lands.
-    // The created device is cached so later steps (swapchain, pacing)
-    // can use it.
     HRESULT hr = D3D12CreateDevice(adapter, minFL, riid, ppDevice);
     if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
         if (g_xsDevice) g_xsDevice->Release();
         g_xsDevice = (ID3D12Device*)*ppDevice;
         g_xsDevice->AddRef();
-        Log("d3d12xs",
-            "D3D12XboxCreateDevice -> REAL desktop device %p (minFL 0x%x)",
+        Log("d3d12x",
+            "D3D12XCreateDevice -> REAL desktop device %p (minFL 0x%x)",
             *ppDevice, (unsigned)minFL);
     } else {
-        Log("d3d12xs",
-            "D3D12XboxCreateDevice FAILED hr=0x%08x (minFL 0x%x)",
+        Log("d3d12x",
+            "D3D12XCreateDevice FAILED hr=0x%08x (minFL 0x%x)",
             (unsigned)hr, (unsigned)minFL);
     }
+    return hr;
+}
+
+// D3D12ConfigureVirtualMemoryX — REAL signature (grounded 2026-11-23
+// from the real exe's call site at 0x141e1cfe0): ONE arg, a pointer to
+// a config struct (32 bytes, zeroed, struct+4 = a computed value).
+// Returns HRESULT — and the game hits int3 if it fails, so this MUST
+// return S_OK. On desktop there is no GPU virtual-address space to
+// configure (the desktop driver owns VA layout), so S_OK with no
+// action is the correct translation.
+extern "C" HRESULT HleD3D12ConfigureVirtualMemoryX(const void* pConfig) {
+    Log("d3d12xs",
+        "D3D12ConfigureVirtualMemoryX(%p) -> S_OK (STUB: no desktop VA "
+        "space to configure)",
+        pConfig);
+    return S_OK;
+}
+
+// D3D12SerializeVersionedRootSignature — the Xbox _xs variant has the
+// same 3-arg shape as the desktop function (NO riid — the versioned
+// serializer always returns an ID3DBlob; the 4-arg riid form belongs
+// to the older non-versioned D3D12SerializeRootSignature). Grounded
+// from the desktop SDK header (d3d12.h:4442, SDK 10.0.26100.0): the
+// desktop function is (pRootSignature, ppBlob, ppErrorBlob). The Xbox
+// form is assumed to match (the GDK _xs functions mirror the desktop
+// D3D12 signatures); the two call sites in the exe (0x14247fc80,
+// 0x1455ac80a) did not decode cleanly enough to prove the arg count,
+// so this is flagged ASSUMED — if the boot crashes at this call, the
+// call-site disassembly is the next step. Forwards straight to the
+// desktop function.
+extern "C" HRESULT HleD3D12SerializeVersionedRootSignature(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* pRootSignature,
+    ID3DBlob** ppBlob, ID3DBlob** ppErrorBlob) {
+    HRESULT hr = D3D12SerializeVersionedRootSignature(pRootSignature,
+                                                      ppBlob, ppErrorBlob);
+    Log("d3d12xs",
+        "D3D12SerializeVersionedRootSignature -> hr=0x%08x (desktop "
+        "forward)",
+        (unsigned)hr);
     return hr;
 }
 
@@ -546,24 +804,245 @@ extern "C" void HleScOptFlightDestroy(ScOptFlightHandle flight) {
     ScOpt_FlightDestroy(flight);
 }
 
+// ---- Generic stub COM object ----
+// A minimal COM object with a shared 64-slot vtable. Used by the
+// factories that must return a REAL (callable) interface pointer:
+// GameInputCreate, XAudio2Create, DStorageGetFactory. The old stubs
+// returned debug sentinel integers as the out-pointer (GameInput
+// 0x6A6E707574 "jnput", XAudio2 0xA0D10, DStorage 0xD570A6E); the
+// game dereferences the pointer as a COM object (reads [ptr] for the
+// vtable, then calls AddRef/Release) and faults. Boot #9 proved it:
+// GameInputCreate's sentinel 0x6a6e707574 was read as a vtable
+// pointer and the singleton getter faulted at 0x1459258e2
+// (mov rax, [rsi]; rsi = the sentinel). Leonida's retail chain stop
+// #5 is the same class: DStorageGetFactory must return a non-null
+// factory (#4348), not a sentinel.
+// Vtable: slot 0 QueryInterface (permissive: S_OK, *ppv = this,
+// AddRef — the object is a generic stub, so any IID gets the same
+// object), slot 1 AddRef, slot 2 Release, slots 3..63 generic S_OK
+// stubs (return 0, ignore args — on x64 the caller cleans the stack,
+// so arg count does not matter). 64 slots covers every method of
+// IGameInput (~20), IXAudio2 (~15) and IDStorageFactory (~10) with
+// room for future interfaces. The vtable is filled once by a
+// file-scope static initializer (runs at DLL load, before any game
+// thread exists), so no per-call init race.
+struct StubComObject {
+    void** vtable;
+    LONG ref;
+};
+static void* g_stubComVtable[64];
+extern "C" HRESULT StubComQueryInterface(void* self, const void* riid,
+                                         void** ppv) {
+    (void)riid;
+    if (ppv) {
+        *ppv = self;
+        StubComObject* obj = (StubComObject*)self;
+        InterlockedIncrement(&obj->ref);
+    }
+    return S_OK;
+}
+extern "C" ULONG StubComAddRef(void* self) {
+    StubComObject* obj = (StubComObject*)self;
+    return (ULONG)InterlockedIncrement(&obj->ref);
+}
+extern "C" ULONG StubComRelease(void* self) {
+    StubComObject* obj = (StubComObject*)self;
+    LONG r = InterlockedDecrement(&obj->ref);
+    if (r == 0) HeapFree(GetProcessHeap(), 0, obj);
+    return (ULONG)r;
+}
+extern "C" HRESULT StubComGeneric() { return S_OK; }
+struct StubComVtableInit {
+    StubComVtableInit() {
+        g_stubComVtable[0] = (void*)StubComQueryInterface;
+        g_stubComVtable[1] = (void*)StubComAddRef;
+        g_stubComVtable[2] = (void*)StubComRelease;
+        for (int i = 3; i < 64; ++i)
+            g_stubComVtable[i] = (void*)StubComGeneric;
+    }
+};
+static StubComVtableInit g_stubComVtableInit;
+static void* MakeStubComObject(const char* tag) {
+    StubComObject* obj = (StubComObject*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(StubComObject));
+    if (!obj) return nullptr;
+    obj->vtable = g_stubComVtable;
+    obj->ref = 1;
+    Log("stub", "%s stub COM object %p", tag, (void*)obj);
+    return (void*)obj;
+}
+
 extern "C" HRESULT HleXAudio2Create(void** ppXAudio2, UINT32 flags,
                                     DWORD proc) {
     Log("audio", "XAudio2Create(flags 0x%x, proc %lu) -> S_OK (STUB)",
         flags, proc);
-    if (ppXAudio2) *ppXAudio2 = (void*)0xA0D10ULL;
+    if (ppXAudio2) *ppXAudio2 = MakeStubComObject("IXAudio2");
     return S_OK;
 }
 
 extern "C" HRESULT HleGameInputCreate(void** ppGameInput) {
     Log("input", "GameInputCreate() -> S_OK (STUB)");
-    if (ppGameInput) *ppGameInput = (void*)0x6A6E707574ULL;  // "jnput"
+    if (ppGameInput) *ppGameInput = MakeStubComObject("IGameInput");
     return S_OK;
 }
 
 extern "C" HRESULT HleDStorageGetFactory(void** ppFactory) {
     Log("dstorage", "DStorageGetFactory() -> S_OK (STUB, no queues yet)");
-    if (ppFactory) *ppFactory = (void*)0xD570A6EULL;
+    if (ppFactory) *ppFactory = MakeStubComObject("IDStorageFactory");
     return S_OK;
+}
+
+
+ // ---- real-exe import stubs (grounded 2026-11-23 from the exe's
+// import table) ----
+// Generic S_OK / void stubs for real-exe imports whose signatures are
+// GDKX-gated (chad, xg_xs, XboxBvhBuilder, FFX loader, libHttpClient,
+// xapu, Bink). Each stub logs its own name and returns the safe default
+// for its return type: S_OK (0) for HRESULT / int / BOOL (0 = FFX_OK /
+// FALSE / no results), nothing for void. The stubs ignore their args —
+// on x64 the caller cleans the stack, so arg count does not matter, and
+// a stub that returns S_OK without touching out-params is safe as long
+// as the game treats S_OK as "call succeeded" (it does; a failure
+// HRESULT would stop the boot). The loader's resolution log records
+// which import resolved to which stub, so the boot log shows every stub
+// call by name.
+#define SC_DEFINE_SOK_STUB(tag, fn) \
+    extern "C" HRESULT fn() { \
+        Log(tag, #fn "() -> S_OK (STUB)"); \
+        return S_OK; \
+    }
+#define SC_DEFINE_VOID_STUB(tag, fn) \
+    extern "C" void fn() { Log(tag, #fn "() (STUB)"); }
+
+// chad.dll — S_OK stubs (audio DSP / texture computer / FSR loader / audio APU).
+SC_DEFINE_SOK_STUB("chad", XDspActivate)
+SC_DEFINE_SOK_STUB("chad", XDspConnectWithMaximumStreamLimit)
+SC_DEFINE_SOK_STUB("chad", XDspDeactivate)
+SC_DEFINE_SOK_STUB("chad", XDspDisconnect)
+SC_DEFINE_SOK_STUB("chad", XDspSubmitCommand)
+
+// xg_xs.dll — S_OK stubs (audio DSP / texture computer / FSR loader / audio APU).
+SC_DEFINE_SOK_STUB("xgxs", XGCreateTextureComputer)
+SC_DEFINE_SOK_STUB("xgxs", XGSuggestSwizzleMode)
+
+// amd_fidelityfx_loader_xbox.dll — S_OK stubs (audio DSP / texture computer / FSR loader / audio APU).
+SC_DEFINE_SOK_STUB("ffx", ffxCreateContext)
+SC_DEFINE_SOK_STUB("ffx", ffxDestroyContext)
+SC_DEFINE_SOK_STUB("ffx", ffxDispatch)
+SC_DEFINE_SOK_STUB("ffx", ffxQuery)
+
+// xapu.dll — S_OK stubs (audio DSP / texture computer / FSR loader / audio APU).
+SC_DEFINE_SOK_STUB("xapu", XApuConnect)
+SC_DEFINE_SOK_STUB("xapu", XApuDequeueResult)
+SC_DEFINE_SOK_STUB("xapu", XApuDisconnect)
+SC_DEFINE_SOK_STUB("xapu", XApuEnqueueCommand)
+SC_DEFINE_SOK_STUB("xapu", XApuGetResultCount)
+
+// libHttpClient.GDK.dll — S_OK stubs (HTTP client; the game does no HTTP at boot, but the imports must resolve).
+SC_DEFINE_SOK_STUB("http", HCCleanupAsync)
+SC_DEFINE_SOK_STUB("http", HCHttpCallCloseHandle)
+SC_DEFINE_SOK_STUB("http", HCHttpCallCreate)
+SC_DEFINE_SOK_STUB("http", HCHttpCallDuplicateHandle)
+SC_DEFINE_SOK_STUB("http", HCHttpCallGetRequestUrl)
+SC_DEFINE_SOK_STUB("http", HCHttpCallPerformAsync)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetHeaderAtIndex)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetNumHeaders)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetRequestBodyBytes)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetRetryAllowed)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetRetryCacheId)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetRetryDelay)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetTimeout)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetTimeoutWindow)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestGetUrl)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetHeader)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetRequestBodyBytes)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetRequestBodyString)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetRetryAllowed)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetRetryCacheId)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetRetryDelay)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetTimeout)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetTimeoutWindow)
+SC_DEFINE_SOK_STUB("http", HCHttpCallRequestSetUrl)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetHeader)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetHeaderAtIndex)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetNetworkErrorCode)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetNumHeaders)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetPlatformNetworkErrorMessage)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetResponseBodyBytes)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetResponseBodyBytesSize)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetResponseString)
+SC_DEFINE_SOK_STUB("http", HCHttpCallResponseGetStatusCode)
+SC_DEFINE_SOK_STUB("http", HCHttpCallSetTracing)
+SC_DEFINE_SOK_STUB("http", HCInitialize)
+SC_DEFINE_SOK_STUB("http", HCSettingsGetTraceLevel)
+SC_DEFINE_SOK_STUB("http", HCTraceImplMessage)
+SC_DEFINE_SOK_STUB("http", HCTraceSetEtwEnabled)
+
+// Bink2Scarlett.dll — video playback stubs. BinkOpenWithOptions returns a dummy non-NULL handle so the game proceeds to call the (void) frame functions; BinkGetKeyFrame / BinkShouldSkip return 0 (no key frame / do not skip).
+SC_DEFINE_VOID_STUB("bink", BinkClose)
+SC_DEFINE_VOID_STUB("bink", BinkDoFrame)
+SC_DEFINE_VOID_STUB("bink", BinkDoFrameAsyncMulti)
+SC_DEFINE_VOID_STUB("bink", BinkDoFrameAsyncWait)
+SC_DEFINE_VOID_STUB("bink", BinkFreeGlobals)
+SC_DEFINE_VOID_STUB("bink", BinkGetFrameBuffersInfo)
+SC_DEFINE_VOID_STUB("bink", BinkGetPlatformInfo)
+SC_DEFINE_VOID_STUB("bink", BinkGoto)
+SC_DEFINE_VOID_STUB("bink", BinkNextFrame)
+SC_DEFINE_VOID_STUB("bink", BinkPause)
+SC_DEFINE_VOID_STUB("bink", BinkRegisterFrameBuffers)
+SC_DEFINE_VOID_STUB("bink", BinkRequestStopAsyncThreadsMulti)
+SC_DEFINE_VOID_STUB("bink", BinkSetMemory)
+SC_DEFINE_VOID_STUB("bink", BinkSetOSFileCallbacks)
+SC_DEFINE_VOID_STUB("bink", BinkSetSoundSystem)
+SC_DEFINE_VOID_STUB("bink", BinkSetVolume)
+SC_DEFINE_VOID_STUB("bink", BinkSetWillLoop)
+SC_DEFINE_VOID_STUB("bink", BinkStartAsyncThread)
+SC_DEFINE_VOID_STUB("bink", BinkWait)
+SC_DEFINE_VOID_STUB("bink", BinkWaitStopAsyncThreadsMulti)
+SC_DEFINE_SOK_STUB("bink", BinkGetKeyFrame)
+SC_DEFINE_SOK_STUB("bink", BinkShouldSkip)
+
+extern "C" void* BinkOpenWithOptions() {
+    Log("bink",
+        "BinkOpenWithOptions() -> 0x42494E4B (STUB: dummy handle, no "
+        "video decode)");
+    return (void*)0x42494E4BULL;  // "BINK"
+}
+
+
+ // XboxBvhBuilder.dll — DXR BVH builder (C++ methods; mangled export
+// names). Return types are read off the mangled names: QEAAX = void,
+// QEAAJ = HRESULT (long). The ctor takes (ID3D12Device11*, bool) and
+// does nothing; the methods are no-ops (no RT at boot). Rehydrate
+// returns S_OK.
+extern "C" void HleXboxBvhBuilderCtor() {
+    Log("bvh", "XboxBvhBuilder::XboxBvhBuilder (ctor) (STUB)");
+}
+extern "C" void HleXboxBvhBuilderDtor() {
+    Log("bvh", "XboxBvhBuilder::~XboxBvhBuilder (dtor) (STUB)");
+}
+extern "C" void HleXboxBvhBuilderBuildBatched2X() {
+    Log("bvh",
+        "XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X "
+        "(STUB)");
+}
+extern "C" void HleXboxBvhBuilderCopy() {
+    Log("bvh",
+        "XboxBvhBuilder::CopyRaytracingAccelerationStructure (STUB)");
+}
+extern "C" void HleXboxBvhBuilderGetPrebuildInfo() {
+    Log("bvh",
+        "XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo "
+        "(STUB)");
+}
+extern "C" HRESULT HleXboxBvhBuilderRehydrate2X() {
+    Log("bvh",
+        "XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X "
+        "-> S_OK (STUB)");
+    return S_OK;
+}
+extern "C" void HleXboxBvhBuilderSet64BitMortonCodes() {
+    Log("bvh", "XboxBvhBuilder::Set64BitMortonCodes (STUB)");
 }
 
 extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags) {
@@ -1408,9 +1887,11 @@ static const Export kExports[] = {
     // Graphics.
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", Status::kImplemented,
      (void*)HleD3D12XboxCreateDevice,
-     "IMPLEMENTED (phase 2). Real passthrough to desktop D3D12CreateDevice; "
-     "signature is D3D12CreateDevice-shaped (assumed) — the real Xbox form "
-     "takes D3D12XBOX_CREATE_DEVICE_PARAMETERS; confirm vs exe."},
+     "IMPLEMENTED (phase 2, real form 2026-11-23). Real 4-arg Xbox form "
+     "(adapter, &D3D12XBOX_CREATE_DEVICE_PARAMETERS, riid, &device) — "
+     "grounded from the exe's call site at 0x1424785b7; creates a real "
+     "desktop D3D12 device at the best feature level the hardware "
+     "offers (Xbox fixed level is 12_2; RX 5700 XT: 12_1)."},
     {"d3d12_xs.dll", "SetFrameIntervalX", Status::kImplemented,
      (void*)HleSetFrameIntervalX,
      "IMPLEMENTED (phase 2). Real pacing: stores the interval."},
@@ -1842,11 +2323,13 @@ static const Export kExports[] = {
      "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 10): explicit "
      "E_NOTIMPL stub (logged)."},
     {"d3d12_x.dll", "D3D12XCreateDevice", Status::kImplemented,
-     (void*)HleD3D12XboxCreateDevice,
-     "ERA adaptation (phase 5): same real-device passthrough as "
-     "d3d12_xs!D3D12XboxCreateDevice. Signature is D3D12CreateDevice-"
-     "shaped (ASSUMED) — a D3D11.x-only title does NOT import d3d12_x at "
-     "all, so no real ordinal is known."},
+     (void*)HleEraD3D12XCreateDevice,
+     "ERA adaptation (phase 5): D3D12CreateDevice-shaped (adapter, minFL, "
+     "riid, ppDevice) — a SEPARATE function from d3d12_xs!D3D12XboxCreateDevice, "
+     "which takes a params struct. Sharing one implementation crashed "
+     "era_gfx12 (0xC0000005: the feature level 0xb000 was read as a params "
+     "pointer). Signature ASSUMED — a D3D11.x-only title does NOT import "
+     "d3d12_x at all, so no real ordinal is known."},
     // Input.
     {"gameinput.dll", "GameInputCreate", Status::kStub,
      (void*)HleGameInputCreate, "STUB."},
@@ -1944,6 +2427,250 @@ static const Export kExports[] = {
      (void*)HleXPackageMountWithUiResult, "IMPLEMENTED (phase 3)."},
     {"xgameruntime.dll", "XPackageCloseMountHandle", Status::kImplemented,
      (void*)HleXPackageCloseMountHandle, "IMPLEMENTED (phase 3)."},
+
+    // ---- Real-exe imports (grounded 2026-11-23 from
+    // game_scarlett_master.exe's import table: 597 imports, 68 modules).
+    // The exe imports BY NAME — the only real ordinal is GameInput
+    // ordinal 1 (confirmed; the synthetic ordinal tables stay
+    // test-only). 97 entries were missing from the registry; they are
+    // added here: 13 real implementations (xmem + d3d12_xs + XCRDAPI)
+    // and 84 stubs (S_OK / void / dummy-handle). Anything the game
+    // calls that is still missing gets the E_NOTIMPL stub and an
+    // "IMPORT FAILED" loader line — the boot log will show it.
+    // Memory (xmem.dll) — real implementations.
+    {"xmem.dll", "XMemAllocDefault", Status::kImplemented,
+     (void*)HleXMemAllocDefault, "IMPLEMENTED (real-exe). HeapAlloc."},
+    {"xmem.dll", "XMemFreeDefault", Status::kImplemented,
+     (void*)HleXMemFreeDefault, "IMPLEMENTED (real-exe). HeapFree."},
+    {"xmem.dll", "XMemVirtualAlloc", Status::kImplemented,
+     (void*)HleXMemVirtualAlloc,
+     "IMPLEMENTED (real-exe). VirtualAlloc wrapper: strips Xbox alloc-type "
+     "bits, retries with PAGE_READWRITE when the Xbox protect value "
+     "fails."},
+    {"xmem.dll", "XMemGetWorkingSetStatistics", Status::kStub,
+     (void*)HleXMemGetWorkingSetStatistics,
+     "STUB (real-exe). S_OK; stats struct not filled (layout "
+     "GDKX-gated)."},
+    {"xmem.dll", "XMemIsToolsMemAvailable", Status::kImplemented,
+     (void*)HleXMemIsToolsMemAvailable,
+     "IMPLEMENTED (real-exe). FALSE: no devkit memory on desktop."},
+    {"xmem.dll", "XMemAllocatePhysicalPages", Status::kStub,
+     (void*)HleXMemAllocatePhysicalPages,
+     "STUB (real-exe). S_OK; no desktop physical-page pool."},
+    {"xmem.dll", "XMemFreePhysicalPages", Status::kStub,
+     (void*)HleXMemFreePhysicalPages,
+     "STUB (real-exe). S_OK; no desktop physical-page pool."},
+    {"xmem.dll", "XMemMapPhysicalPages", Status::kImplemented,
+     (void*)HleXMemMapPhysicalPages,
+     "IMPLEMENTED (real-exe). Ordinary committed memory returned as the "
+     "mapped VA (guarded size)."},
+    {"xmem.dll", "XMemMapPhysicalPagesScatter", Status::kImplemented,
+     (void*)HleXMemMapPhysicalPagesScatter,
+     "IMPLEMENTED (real-exe). Ordinary committed memory returned as the "
+     "mapped VA (guarded size)."},
+    {"xmem.dll", "XMemTransferMemory", Status::kImplemented,
+     (void*)HleXMemTransferMemory,
+     "IMPLEMENTED (real-exe). memcpy(dst, src, size)."},
+    // Graphics (d3d12_xs.dll) — real implementations.
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", Status::kImplemented,
+     (void*)HleD3D12ConfigureVirtualMemoryX,
+     "IMPLEMENTED (real-exe). S_OK: no desktop GPU VA space to "
+     "configure (the game int3-crashes if this fails)."},
+    {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature",
+     Status::kImplemented, (void*)HleD3D12SerializeVersionedRootSignature,
+     "IMPLEMENTED (real-exe). Forwards to desktop "
+     "D3D12SerializeVersionedRootSignature."},
+    // DirectStorage via XCRDAPI.dll (the real exe uses XCRDAPI.dll, not
+    // dstorage_xs.dll, for DStorageGetFactory).
+    {"XCRDAPI.dll", "DStorageGetFactory", Status::kStub,
+     (void*)HleDStorageGetFactory,
+     "STUB (real-exe). Same dummy-factory stub as dstorage_xs.dll."},
+
+    // chad.dll — S_OK stubs.
+    {"chad.dll", "XDspActivate", Status::kStub,
+     (void*)XDspActivate, "STUB (real-exe import, 2026-11-23)."},
+    {"chad.dll", "XDspConnectWithMaximumStreamLimit", Status::kStub,
+     (void*)XDspConnectWithMaximumStreamLimit, "STUB (real-exe import, 2026-11-23)."},
+    {"chad.dll", "XDspDeactivate", Status::kStub,
+     (void*)XDspDeactivate, "STUB (real-exe import, 2026-11-23)."},
+    {"chad.dll", "XDspDisconnect", Status::kStub,
+     (void*)XDspDisconnect, "STUB (real-exe import, 2026-11-23)."},
+    {"chad.dll", "XDspSubmitCommand", Status::kStub,
+     (void*)XDspSubmitCommand, "STUB (real-exe import, 2026-11-23)."},
+
+    // xg_xs.dll — S_OK stubs.
+    {"xg_xs.dll", "XGCreateTextureComputer", Status::kStub,
+     (void*)XGCreateTextureComputer, "STUB (real-exe import, 2026-11-23)."},
+    {"xg_xs.dll", "XGSuggestSwizzleMode", Status::kStub,
+     (void*)XGSuggestSwizzleMode, "STUB (real-exe import, 2026-11-23)."},
+
+    // amd_fidelityfx_loader_xbox.dll — S_OK stubs.
+    {"amd_fidelityfx_loader_xbox.dll", "ffxCreateContext", Status::kStub,
+     (void*)ffxCreateContext, "STUB (real-exe import, 2026-11-23)."},
+    {"amd_fidelityfx_loader_xbox.dll", "ffxDestroyContext", Status::kStub,
+     (void*)ffxDestroyContext, "STUB (real-exe import, 2026-11-23)."},
+    {"amd_fidelityfx_loader_xbox.dll", "ffxDispatch", Status::kStub,
+     (void*)ffxDispatch, "STUB (real-exe import, 2026-11-23)."},
+    {"amd_fidelityfx_loader_xbox.dll", "ffxQuery", Status::kStub,
+     (void*)ffxQuery, "STUB (real-exe import, 2026-11-23)."},
+
+    // xapu.dll — S_OK stubs.
+    {"xapu.dll", "XApuConnect", Status::kStub,
+     (void*)XApuConnect, "STUB (real-exe import, 2026-11-23)."},
+    {"xapu.dll", "XApuDequeueResult", Status::kStub,
+     (void*)XApuDequeueResult, "STUB (real-exe import, 2026-11-23)."},
+    {"xapu.dll", "XApuDisconnect", Status::kStub,
+     (void*)XApuDisconnect, "STUB (real-exe import, 2026-11-23)."},
+    {"xapu.dll", "XApuEnqueueCommand", Status::kStub,
+     (void*)XApuEnqueueCommand, "STUB (real-exe import, 2026-11-23)."},
+    {"xapu.dll", "XApuGetResultCount", Status::kStub,
+     (void*)XApuGetResultCount, "STUB (real-exe import, 2026-11-23)."},
+
+    // libHttpClient.GDK.dll — S_OK stubs.
+    {"libHttpClient.GDK.dll", "HCCleanupAsync", Status::kStub,
+     (void*)HCCleanupAsync, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallCloseHandle", Status::kStub,
+     (void*)HCHttpCallCloseHandle, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallCreate", Status::kStub,
+     (void*)HCHttpCallCreate, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallDuplicateHandle", Status::kStub,
+     (void*)HCHttpCallDuplicateHandle, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallGetRequestUrl", Status::kStub,
+     (void*)HCHttpCallGetRequestUrl, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallPerformAsync", Status::kStub,
+     (void*)HCHttpCallPerformAsync, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetHeaderAtIndex", Status::kStub,
+     (void*)HCHttpCallRequestGetHeaderAtIndex, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetNumHeaders", Status::kStub,
+     (void*)HCHttpCallRequestGetNumHeaders, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetRequestBodyBytes", Status::kStub,
+     (void*)HCHttpCallRequestGetRequestBodyBytes, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetRetryAllowed", Status::kStub,
+     (void*)HCHttpCallRequestGetRetryAllowed, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetRetryCacheId", Status::kStub,
+     (void*)HCHttpCallRequestGetRetryCacheId, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetRetryDelay", Status::kStub,
+     (void*)HCHttpCallRequestGetRetryDelay, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetTimeout", Status::kStub,
+     (void*)HCHttpCallRequestGetTimeout, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetTimeoutWindow", Status::kStub,
+     (void*)HCHttpCallRequestGetTimeoutWindow, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestGetUrl", Status::kStub,
+     (void*)HCHttpCallRequestGetUrl, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetHeader", Status::kStub,
+     (void*)HCHttpCallRequestSetHeader, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetRequestBodyBytes", Status::kStub,
+     (void*)HCHttpCallRequestSetRequestBodyBytes, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetRequestBodyString", Status::kStub,
+     (void*)HCHttpCallRequestSetRequestBodyString, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetRetryAllowed", Status::kStub,
+     (void*)HCHttpCallRequestSetRetryAllowed, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetRetryCacheId", Status::kStub,
+     (void*)HCHttpCallRequestSetRetryCacheId, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetRetryDelay", Status::kStub,
+     (void*)HCHttpCallRequestSetRetryDelay, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetTimeout", Status::kStub,
+     (void*)HCHttpCallRequestSetTimeout, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetTimeoutWindow", Status::kStub,
+     (void*)HCHttpCallRequestSetTimeoutWindow, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallRequestSetUrl", Status::kStub,
+     (void*)HCHttpCallRequestSetUrl, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetHeader", Status::kStub,
+     (void*)HCHttpCallResponseGetHeader, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetHeaderAtIndex", Status::kStub,
+     (void*)HCHttpCallResponseGetHeaderAtIndex, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetNetworkErrorCode", Status::kStub,
+     (void*)HCHttpCallResponseGetNetworkErrorCode, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetNumHeaders", Status::kStub,
+     (void*)HCHttpCallResponseGetNumHeaders, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetPlatformNetworkErrorMessage", Status::kStub,
+     (void*)HCHttpCallResponseGetPlatformNetworkErrorMessage, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetResponseBodyBytes", Status::kStub,
+     (void*)HCHttpCallResponseGetResponseBodyBytes, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetResponseBodyBytesSize", Status::kStub,
+     (void*)HCHttpCallResponseGetResponseBodyBytesSize, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetResponseString", Status::kStub,
+     (void*)HCHttpCallResponseGetResponseString, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallResponseGetStatusCode", Status::kStub,
+     (void*)HCHttpCallResponseGetStatusCode, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCHttpCallSetTracing", Status::kStub,
+     (void*)HCHttpCallSetTracing, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCInitialize", Status::kStub,
+     (void*)HCInitialize, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCSettingsGetTraceLevel", Status::kStub,
+     (void*)HCSettingsGetTraceLevel, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCTraceImplMessage", Status::kStub,
+     (void*)HCTraceImplMessage, "STUB (real-exe import, 2026-11-23)."},
+    {"libHttpClient.GDK.dll", "HCTraceSetEtwEnabled", Status::kStub,
+     (void*)HCTraceSetEtwEnabled, "STUB (real-exe import, 2026-11-23)."},
+
+    // Bink2Scarlett.dll — video stubs.
+    {"Bink2Scarlett.dll", "BinkClose", Status::kStub,
+     (void*)BinkClose, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkDoFrame", Status::kStub,
+     (void*)BinkDoFrame, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkDoFrameAsyncMulti", Status::kStub,
+     (void*)BinkDoFrameAsyncMulti, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkDoFrameAsyncWait", Status::kStub,
+     (void*)BinkDoFrameAsyncWait, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkFreeGlobals", Status::kStub,
+     (void*)BinkFreeGlobals, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkGetFrameBuffersInfo", Status::kStub,
+     (void*)BinkGetFrameBuffersInfo, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkGetPlatformInfo", Status::kStub,
+     (void*)BinkGetPlatformInfo, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkGoto", Status::kStub,
+     (void*)BinkGoto, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkNextFrame", Status::kStub,
+     (void*)BinkNextFrame, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkPause", Status::kStub,
+     (void*)BinkPause, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkRegisterFrameBuffers", Status::kStub,
+     (void*)BinkRegisterFrameBuffers, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkRequestStopAsyncThreadsMulti", Status::kStub,
+     (void*)BinkRequestStopAsyncThreadsMulti, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkSetMemory", Status::kStub,
+     (void*)BinkSetMemory, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkSetOSFileCallbacks", Status::kStub,
+     (void*)BinkSetOSFileCallbacks, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkSetSoundSystem", Status::kStub,
+     (void*)BinkSetSoundSystem, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkSetVolume", Status::kStub,
+     (void*)BinkSetVolume, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkSetWillLoop", Status::kStub,
+     (void*)BinkSetWillLoop, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkStartAsyncThread", Status::kStub,
+     (void*)BinkStartAsyncThread, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkWait", Status::kStub,
+     (void*)BinkWait, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkWaitStopAsyncThreadsMulti", Status::kStub,
+     (void*)BinkWaitStopAsyncThreadsMulti, "STUB (real-exe import, 2026-11-23)."},
+    {"Bink2Scarlett.dll", "BinkGetKeyFrame", Status::kStub,
+     (void*)BinkGetKeyFrame,
+     "STUB (real-exe import, 2026-11-23). Returns 0."},
+    {"Bink2Scarlett.dll", "BinkShouldSkip", Status::kStub,
+     (void*)BinkShouldSkip,
+     "STUB (real-exe import, 2026-11-23). Returns FALSE."},
+    {"Bink2Scarlett.dll", "BinkOpenWithOptions", Status::kStub,
+     (void*)BinkOpenWithOptions,
+     "STUB (real-exe import, 2026-11-23). Dummy non-NULL handle; no "
+     "video decode."},
+
+    // XboxBvhBuilder.dll — DXR BVH builder (C++ methods).
+    {"XboxBvhBuilder.dll", "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z", Status::kStub,
+     (void*)HleXboxBvhBuilderCtor, "STUB (real-exe import, 2026-11-23)."},
+    {"XboxBvhBuilder.dll", "??1XboxBvhBuilder@@QEAA@XZ", Status::kStub,
+     (void*)HleXboxBvhBuilderDtor, "STUB (real-exe import, 2026-11-23)."},
+    {"XboxBvhBuilder.dll", "?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList6@@IPEBUD3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2@@@Z", Status::kStub,
+     (void*)HleXboxBvhBuilderBuildBatched2X, "STUB (real-exe import, 2026-11-23)."},
+    {"XboxBvhBuilder.dll", "?CopyRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@_K1W4D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE@@@Z", Status::kStub,
+     (void*)HleXboxBvhBuilderCopy, "STUB (real-exe import, 2026-11-23)."},
+    {"XboxBvhBuilder.dll", "?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z", Status::kStub,
+     (void*)HleXboxBvhBuilderGetPrebuildInfo, "STUB (real-exe import, 2026-11-23)."},
+    {"XboxBvhBuilder.dll", "?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z", Status::kStub,
+     (void*)HleXboxBvhBuilderRehydrate2X, "STUB (real-exe import, 2026-11-23)."},
+    {"XboxBvhBuilder.dll", "?Set64BitMortonCodes@XboxBvhBuilder@@QEAAX_N@Z", Status::kStub,
+     (void*)HleXboxBvhBuilderSet64BitMortonCodes, "STUB (real-exe import, 2026-11-23)."},
 };
 
 static const char* kShimModules[] = {
@@ -1954,6 +2681,15 @@ static const char* kShimModules[] = {
     // LoadLibrary'd — none of them exist on desktop Windows.
     // (d3d12_x.dll was already in the list above.)
     "d3d11_x.dll", "kernelx.dll", "xg_x.dll", "AcpHal.dll",
+    // Real-exe modules (2026-11-23, from game_scarlett_master.exe's
+    // import table): the exe imports these by name, and none of them
+    // exists on desktop Windows, so they must resolve through the HLE
+    // registry — if one is missing here the loader falls through to
+    // real LoadLibraryA, which fails, and every import from it gets
+    // the E_NOTIMPL stub.
+    "chad.dll", "xg_xs.dll", "XboxBvhBuilder.dll", "XCRDAPI.dll",
+    "amd_fidelityfx_loader_xbox.dll", "libHttpClient.GDK.dll", "xapu.dll",
+    "Bink2Scarlett.dll",
 };
 
 static bool CiEq(const char* a, const char* b) {
@@ -1984,6 +2720,15 @@ const Export* FindExport(const char* module, const char* name) {
 // matter for a title that imports by ordinal. An earlier phase 5 pass
 // wrote wrong ordinals into these rows by mistake; the rows below are
 // the corrected Xbox One shim-DLL ordinals.
+//
+// REAL-EXE FINDING (2026-11-23, game_scarlett_master.exe, 597 imports):
+// the real Series X exe imports BY NAME — there are no real ordinals
+// to replace the synthetic ones with, and the synthetic tables stay
+// test-only (guest_ordinal exercises them). The ONE real ordinal in
+// the exe is GameInput.dll ordinal 1, and it matches the synthetic
+// row below (gameinput 1 = GameInputCreate) — that assignment is now
+// CONFIRMED real, not synthetic. Do NOT invent ordinal numbers for
+// the other modules.
 static const OrdinalExport kOrdinalExports[] = {
     {"xgameruntime.dll", 1, (void*)HleXGameRuntimeInitialize,
      "XGameRuntimeInitialize"},

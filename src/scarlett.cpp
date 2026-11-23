@@ -32,11 +32,57 @@ SC_API void* XMemAlloc(SIZE_T size, DWORD attrs) {
     return HleXMemAlloc(size, attrs);
 }
 SC_API void XMemFree(void* p) { HleXMemFree(p); }
-SC_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter,
-                                     D3D_FEATURE_LEVEL minFL, REFIID riid,
-                                     void** ppDevice) {
-    return HleD3D12XboxCreateDevice(adapter, minFL, riid, ppDevice);
+SC_API void* XMemAllocDefault(SIZE_T size) {
+    return HleXMemAllocDefault(size);
 }
+SC_API void XMemFreeDefault(void* p) { HleXMemFreeDefault(p); }
+SC_API void* XMemVirtualAlloc(void* lpAddress, SIZE_T dwSize,
+                              DWORD flAllocationType, DWORD flProtect,
+                              DWORD dwMemoryAttributes) {
+    return HleXMemVirtualAlloc(lpAddress, dwSize, flAllocationType,
+                               flProtect, dwMemoryAttributes);
+}
+SC_API HRESULT XMemGetWorkingSetStatistics(void* pStats) {
+    return HleXMemGetWorkingSetStatistics(pStats);
+}
+SC_API BOOL XMemIsToolsMemAvailable(void) {
+    return HleXMemIsToolsMemAvailable();
+}
+SC_API HRESULT XMemAllocatePhysicalPages(void) {
+    return HleXMemAllocatePhysicalPages();
+}
+SC_API HRESULT XMemFreePhysicalPages(void) {
+    return HleXMemFreePhysicalPages();
+}
+SC_API void* XMemMapPhysicalPages(const uint64_t* pPhysicalPages,
+                                  uint32_t dwPageCount,
+                                  DWORD dwMemoryAttributes, DWORD flProtect) {
+    return HleXMemMapPhysicalPages(pPhysicalPages, dwPageCount,
+                                   dwMemoryAttributes, flProtect);
+}
+SC_API void* XMemMapPhysicalPagesScatter(const uint64_t* pPhysicalPages,
+                                         uint32_t dwPageCount,
+                                         DWORD dwMemoryAttributes,
+                                         DWORD flProtect) {
+    return HleXMemMapPhysicalPagesScatter(pPhysicalPages, dwPageCount,
+                                          dwMemoryAttributes, flProtect);
+}
+SC_API void XMemTransferMemory(void* pDst, const void* pSrc, SIZE_T cbSize) {
+    HleXMemTransferMemory(pDst, pSrc, cbSize);
+}
+SC_API HRESULT D3D12XboxCreateDevice(
+    IUnknown* adapter,
+    const D3D12XBOX_CREATE_DEVICE_PARAMETERS* params, REFIID riid,
+    void** ppDevice) {
+    return HleD3D12XboxCreateDevice(adapter, params, riid, ppDevice);
+}
+SC_API HRESULT D3D12ConfigureVirtualMemoryX(const void* pConfig) {
+    return HleD3D12ConfigureVirtualMemoryX(pConfig);
+}
+// NOTE: no scarlett.cpp wrapper for D3D12SerializeVersionedRootSignature —
+// that name is already the desktop SDK function (d3d12.h), and defining
+// it here would conflict (C2733). The registry maps the Xbox import to
+// HleD3D12SerializeVersionedRootSignature, which calls the SDK function.
 SC_API HRESULT XAudio2Create(void** ppXAudio2, UINT32 flags, DWORD proc) {
     return HleXAudio2Create(ppXAudio2, flags, proc);
 }

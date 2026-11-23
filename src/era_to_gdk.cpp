@@ -44,10 +44,16 @@ bool StartsWithCi(const char* s, const char* prefix) {
 }  // namespace
 
 // ERA modules the layer translates. None of these exist on desktop
-// Windows, so the loader must never LoadLibrary them — they resolve
-// through the HLE registry instead (see hle_registry.cpp).
+// ERA modules (phase 5): the Xbox One shim DLLs. A title importing any
+// of these is ERA. AcpHal.dll is NOT in this list: it is the audio DSP
+// HAL, shared across Xbox One and Series X — the real GTA 6 (GDK)
+// exe imports it (9 imports), so counting it as ERA mis-detected a
+// GDK title as ERA (boot #1, 2026-11-23). The _x modules below are
+// the ERA-only signal. AcpHal.dll still resolves through the HLE
+// registry (kShimModules), never LoadLibrary — that is separate from
+// this detection list.
 static const char* kEraModules[] = {
-    "d3d11_x.dll", "d3d12_x.dll", "kernelx.dll", "xg_x.dll", "AcpHal.dll",
+    "d3d11_x.dll", "d3d12_x.dll", "kernelx.dll", "xg_x.dll",
 };
 
 bool EraIsEraModule(const char* module) {

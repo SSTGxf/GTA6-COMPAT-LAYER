@@ -29,9 +29,42 @@ extern "C" void HleXMemFree(void* p);
 // system-chosen address when the requested address fails.
 extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
                                   DWORD flAllocationType, DWORD flProtect);
-extern "C" HRESULT HleD3D12XboxCreateDevice(IUnknown* adapter,
+extern "C" HRESULT HleD3D12XboxCreateDevice(
+    IUnknown* adapter,
+    const D3D12XBOX_CREATE_DEVICE_PARAMETERS* params, REFIID riid,
+    void** ppDevice);
+// ERA d3d12_x!D3D12XCreateDevice — D3D12CreateDevice-shaped (adapter,
+// minFL, riid, ppDevice). SEPARATE from the GDK form above (see
+// hle_registry.cpp — sharing one implementation crashed era_gfx12).
+extern "C" HRESULT HleEraD3D12XCreateDevice(IUnknown* adapter,
                                             D3D_FEATURE_LEVEL minFL,
                                             REFIID riid, void** ppDevice);
+extern "C" HRESULT HleD3D12ConfigureVirtualMemoryX(const void* pConfig);
+extern "C" HRESULT HleD3D12SerializeVersionedRootSignature(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* pRootSignature,
+    ID3DBlob** ppBlob, ID3DBlob** ppErrorBlob);
+// Real-exe xmem additions (grounded 2026-11-23 from the exe's import
+// table; XMemVirtualAlloc's 5-arg form from its call site at
+// 0x14193e220).
+extern "C" void* HleXMemAllocDefault(SIZE_T size);
+extern "C" void HleXMemFreeDefault(void* p);
+extern "C" void* HleXMemVirtualAlloc(void* lpAddress, SIZE_T dwSize,
+                                     DWORD flAllocationType, DWORD flProtect,
+                                     DWORD dwMemoryAttributes);
+extern "C" HRESULT HleXMemGetWorkingSetStatistics(void* pStats);
+extern "C" BOOL HleXMemIsToolsMemAvailable(void);
+extern "C" HRESULT HleXMemAllocatePhysicalPages(void);
+extern "C" HRESULT HleXMemFreePhysicalPages(void);
+extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
+                                         uint32_t dwPageCount,
+                                         DWORD dwMemoryAttributes,
+                                         DWORD flProtect);
+extern "C" void* HleXMemMapPhysicalPagesScatter(const uint64_t* pPhysicalPages,
+                                                uint32_t dwPageCount,
+                                                DWORD dwMemoryAttributes,
+                                                DWORD flProtect);
+extern "C" void HleXMemTransferMemory(void* pDst, const void* pSrc,
+                                      SIZE_T cbSize);
 extern "C" HRESULT HleXAudio2Create(void** ppXAudio2, UINT32 flags, DWORD proc);
 extern "C" HRESULT HleGameInputCreate(void** ppGameInput);
 extern "C" HRESULT HleDStorageGetFactory(void** ppFactory);

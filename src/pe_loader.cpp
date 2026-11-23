@@ -6,10 +6,15 @@
 #include "era_to_gdk.h"  // ERA -> GDK translation (phase 5)
 #include "winrt_shim.h"  // WinRT CoreApplication shim (WinRT phase)
 #include "hle_registry.h"
+#include <cstdio>   // _snwprintf_s
 #include <cstring>
+#include <cwchar>    // wcsrchr
+#include <dbghelp.h>  // MiniDumpWriteDump (crash dumps)
 #include <intrin.h>  // __readgsqword
 #include <string>
 #include <vector>
+
+#pragma comment(lib, "Dbghelp.lib")
 
 namespace sc {
 
@@ -86,10 +91,8 @@ DWORD SectionProtection(DWORD characteristics) {
     if (exec) {
         prot = write ? PAGE_EXECUTE_READWRITE
                      : (read ? PAGE_EXECUTE_READ : PAGE_EXECUTE);
-    } else if (write) {
-        prot = PAGE_READWRITE;
     } else if (read) {
-        prot = PAGE_READONLY;
+        prot = write ? PAGE_READWRITE : PAGE_READONLY;
     } else {
         prot = PAGE_NOACCESS;
     }
@@ -143,6 +146,199 @@ void ApplySectionProtections(void* base, const IMAGE_NT_HEADERS64* nt) {
     }
 }
 
+// GTA 6 boot #3 fix (game_scarlett_master.exe): the title's global
+// memory-pool singleton has a derived vtable whose slot 6 is a deliberate
+// int3 trap (VA 0x1422106e0, bytes cc c3) in the shipped binary. During
+// static init the allocator's slot 0 returns NULL (empty, capacity 0)
+// and the guard calls slot 6 -> EXCEPTION_BREAKPOINT before main, before
+// any file I/O. The base class's slot 6 is a real stub (VA 0x140004810:
+// xor eax, eax; ret) and the caller ignores slot 6's return value, so
+// point the derived slot 6 at the base stub. Single 8-byte patch at a
+// fixed RVA; image base is stable (preferred 0x140000000), and all
+// addresses are computed base-relative so a relocated image still works
+// (relocations have already adjusted the vtable qword by then).
+// Fingerprint-gated on all three values, so proof guests (which have
+// neither the vtable nor the trap) are untouched. Runs while the image
+// is still RWX, before section protections make .rdata read-only.
+// Boot #5 (see gta6-exe-re/BOOT4-DIAGNOSIS.md): the vtable patch moved
+// the fault one step — F itself (RVA 0x2219620) is a noreturn path with
+// its own int3 at RVA 0x2219650 right after the slot-6 call, so slot 6
+// returning is fatal inside F. NOP that int3 (0xcc -> 0x90) so F
+// unlocks and returns and the guard returns NULL to its caller.
+// Fingerprint-gated on the byte being 0xcc plus the call before it
+// (FF 50 30 = call qword ptr [rax+0x30]) and the mov after it
+// (4C 89 F1 = mov rcx, r14), all verified against the exe bytes on
+// disk before patching.
+void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
+    // RVAs from the boot #3 diagnosis (see gta6-exe-re/BOOT3-DIAGNOSIS.md):
+    //   slot 6 qword  VA 0x1465f5450 -> RVA 0x65f5450
+    //   trap          VA 0x1422106e0 -> RVA 0x22106e0
+    //   base stub     VA 0x140004810 -> RVA 0x4810
+    // F's int3 (boot #5, see gta6-exe-re/BOOT4-DIAGNOSIS.md):
+    //   F int3        VA 0x142219650 -> RVA 0x2219650
+    const uint32_t kSlotRva = 0x65f5450;
+    const uint32_t kTrapRva = 0x22106e0;
+    const uint32_t kStubRva = 0x4810;
+    const uint32_t kFInt3Rva = 0x2219650;
+    const SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
+    if ((SIZE_T)kSlotRva + 8 > imageSize ||
+        (SIZE_T)kTrapRva + 2 > imageSize ||
+        (SIZE_T)kStubRva + 3 > imageSize ||
+        (SIZE_T)kFInt3Rva + 4 > imageSize) {
+        return;  // Too small to hold the Scarlett title's vtable/trap.
+    }
+    uint8_t* img = (uint8_t*)base;
+    uint64_t* slot = (uint64_t*)(img + kSlotRva);
+    const uint8_t* trap = img + kTrapRva;
+    const uint8_t* stub = img + kStubRva;
+    // Fingerprint: slot 6 must point at the int3 trap, the trap must be
+    // `cc c3`, and the base stub must be `31 c0 c3` (xor eax, eax; ret).
+    if (*slot != (uint64_t)img + kTrapRva) return;
+    if (trap[0] != 0xcc || trap[1] != 0xc3) return;
+    if (stub[0] != 0x31 || stub[1] != 0xc0 || stub[2] != 0xc3) return;
+    const uint64_t old = *slot;
+    *slot = (uint64_t)img + kStubRva;
+    Log("loader",
+        "scarlett vtable patch: slot6 0x%llx -> base stub 0x%llx "
+        "(was int3 trap)",
+        (unsigned long long)old, (unsigned long long)*slot);
+    // Boot #5: NOP F's own int3 so the patched slot-6 return does not
+    // die inside F. Fingerprint: the byte must be 0xcc, preceded by
+    // `call qword ptr [rax+0x30]` (FF 50 30) and followed by
+    // `mov rcx, r14` (4C 89 F1) — all verified against the exe bytes
+    // on disk (RVA 0x221964d: ff 50 30 cc 4c 89 f1). Runs in the same
+    // RWX window as the vtable patch, before section protections.
+    uint8_t* fInt3 = img + kFInt3Rva;
+    if (fInt3[0] == 0xcc && fInt3[-3] == 0xff && fInt3[-2] == 0x50 &&
+        fInt3[-1] == 0x30 && fInt3[1] == 0x4c && fInt3[2] == 0x89 &&
+        fInt3[3] == 0xf1) {
+        fInt3[0] = 0x90;
+        Log("loader",
+            "scarlett F int3 patch: 0xcc -> 0x90 at RVA 0x2219650 (NOP)");
+    } else {
+        Log("loader",
+            "scarlett F int3 patch: fingerprint mismatch, skipped "
+            "(byte 0x%02x, want 0xcc)",
+            fInt3[0]);
+    }
+    // Boot #6 / H1 Option A (see gta6-exe-re/BOOT6-H1-DIAGNOSIS.md):
+    // grow the pool at construction so slot 0 returns a real block.
+    // The pool is built as a 0x20-byte pool over a 0x60-byte BSS buffer;
+    // the caller needs a 4-byte bitmap + a 0x5c0-byte entries array, so
+    // slot 0 can never serve it as constructed. Patch the size constant
+    // (0x20 -> 0x100000) and the buffer lea (BSS global -> a
+    // layer-allocated 1 MB region, read through a scratch qword the
+    // layer writes before entry runs). Fingerprint-gated on the exact
+    // bytes below, verified against the exe bytes on disk first, so
+    // proof guests are untouched. Allocation happens only after both
+    // fingerprints pass.
+    // NOTE (2026-11-23, applied from OPTIONA-IMPLEMENTATION-SPEC.md):
+    // the spec wrote the buffer/scratch as RVAs 0x471be600/0x471be688,
+    // but the exe bytes prove they are RVAs 0x71be600/0x71be688
+    // (VA 0x1471be600/0x1471be688 minus image base 0x140000000;
+    // the buffer lea at RVA 0x1cff465 targets RVA 0x71be600, and the
+    // singleton lea just before it targets RVA 0x71be660). The spec's
+    // own fingerprint (bufTarget == kPoolBufRva) would have failed
+    // with the written values and skipped the patch, so the RVAs are
+    // corrected here; the patch bytes and disp (0x54bf21c) are
+    // unchanged.
+    const uint32_t kPoolSizeRva = 0x1cff1e0;    // mov ecx, 0x20
+    const uint32_t kPoolBufLeaRva = 0x1cff465;  // lea r8, [rip+...] (buffer)
+    const uint32_t kPoolScratchRva = 0x71be688; // [obj+0x28], BSS, 0
+    const uint32_t kPoolBufRva = 0x71be600;     // BSS buffer the lea loads
+    const uint32_t kPoolSize = 0x100000;
+    if ((SIZE_T)kPoolSizeRva + 5 > imageSize ||
+        (SIZE_T)kPoolBufLeaRva + 7 > imageSize ||
+        (SIZE_T)kPoolScratchRva + 8 > imageSize) {
+        Log("loader", "scarlett pool patch: RVAs out of range, skipped");
+        return;
+    }
+    // Fingerprints (all verified against the exe bytes on disk):
+    //   size site:  b9 20 00 00 00, preceded by lea rsi,[rsp+0x28]
+    //               (48 8d 74 24 28), followed by mov byte [rsi+0x10],0
+    //               (c6 46 10 00).
+    //   buffer site: 4c 8d 05 94 f1 4b 05, preceded by
+    //               lea rcx,[rip+0x54bf1fb] (48 8d 0d fb f1 4b 05),
+    //               followed by mov edx,8 (ba 08 00 00 00); the lea's
+    //               target must be the BSS buffer (RVA 0x71be600).
+    uint8_t* sizeSite = img + kPoolSizeRva;
+    uint8_t* bufSite = img + kPoolBufLeaRva;
+    const int32_t bufDisp =
+        *(const int32_t*)(bufSite + 3);
+    const uint32_t bufTarget =
+        kPoolBufLeaRva + 7 + (uint32_t)bufDisp;
+    const bool sizeOk =
+        sizeSite[0] == 0xb9 && sizeSite[1] == 0x20 &&
+        sizeSite[2] == 0x00 && sizeSite[3] == 0x00 &&
+        sizeSite[4] == 0x00 &&
+        sizeSite[-5] == 0x48 && sizeSite[-4] == 0x8d &&
+        sizeSite[-3] == 0x74 && sizeSite[-2] == 0x24 &&
+        sizeSite[-1] == 0x28 &&
+        sizeSite[5] == 0xc6 && sizeSite[6] == 0x46 &&
+        sizeSite[7] == 0x10 && sizeSite[8] == 0x00;
+    const bool bufOk =
+        bufSite[0] == 0x4c && bufSite[1] == 0x8d &&
+        bufSite[2] == 0x05 && bufSite[3] == 0x94 &&
+        bufSite[4] == 0xf1 && bufSite[5] == 0x4b &&
+        bufSite[6] == 0x05 && bufTarget == kPoolBufRva &&
+        bufSite[-7] == 0x48 && bufSite[-6] == 0x8d &&
+        bufSite[-5] == 0x0d && bufSite[-4] == 0xfb &&
+        bufSite[-3] == 0xf1 && bufSite[-2] == 0x4b &&
+        bufSite[-1] == 0x05 &&
+        bufSite[7] == 0xba && bufSite[8] == 0x08 &&
+        bufSite[9] == 0x00 && bufSite[10] == 0x00 &&
+        bufSite[11] == 0x00;
+    if (!sizeOk || !bufOk) {
+        Log("loader",
+            "scarlett pool patch: fingerprint mismatch, skipped "
+            "(size ok=%d, buffer ok=%d)",
+            (int)sizeOk, (int)bufOk);
+        return;
+    }
+    // Scratch qword must still be 0 (BSS); if something already wrote
+    // it, do not clobber unknown state.
+    uint64_t* scratch = (uint64_t*)(img + kPoolScratchRva);
+    if (*scratch != 0) {
+        Log("loader",
+            "scarlett pool patch: scratch qword already 0x%llx, skipped",
+            (unsigned long long)*scratch);
+        return;
+    }
+    void* poolBuf = VirtualAlloc(nullptr, kPoolSize,
+                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!poolBuf) {
+        Log("loader", "scarlett pool patch: VirtualAlloc failed (%lu)",
+            GetLastError());
+        return;
+    }
+    *scratch = (uint64_t)poolBuf;
+    Log("loader",
+        "scarlett pool scratch: wrote buffer %p to RVA 0x71be688 "
+        "([obj+0x28])",
+        poolBuf);
+    // Size: mov ecx, 0x20 -> mov ecx, 0x100000.
+    sizeSite[0] = 0xb9;
+    sizeSite[1] = 0x00;
+    sizeSite[2] = 0x00;
+    sizeSite[3] = 0x10;
+    sizeSite[4] = 0x00;
+    Log("loader",
+        "scarlett pool size patch: mov ecx,0x20 -> mov ecx,0x100000 "
+        "at RVA 0x1cff1e0");
+    // Buffer: lea r8, [rip+0x54bf194] -> mov r8, [rip+0x54bf21c]
+    // (loads the layer-written buffer address from the scratch qword).
+    bufSite[0] = 0x4c;
+    bufSite[1] = 0x8b;
+    bufSite[2] = 0x05;
+    bufSite[3] = 0x1c;
+    bufSite[4] = 0xf2;
+    bufSite[5] = 0x4b;
+    bufSite[6] = 0x05;
+    Log("loader",
+        "scarlett pool buffer patch: lea r8,[BSS] -> mov r8,[scratch] "
+        "at RVA 0x1cff465");
+}
+
 // Per-thread TLS for guest worker threads (phase 3). SetupTls fills
 // this in for the main thread; a guest thread created through the
 // guest's own CreateThread/CreateRemoteThread import gets the same
@@ -157,6 +353,123 @@ struct TlsTemplateInfo {
     bool valid = false;
 };
 static TlsTemplateInfo g_tlsInfo;
+
+// ---- TLS /GA view (Seth's decision 2026-11-23: Leonida's patch+view,
+// approach (B), implemented clean-room from the digest description) ----
+//
+// The game reads its per-thread pool from TLS array[0] + 0x13a8 through
+// a hardcoded slot-0 deref (boot #6: 9,084 sites). The real Windows
+// loader always gives the process exe TLS index 0, but our loader's
+// TlsAlloc() returns a higher index, so the exe block sits elsewhere.
+// Approach (A) — put the block at array[0] + save/restore the host
+// slot-0 owner — worked on the synthetic guests (build 13 green, era
+// 21/21) but boot #7 still died on a worker thread at the same thunk
+// (0x140104075, rcx=0x7fffffff), so Seth chose (B):
+//
+//  - PatchGaTlsReads: scan every executable section for the 9-byte
+//    `mov r64, gs:[58h]` (the TLS-array load: 65 48/4C 8B modrm 25
+//    58 00 00 00) and rewrite its disp32 from 0x58 to
+//    0x1480 + 8*gaSlot, i.e. TEB->TlsSlots[gaSlot]. Same length, so
+//    nothing else moves; runs while the image is RWX, before any
+//    image code (TLS callbacks included).
+//  - The /GA view: a per-thread fake 64-entry array (512 bytes) with
+//    view[0] = view[tlsIndex] = the guest block, rest NULL, stored via
+//    TlsSetValue(gaSlot, view) (+ a direct TEB TlsSlots write). The
+//    exe's patched `mov r64, gs:[58h]` now loads the view, and
+//    [view+0] is the exe's block. The real array[0] (the host DLL's
+//    block) is never touched — no save/restore of the host slot-0
+//    owner is needed.
+//  - The guest's __tls_index slot is set to the TlsAlloc index, and
+//    the block still goes to tlsArr[tlsIndex] too, so any TLS access
+//    the patch misses still lands on the block through __tls_index.
+//
+// One TlsAlloc index for the /GA view, allocated once (process-wide
+// index, per-thread value). Lazily allocated on first use.
+static DWORD g_gaSlot = TLS_OUT_OF_INDEXES;
+static DWORD GaSlot() {
+    if (g_gaSlot == TLS_OUT_OF_INDEXES) g_gaSlot = TlsAlloc();
+    return g_gaSlot;
+}
+
+// TEB->TlsSlots lives at TEB+0x1480 on x64 (64 slots). The patched
+// `mov r64, gs:[58h]` reads gs:[0x1480 + 8*gaSlot] == TlsSlots[gaSlot].
+static PVOID* TlsSlots() {
+    uint8_t* teb = (uint8_t*)__readgsqword(0x30);  // TEB Self
+    return (PVOID*)(teb + 0x1480);
+}
+
+// Build the per-thread /GA view for `block`: 64 entries, view[0] and
+// view[tlsIndex] both point at the block, the rest NULL. Installs it
+// in TlsSlots[gaSlot] (via TlsSetValue and a direct TEB write) and
+// returns the view (owned by the caller; free with FreeGaView).
+static void* InstallGaView(void* block, DWORD tlsIndex) {
+    DWORD slot = GaSlot();
+    if (slot == TLS_OUT_OF_INDEXES) return nullptr;
+    void** view = (void**)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                    64 * sizeof(void*));
+    if (!view) return nullptr;
+    view[0] = block;
+    if (tlsIndex < 64) view[tlsIndex] = block;
+    TlsSetValue(slot, view);
+    TlsSlots()[slot] = view;
+    return view;
+}
+
+// Remove the calling thread's /GA view (frees it). No-op if none.
+static void FreeGaView() {
+    DWORD slot = g_gaSlot;
+    if (slot == TLS_OUT_OF_INDEXES) return;
+    void* view = TlsGetValue(slot);
+    TlsSetValue(slot, nullptr);
+    TlsSlots()[slot] = nullptr;
+    if (view) HeapFree(GetProcessHeap(), 0, view);
+}
+
+// Rewrite every `mov r64, gs:[58h]` in the executable sections so it
+// loads TlsSlots[gaSlot] (the /GA view) instead of the TLS array.
+// Pattern (9 bytes): 65 (48|4C) 8B modrm 25 58 00 00 00, where modrm
+// has mod=00, rm=100 (SIB follows) and reg = the destination register.
+// Only the disp32 (bytes 5..8) is rewritten, to 0x1480 + 8*gaSlot;
+// the instruction keeps its length. Returns the number of sites
+// patched. Runs while the image is RWX, before section protections.
+static size_t PatchGaTlsReads(void* base, const IMAGE_NT_HEADERS64* nt) {
+    DWORD slot = GaSlot();
+    if (slot == TLS_OUT_OF_INDEXES) {
+        Log("loader", "WARNING: GA TLS patch skipped (no TlsAlloc slot)");
+        return 0;
+    }
+    const DWORD newDisp = 0x1480 + 8 * slot;
+    static const uint8_t kModrm[8] = {0x04, 0x0C, 0x14, 0x1C,
+                                      0x24, 0x2C, 0x34, 0x3C};
+    size_t patched = 0;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* begin = (uint8_t*)base + sec->VirtualAddress;
+        uint8_t* end = begin + sec->Misc.VirtualSize;
+        for (uint8_t* p = begin; p + 9 <= end; ++p) {
+            if (p[0] != 0x65) continue;
+            if (p[1] != 0x48 && p[1] != 0x4C) continue;
+            if (p[2] != 0x8B) continue;
+            bool modrmOk = false;
+            for (uint8_t m : kModrm) {
+                if (p[3] == m) { modrmOk = true; break; }
+            }
+            if (!modrmOk) continue;
+            if (p[4] != 0x25) continue;
+            if (p[5] != 0x58 || p[6] != 0x00 || p[7] != 0x00 ||
+                p[8] != 0x00) continue;
+            *(DWORD*)(p + 5) = newDisp;  // rewrite only the disp32
+            ++patched;
+            p += 8;  // skip past this instruction
+        }
+    }
+    Log("loader",
+        "GA TLS patch: %zu mov r64, gs:[58h] sites -> TlsSlots[%lu] "
+        "(disp 0x%x)",
+        patched, slot, newDisp);
+    return patched;
+}
 
 // Real thread-creation functions, captured when the guest's IAT is
 // hooked (their FT entries hold the real addresses after import
@@ -189,6 +502,11 @@ static void* EnsureThreadTls() {
     }
     PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
     tlsArr[g_tlsInfo.index] = block;
+    // Install this thread's /GA view so the guest's patched
+    // `mov r64, gs:[58h]` loads the guest block (via TlsSlots[gaSlot]).
+    // The real array[0] is never touched. Must run before the
+    // DLL_THREAD_ATTACH callbacks below (guest code).
+    InstallGaView(block, g_tlsInfo.index);
     if (g_tlsInfo.callbacks) {
         for (size_t i = 0; g_tlsInfo.callbacks[i]; ++i) {
             __try {
@@ -222,6 +540,8 @@ static void CleanupThreadTls() {
     TlsSetValue(g_tlsInfo.index, nullptr);
     PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
     tlsArr[g_tlsInfo.index] = nullptr;
+    // Remove this thread's /GA view (frees it).
+    FreeGaView();
     if (block) HeapFree(GetProcessHeap(), 0, block);
 }
 
@@ -299,7 +619,23 @@ void HookThreadCreation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
     for (; desc && desc->Name; ++desc) {
         const char* modName =
             (const char*)RvaToFile(file, nt, desc->Name, nullptr);
-        if (!modName || !CiEq(modName, "kernel32.dll")) continue;
+        // CreateThread/CreateRemoteThread live in kernel32, but a
+        // modern (GDK) title imports them through the processthreads
+        // API set (api-ms-win-core-processthreads-l1-1-0.dll), which
+        // forwards to kernel32. Boot #8 proved the hook missed the
+        // real exe for exactly this reason: its CreateThread import
+        // is under the API-set name, so a worker thread was created
+        // without ScarlettThreadStart (no guest TLS, no /GA view) and
+        // faulted on a patched TLS read with a NULL view. Match the
+        // API sets too (the WinRT hook already does this for combase).
+        if (!modName) continue;
+        bool isKernel32 =
+            CiEq(modName, "kernel32.dll") ||
+            CiEq(modName, "api-ms-win-core-processthreads-l1-1-0.dll") ||
+            CiEq(modName, "api-ms-win-core-processthreads-l1-1-1.dll") ||
+            CiEq(modName, "api-ms-win-core-processthreads-l1-1-2.dll") ||
+            CiEq(modName, "api-ms-win-core-processthreads-l1-1-3.dll");
+        if (!isKernel32) continue;
         uint32_t oftRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
                                                    : desc->FirstThunk;
         auto* oft = (const IMAGE_THUNK_DATA64*)RvaToFile(file, nt, oftRva,
@@ -456,19 +792,31 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
     if (!tlsDir.VirtualAddress) return true;
     auto* tls = (const IMAGE_TLS_DIRECTORY64*)((uint8_t*)base +
                                                tlsDir.VirtualAddress);
+    // The layer keeps a TlsAlloc index for its own bookkeeping
+    // (TlsSetValue/TlsGetValue/TlsFree + the direct TEB write at that
+    // slot), and the GUEST's __tls_index slot is set to that same
+    // index. The guest's hardcoded slot-0 reads (boot #6: the pool at
+    // TLS array[0] + 0x13a8, 9,084 sites) are handled by the /GA view
+    // instead: PatchGaTlsReads rewrote every `mov r64, gs:[58h]` to
+    // load TlsSlots[gaSlot] (the view), and view[0] = view[index] =
+    // the block. The real array[0] is never touched.
     DWORD index = TlsAlloc();
     if (index == TLS_OUT_OF_INDEXES) {
         Log("loader", "WARNING: TlsAlloc failed (%lu)", GetLastError());
         return false;
     }
-    // The guest's __tls_index slot (a VA into the image, relocated).
+    // The guest's __tls_index slot (a VA into the image, relocated):
+    // the TlsAlloc index, so __declspec(thread) access via
+    // __tls_index reads the block (through the /GA view, or through
+    // tlsArr[index] if a site escaped the patch).
     DWORD* indexSlot = (DWORD*)tls->AddressOfIndex;
     *indexSlot = index;
     Log("loader",
-        "TLS dir: rawdata [%p, %p) indexSlot %p (now %lu) callbacks %p",
+        "TLS dir: rawdata [%p, %p) indexSlot %p (guest index %lu, layer "
+        "TlsAlloc index %lu) callbacks %p",
         (void*)tls->StartAddressOfRawData,
         (void*)tls->EndAddressOfRawData, (void*)tls->AddressOfIndex,
-        *indexSlot, (void*)tls->AddressOfCallBacks);
+        index, index, (void*)tls->AddressOfCallBacks);
     SIZE_T templateSize =
         (SIZE_T)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
     void* block = nullptr;
@@ -504,13 +852,22 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
         PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
         tlsArr[index] = block;
     }
-    // Confirm the slot actually holds the block (diagnostic: TlsGetValue
+    // Install this thread's /GA view (view[0] = view[index] = block)
+    // so the guest's patched `mov r64, gs:[58h]` loads the block. The
+    // real array[0] is never touched. Must run before the TLS
+    // callbacks below (guest code).
+    out->gaView = InstallGaView(block, index);
+    // Confirm the slots actually hold the block (diagnostic: TlsGetValue
     // and the direct TEB read have disagreed in testing).
     {
         void* check = TlsGetValue(index);
         PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
-        Log("loader", "TLS slot check: TlsGetValue=%p TEB->TLS[%lu]=%p",
-            check, index, tlsArr[index]);
+        Log("loader",
+            "TLS slot check: TlsGetValue=%p TEB->TLS[%lu]=%p "
+            "GA view=%p view[0]=%p view[%lu]=%p",
+            check, index, tlsArr[index], out->gaView,
+            out->gaView ? ((void**)out->gaView)[0] : nullptr, index,
+            out->gaView ? ((void**)out->gaView)[index] : nullptr);
     }
     out->tlsBlock = block;
     out->tlsIndex = index;
@@ -560,8 +917,10 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
             memcpy(block, (void*)tls->StartAddressOfRawData, templateSize);
         }
     }
-    Log("loader", "TLS: index %lu, template %zu bytes, block %p", index,
-        templateSize, block);
+    Log("loader",
+        "TLS: guest index %lu, layer index %lu, template %zu bytes, "
+        "block %p, GA view %p (gaSlot %lu)",
+        index, index, templateSize, block, out->gaView, g_gaSlot);
     return true;
 }
 
@@ -879,6 +1238,18 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     // before protections).
     if (out->eraDetected) HookWinRtActivation(buf, nt, base);
 
+    // GTA 6 boot #3/#5 fix: patch the derived vtable's slot 6 and NOP
+    // F's int3 (see ApplyScarlettVtablePatch). Must run while the image
+    // is still RWX, i.e. before section protections make .rdata
+    // read-only.
+    ApplyScarlettVtablePatch(base, nt);
+
+    // TLS /GA patch (approach (B), Seth's decision): rewrite every
+    // `mov r64, gs:[58h]` to load the /GA view from TlsSlots[gaSlot].
+    // Same window as above — while the image is RWX, before section
+    // protections and before any image code (TLS callbacks) runs.
+    PatchGaTlsReads(base, nt);
+
     // Final page protections: per-section (text XR, rodata R, data RW).
     // Applied AFTER relocations + imports, which write into the image.
     ApplySectionProtections(base, nt);
@@ -891,20 +1262,144 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     return true;
 }
 
+// Shared crash-dump writer: logs the exception record and the faulting
+// thread's TLS array state, then writes a full-memory minidump next to
+// the harness exe. Used by CrashFilter (entry thread, via __except)
+// and by UnhandledFilter (any thread, via SetUnhandledExceptionFilter).
+// Boot #7 crashed on a worker thread (0x140104075, rcx=0x7fffffff) and
+// the __except never fired, so no dump was written — the worker-thread
+// path needs this filter. Runs on the faulting thread, so the TEB read
+// below is that thread's TLS array.
+static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* where) {
+    if (!ep || !ep->ExceptionRecord) {
+        Log("loader", "guest crashed (%s): no exception record", where);
+        return;
+    }
+    EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    if (r->NumberParameters >= 2) {
+        Log("loader",
+            "guest crashed (%s): exception 0x%08x at %p "
+            "(record %p, params[0]=0x%llx params[1]=0x%llx) thread %lu",
+            where, r->ExceptionCode, r->ExceptionAddress, r,
+            (unsigned long long)r->ExceptionInformation[0],
+            (unsigned long long)r->ExceptionInformation[1],
+            (unsigned long)GetCurrentThreadId());
+    } else {
+        Log("loader",
+            "guest crashed (%s): exception 0x%08x at %p (record %p) "
+            "thread %lu",
+            where, r->ExceptionCode, r->ExceptionAddress, r,
+            (unsigned long)GetCurrentThreadId());
+    }
+    // Faulting thread's TLS state: the /GA view (TlsSlots[gaSlot])
+    // and the allocator's pool slot [view[0]+0x13a8]. Guarded — the
+    // view pointer may itself be garbage.
+    __try {
+        PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+        void* view = (g_gaSlot != TLS_OUT_OF_INDEXES)
+                         ? TlsSlots()[g_gaSlot]
+                         : nullptr;
+        void* poolSlot = nullptr;
+        if (view && ((void**)view)[0]) {
+            poolSlot = *(void**)((uint8_t*)((void**)view)[0] + 0x13a8);
+        }
+        Log("loader",
+            "crash TLS: thread %lu tlsArr[0]=%p tlsArr[%lu]=%p "
+            "GA view=%p view[0]=%p [view[0]+0x13a8]=%p",
+            (unsigned long)GetCurrentThreadId(), tlsArr ? tlsArr[0] : nullptr,
+            g_tlsInfo.valid ? g_tlsInfo.index : 0,
+            (tlsArr && g_tlsInfo.valid) ? tlsArr[g_tlsInfo.index] : nullptr,
+            view, view ? ((void**)view)[0] : nullptr, poolSlot);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "crash TLS: faulting thread TLS unreadable");
+    }
+    // Dump path: directory of this exe (verify.exe / ScarlettCompat.dll
+    // dir), fixed name so each crash overwrites the last.
+    wchar_t exePath[MAX_PATH] = {};
+    wchar_t dumpPath[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+        wchar_t* slash = wcsrchr(exePath, L'\\');
+        if (slash) *slash = L'\0';
+        _snwprintf_s(dumpPath, MAX_PATH, _TRUNCATE, L"%s\\scarlett_crash.dmp",
+                     exePath);
+    } else {
+        _snwprintf_s(dumpPath, MAX_PATH, _TRUNCATE,
+                     L"scarlett_crash.dmp");
+    }
+    HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        Log("loader", "minidump: cannot create %ls (err %lu)", dumpPath,
+            GetLastError());
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION mei = {};
+    mei.ThreadId = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers = FALSE;
+    BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
+                                hFile, MiniDumpWithFullMemory, &mei,
+                                nullptr, nullptr);
+    if (ok) {
+        LARGE_INTEGER size = {};
+        GetFileSizeEx(hFile, &size);
+        Log("loader", "minidump: wrote %ls (%lld bytes, full memory)",
+            dumpPath, size.QuadPart);
+    } else {
+        Log("loader", "minidump: MiniDumpWriteDump failed (err %lu)",
+            GetLastError());
+    }
+    CloseHandle(hFile);
+}
+
+// Unhandled-exception filter: catches a fatal crash on ANY thread
+// (the __except in RunXboxPe only covers the entry thread). Writes the
+// full-memory dump via WriteCrashDump and lets the process terminate.
+static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS* ep) {
+    WriteCrashDump(ep, "unhandled");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Crash filter for the guest entry point (GTA 6 boot #6 / H1 harness
+// improvement). Runs in the exception
+// filter expression, where GetExceptionInformation() is valid — the
+// __except handler body cannot see the record. Logs the exception
+// record address (so the next boot's fault address is known, not just
+// the code) and writes a full-memory minidump so the guest image —
+// including the allocator singleton in .data — is readable on the next
+// failure. WER's small dumps did not contain it. The dump goes next to
+// the harness exe (F:\ScarlettCompat), NEVER next to the guest: the
+// child CWD is the guest dir (D:\game\game), which is read-only for us.
+// NOTE: MiniDumpWithFullMemory includes all committed memory, so the
+// dump is ~5 GB (the committed XMem arenas); the two 24 GB arenas are
+// reserved-only and are not included.
+LONG CrashFilter(EXCEPTION_POINTERS* ep) {
+    WriteCrashDump(ep, "entry");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 bool RunXboxPe(LoadedPe* pe, DWORD* exitCode) {
     typedef DWORD(WINAPI* EntryFn)();
+    // Catch a fatal crash on ANY thread (boot #7 died on a worker
+    // thread and the __except below never fired). Installed here so it
+    // is live for the whole guest run.
+    SetUnhandledExceptionFilter(UnhandledFilter);
     // TLS state just before the entry point (diagnostic).
     if (pe->tlsIndexValid) {
         void* check = TlsGetValue(pe->tlsIndex);
         PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
-        Log("loader", "TLS pre-entry: TlsGetValue=%p TEB->TLS[%lu]=%p",
-            check, pe->tlsIndex, tlsArr[pe->tlsIndex]);
+        Log("loader",
+            "TLS pre-entry: TlsGetValue=%p TEB->TLS[%lu]=%p "
+            "GA view=%p view[0]=%p (guest block %p)",
+            check, pe->tlsIndex, tlsArr[pe->tlsIndex], pe->gaView,
+            pe->gaView ? ((void**)pe->gaView)[0] : nullptr,
+            pe->tlsBlock);
     }
     __try {
         DWORD rc = ((EntryFn)pe->entry)();
         *exitCode = rc;
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (CrashFilter(GetExceptionInformation())) {
         *exitCode = (DWORD)GetExceptionCode();
         Log("loader", "guest crashed in entry: exception 0x%08x",
             *exitCode);
@@ -916,6 +1411,7 @@ void FreeXboxPe(LoadedPe* pe) {
     if (pe->tlsIndexValid) {
         TlsSetValue(pe->tlsIndex, nullptr);
         if (pe->tlsBlock) HeapFree(GetProcessHeap(), 0, pe->tlsBlock);
+        FreeGaView();  // clears TlsSlots[gaSlot] and frees the view
         TlsFree(pe->tlsIndex);
     }
     if (pe->base) VirtualFree(pe->base, 0, MEM_RELEASE);

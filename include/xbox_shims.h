@@ -23,13 +23,72 @@ HRESULT XGameRuntimeInitialize(void);
 void* XMemAlloc(SIZE_T size, DWORD allocationAttributes);
 void XMemFree(void* p);
 
-// D3D12XboxCreateDevice — D3D12CreateDevice-shaped signature (ASSUMED).
-// Real Xbox form takes D3D12XBOX_CREATE_DEVICE_PARAMETERS (GDKX-gated);
-// the layer translates the assumed form to a real desktop D3D12 device
-// (phase 2). Confirm the real form against the exe's import table once
-// it lands.
-HRESULT D3D12XboxCreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL minFeatureLevel,
-                              REFIID riid, void** ppDevice);
+// D3D12XboxCreateDevice — REAL signature (grounded 2026-11-23 from the
+// real exe's call site at 0x1424785b7, corroborated by the public Xbox
+// SDK guide's sample: D3D12XboxCreateDevice(nullptr, &params,
+// IID_PPV_ARGS(&device))).
+//   HRESULT D3D12XboxCreateDevice(IUnknown* pAdapter,
+//       const D3D12XBOX_CREATE_DEVICE_PARAMETERS* pParameters,
+//       REFIID riid, void** ppDevice);
+// The game passes adapter=NULL (default adapter) and a params struct.
+// params.Version at +0x00 is 0x20004 (SDK 2.4: (2 << 16) | 4 — matches
+// the "SDK 2.4" the Series X GDK reports). The struct carries NO
+// feature level: on Xbox the level is fixed at 12_2 (DirectX 12
+// Ultimate), so the layer takes the best level the desktop hardware
+// offers (RX 5700 XT: 12_1). Field offsets beyond Version are from the
+// guide's declaration order (Version, GraphicsSwitchingMode,
+// ProcessDebugFlags) + the call-site writes (+0x04 = 0,
+// +0x08 = 0x100000, +0x20/+0x24 = bytes from globals, +0x28 = 1,
+// +0x3c = 0x20); the layer reads Version and logs the rest.
+// The old D3D12CreateDevice-shaped (adapter, minFL, riid, ppDevice)
+// form was ASSUMED and is now replaced — do not use it.
+typedef struct D3D12XBOX_CREATE_DEVICE_PARAMETERS {
+    UINT32 Version;                // +0x00: 0x20004 at the real call site
+    UINT32 GraphicsSwitchingMode;  // +0x04: 0 (D3D12XBOX_MODE_PROCESS = 0)
+    UINT32 ProcessDebugFlags;      // +0x08: 0x100000 at the real call site
+    UINT8 reserved[0x50 - 0x0c];   // +0x0c..0x4f (struct is 80 bytes)
+} D3D12XBOX_CREATE_DEVICE_PARAMETERS;
+
+HRESULT D3D12XboxCreateDevice(
+    IUnknown* pAdapter,
+    const D3D12XBOX_CREATE_DEVICE_PARAMETERS* pParameters, REFIID riid,
+    void** ppDevice);
+
+// D3D12ConfigureVirtualMemoryX — REAL signature (grounded 2026-11-23
+// from the real exe's call site at 0x141e1cfe0): ONE arg, a pointer to
+// a config struct (32 bytes, zeroed, struct+4 = a computed value).
+// Returns HRESULT; the game hits int3 if it fails, so the layer MUST
+// return S_OK (there is no GPU VA space to configure on desktop).
+HRESULT D3D12ConfigureVirtualMemoryX(const void* pConfig);
+
+// D3D12SerializeVersionedRootSignature — NOT redeclared here: it is
+// already declared in the desktop SDK (d3d12.h), and redeclaring it
+// inside this header's extern "C" block conflicts with the SDK
+// declaration (C2733). The layer's HleD3D12SerializeVersionedRootSignature
+// (src/hle_registry.cpp) calls the SDK function directly; the registry
+// maps the Xbox import to that Hle function. No wrapper in
+// src/scarlett.cpp either, for the same reason. NOTE: the desktop form
+// is 3-arg (pRootSignature, ppBlob, ppErrorBlob) — NO riid (the 4-arg
+// riid form belongs to the older non-versioned D3D12SerializeRootSignature);
+// the Xbox form is assumed to match (see hle_registry.cpp).
+
+// XMemAllocDefault / XMemFreeDefault — Xbox extended memory API
+// (xmem.dll). Same heap as XMemAlloc/XMemFree, no attributes arg.
+void* XMemAllocDefault(SIZE_T size);
+void XMemFreeDefault(void* p);
+
+// XMemVirtualAlloc — REAL signature (grounded 2026-11-23 from the
+// real exe's call site at 0x14193e220):
+//   void* XMemVirtualAlloc(void* lpAddress, SIZE_T dwSize,
+//       DWORD flAllocationType, DWORD flProtect,
+//       DWORD dwMemoryAttributes);
+// Returns the allocated VA (NULL on failure). The call site passes
+// type 0x20003000 (the same Xbox alloc-type bits as kernelx!
+// VirtualAlloc) and attributes 0x2004; protect 0x283 is an Xbox
+// protection encoding, not a desktop PAGE_* value.
+void* XMemVirtualAlloc(void* lpAddress, SIZE_T dwSize,
+                       DWORD flAllocationType, DWORD flProtect,
+                       DWORD dwMemoryAttributes);
 
 // XAudio2Create — public XAudio2 2.9 signature (xaudio2.h).
 struct IXAudio2;

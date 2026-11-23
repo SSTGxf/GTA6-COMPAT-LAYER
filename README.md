@@ -411,9 +411,12 @@ Steps 1, 2, and 2.5 are done and verified (above).
 
 **Next steps:** shader lifting (DXIL route) and `d3d12_xs` → D3D12
 translation beyond the device-method surface (PSOs, resource views,
-command recording); DirectStorage queues; confirm the real ordinal
-numbers and the true `D3D12XboxCreateDevice` signature from the exe's
-import table the moment it lands.
+command recording); DirectStorage queues. **Done 2026-11-23:** the real
+ordinal numbers and the true `D3D12XboxCreateDevice` signature are
+confirmed from the exe's import table — the exe imports by name (the
+only real ordinal is GameInput ordinal 1, confirmed), and the true
+device signature is the 4-arg `(adapter, &params, riid, &device)` form
+(see docs/REAL-EXE-INTEGRATION.md).
 
 ## Layout
 

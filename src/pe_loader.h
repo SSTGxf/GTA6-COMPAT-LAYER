@@ -20,6 +20,7 @@ struct LoadedPe {
     void* tlsBlock = nullptr;   // Per-thread TLS block (this thread).
     DWORD tlsIndex = 0;         // TlsAlloc index for this module.
     bool tlsIndexValid = false;
+    void* gaView = nullptr;     // Per-thread /GA view (this thread).
     bool eraDetected = false;   // True when the guest imports ERA modules
                                 // (phase 5): its ERA imports route through
                                 // the ERA -> GDK translation.
