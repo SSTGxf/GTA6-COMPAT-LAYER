@@ -5,6 +5,7 @@
 #include "pe_loader.h"
 #include "hle_registry.h"
 #include <cstring>
+#include <intrin.h>  // __readgsqword
 #include <string>
 #include <vector>
 
@@ -192,6 +193,24 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
         TlsFree(index);
         return false;
     }
+    // Write the block DIRECTLY into the TEB TLS array as well: the
+    // compiler's __declspec(thread) access reads TEB->TLS[index] via
+    // gs:[58h], and in this process TlsSetValue's slot and the TEB array
+    // slot disagree (TlsGetValue returns the block, the direct TEB read
+    // returns a stale pointer), so the direct write is what the guest's
+    // TLS access actually sees. TlsSetValue is kept for TlsGetValue.
+    {
+        PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+        tlsArr[index] = block;
+    }
+    // Confirm the slot actually holds the block (diagnostic: TlsGetValue
+    // and the direct TEB read have disagreed in testing).
+    {
+        void* check = TlsGetValue(index);
+        PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+        Log("loader", "TLS slot check: TlsGetValue=%p TEB->TLS[%lu]=%p",
+            check, index, tlsArr[index]);
+    }
     out->tlsBlock = block;
     out->tlsIndex = index;
     out->tlsIndexValid = true;
@@ -217,6 +236,15 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
 
 bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     memset(out, 0, sizeof(*out));
+    // The guest directory becomes the XPackage mount path.
+    {
+        std::wstring dir = path;
+        size_t p = dir.find_last_of(L"\\/");
+        if (p != std::wstring::npos) {
+            dir = dir.substr(0, p);
+            SetGuestDir(dir.c_str());
+        }
+    }
     auto fail = [&](const char* fmt, ...) {
         va_list ap; va_start(ap, fmt);
         vsnprintf(err, errSize, fmt, ap);
@@ -443,6 +471,13 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
 
 bool RunXboxPe(LoadedPe* pe, DWORD* exitCode) {
     typedef DWORD(WINAPI* EntryFn)();
+    // TLS state just before the entry point (diagnostic).
+    if (pe->tlsIndexValid) {
+        void* check = TlsGetValue(pe->tlsIndex);
+        PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+        Log("loader", "TLS pre-entry: TlsGetValue=%p TEB->TLS[%lu]=%p",
+            check, pe->tlsIndex, tlsArr[pe->tlsIndex]);
+    }
     __try {
         DWORD rc = ((EntryFn)pe->entry)();
         *exitCode = rc;

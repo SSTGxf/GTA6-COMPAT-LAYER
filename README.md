@@ -92,18 +92,24 @@ Implemented / stubbed now:
 |---|---|---|---|
 | `xgameruntime.dll` | `XGameRuntimeInitialize` | stub | First GDK call; returns S_OK |
 | `xmem.dll` | `XMemAlloc` / `XMemFree` | implemented | Real process-heap backing |
-| `d3d12_xs.dll` | `D3D12XboxCreateDevice` | stub | Signature assumed D3D12CreateDevice-shaped; real translation pending |
-| `d3d12_xs.dll` | `SetFrameIntervalX` / `ScheduleFrameEventX` / `WaitFrameEventX` | stub | Frame pacing (real pacing needed for stability) |
+| `d3d12_xs.dll` | `D3D12XboxCreateDevice` | implemented | Real passthrough to desktop `D3D12CreateDevice` |
+| `d3d12_xs.dll` | `SetFrameIntervalX` / `ScheduleFrameEventX` / `WaitFrameEventX` | implemented | Real frame pacing (waitable timer) |
+| `d3d12_xs.dll` | First `d3d12_xs` frame | implemented | 640x360 rendered via shim device, pixel verified via readback |
 | `XAudio2_9.dll` | `XAudio2Create` | stub | XMA2 decode is 0% everywhere |
 | `gameinput.dll` | `GameInputCreate` | stub | — |
 | `dstorage_xs.dll` | `DStorageGetFactory` | stub | No queues/files yet |
+| — | `XAsync` | implemented | Synchronous completion model |
+| — | `XUser` | implemented | Silent default user ("Player") |
+| — | `XGameSave` | implemented | Local-only provider |
+| — | `XPackage` | implemented | Mount path = guest dir |
 
-Tracked as not-implemented: `XUserAddAsync` / `XUserGetId`, plus whole
-areas not yet in the registry — XGameSave / XGameSaveFiles, XPackage
-(mount/chunks), XAsync / XTaskQueue, XSAPI (live Xbox Live — stub/fail-soft
-only), XGameUI / TCUI, XDisplay, XSystem, XStore, Game Chat, AcpHal / XMA,
-DirectStorage queues + BCPack, shader lifting, texture de-tiling
-(`XBOX_TILEMODE_SCARLETT`), unified memory (`MEM_GRAPHICS`).
+Tracked as not-implemented: `XGameSaveCreateUpdate` /
+`XGameSaveSubmitBlobWrite` / `XGameSaveFiles` /
+`XPackageEnumeratePackages`, plus whole areas not yet in the registry —
+XSAPI (live Xbox Live — stub/fail-soft only), XGameUI / TCUI, XDisplay,
+XSystem, XStore, Game Chat, AcpHal / XMA, DirectStorage queues + BCPack,
+shader lifting, texture de-tiling (`XBOX_TILEMODE_SCARLETT`), unified
+memory (`MEM_GRAPHICS`).
 
 ### 3. Shim DLLs (`src/scarlett.cpp`, `defs/*.def`)
 
@@ -189,15 +195,48 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-22 (scaffolding, day 1)
+## Status — 2026-11-22 (phase 2 complete: built to work, not just scaffold)
 
-**The honest bar for this scaffolding (15-hour window):** a loader +
-shimmed boot path for a synthetic guest title and a first `d3d12_xs`
+**What works now (verified on the build machine, both harness guests
+ALL PASS):**
+
+- Xbox PE32+ loader: maps a native x86-64 PE into the host process,
+  validates the `.xbld` section (GXDK build strings), applies base
+  relocations, and resolves imports — Xbox DLLs to the HLE registry,
+  `api-ms-win-*` / system DLLs to real Windows. **Phase 2:** per-section
+  page protections (`.text` XR, `.rdata` R, `.data` RW — guest-verified
+  via VirtualQuery), TLS handling (slot + block + template copy +
+  `.CRT$XLB` callbacks, `__declspec(thread)` var reads its template
+  value), and an ordinal table (synthetic ordinals; `guest_ordinal`
+  imports by ordinal and passes).
+- HLE registry (Xenia-style tags): `XGameRuntimeInitialize`, `XMemAlloc` /
+  `XMemFree` (real heap backing), **`D3D12XboxCreateDevice` — real
+  passthrough to desktop `D3D12CreateDevice` (no longer a stub)**,
+  **real frame pacing** (`SetFrameIntervalX` / `ScheduleFrameEventX` /
+  `WaitFrameEventX`, waitable-timer), **first real `d3d12_xs` frame**
+  (640x360 rendered via the shim device, center pixel verified via
+  readback), `XAudio2Create`, `GameInputCreate`, `DStorageGetFactory`,
+  plus **implemented boot-critical services: `XAsync` (sync completion),
+  `XUser` (silent default user), `XGameSave` (local-only provider),
+  `XPackage` (mount path = guest dir)**.
+- Verification harness (`scarlett_verify.exe`): runs a guest PE through
+  the layer in a throwaway child process and reports **pass/fail per
+  subsystem**. Final clean build: `guest_minimal` ALL PASS (real device,
+  frame, protections, TLS, services), `guest_ordinal` ALL PASS (57
+  imports resolved, 0 failed).
+- Swapchain Present is **environment-blocked** in the harness session
+  (DXGI 0x887a0022; a standalone probe fails identically — no compositor
+  in that session), so the frame is proven by render + readback pixel
+  verification, with Present best-effort. Re-verify Present when the
+  build machine has an interactive session.
+
+**The honest bar for this work (15-hour window):** a loader + shimmed
+boot path for a synthetic guest title and a first `d3d12_xs`
 frame — **not GTA 6 playable.** No public project boots this game; the
 realistic ladder is (1) synthetic guest boots, (2) first `d3d12_xs` frame
 on screen, (3) one small real Game Core title boots, (4) only then point
 the layer at the GTA VI exe once it lands and read its import table.
-Step 1 is done and verified (above).
+Steps 1 and 2 are done and verified (above).
 
 **Blocked on the exe (nothing here can substitute):**
 
@@ -221,11 +260,11 @@ Step 1 is done and verified (above).
   the build machine's RX 5700 XT (RDNA1) has neither, so the full GTA VI
   pipeline cannot be verified on it (9,282 mesh shaders + DXR in the game).
 
-**Next steps:** real `D3D12XboxCreateDevice` → `D3D12CreateDevice`
-translation (stub now), first real `d3d12_xs` frame/swapchain,
-XUser/XGameSave/XPackage handlers, ordinal tables for Xbox DLLs,
-per-section page protections, TLS handling — then the exe's import table
-the moment it lands.
+**Next steps:** `d3d12_xs` → D3D12 translation beyond device creation
+(command lists, resources, shaders/DXIL); confirm the real ordinal
+numbers and the true `D3D12XboxCreateDevice` signature from the exe's
+import table the moment it lands; re-verify swapchain Present in an
+interactive session.
 
 ## Layout
 

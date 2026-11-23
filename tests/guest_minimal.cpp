@@ -46,11 +46,6 @@ static void NTAPI TlsCallback(PVOID base, DWORD reason, PVOID reserved) {
 __declspec(allocate(".CRT$XLB")) static PIMAGE_TLS_CALLBACK g_tlsCb =
     TlsCallback;
 
-// The linker's per-module TLS index (written by the loader at load time).
-// The symbol is _tls_index (single underscore) — __tls_index is not
-// defined for this link; the compiler's own TLS access uses _tls_index.
-extern "C" ULONG _tls_index;
-
 static FILE* g_report = nullptr;
 
 static void Report(const char* name, bool pass, const char* detail) {
@@ -61,6 +56,128 @@ static void Report(const char* name, bool pass, const char* detail) {
         if (detail) fprintf(g_report, "%s_detail=%s\n", name, detail);
         fflush(g_report);
     }
+}
+
+// Services (phase 2, milestone E): XUser sign-in (silent default user),
+// XAsync completion, XGameSave provider + container, XPackage mount path.
+static bool g_userCallbackRan = false;
+static void CALLBACK UserAddCallback(XAsyncBlock* async) {
+    (void)async;
+    g_userCallbackRan = true;
+}
+
+static void CALLBACK TestAsyncWork(XAsyncBlock* async) {
+    async->internal[1] = (void*)42;
+}
+
+static bool TestServices(char* detail, size_t n) {
+    // XUser: silent add -> status -> result -> id/gamertag/localid.
+    XAsyncBlock async = {};
+    async.callback = UserAddCallback;
+    HRESULT hr = XUserAddAsync(XUserAddOptions_AddDefaultUserSilently, &async);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XUserAddAsync hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    if (!g_userCallbackRan) {
+        snprintf(detail, n, "XUserAddAsync callback did not run");
+        return false;
+    }
+    hr = XAsyncGetStatus(&async, FALSE);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XAsyncGetStatus hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    XUserHandle user = nullptr;
+    hr = XUserAddResult(&async, &user);
+    if (FAILED(hr) || !user) {
+        snprintf(detail, n, "XUserAddResult hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    uint64_t xuid = 0;
+    hr = XUserGetId(user, &xuid);
+    if (FAILED(hr) || xuid == 0) {
+        snprintf(detail, n, "XUserGetId hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    char tag[32] = {};
+    size_t tagSize = sizeof(tag);
+    hr = XUserGetGamertag(user, XUserGamertagOptions_UniqueModern, tag,
+                          &tagSize);
+    if (FAILED(hr) || strcmp(tag, "Player") != 0) {
+        snprintf(detail, n, "XUserGetGamertag hr=0x%08x tag=%s",
+                 (unsigned)hr, tag);
+        return false;
+    }
+    XUserLocalId localId = {};
+    hr = XUserGetLocalId(user, &localId);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XUserGetLocalId hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    // XAsyncRun: work runs synchronously and completes the block.
+    XAsyncBlock runBlk = {};
+    hr = XAsyncRun(&runBlk, TestAsyncWork);
+    size_t resultSize = 0;
+    HRESULT hr2 = XAsyncGetResultSize(&runBlk, &resultSize);
+    if (FAILED(hr) || FAILED(hr2) || resultSize != 42) {
+        snprintf(detail, n, "XAsyncRun hr=0x%08x resultSize=%zu",
+                 (unsigned)hr, resultSize);
+        return false;
+    }
+    // XGameSave: initialize provider + create a container, then close.
+    XGameSaveProviderHandle provider = nullptr;
+    hr = XGameSaveInitializeProvider(
+        user, "00000000-0000-0000-0000-000000000001", FALSE, &provider);
+    if (FAILED(hr) || !provider) {
+        snprintf(detail, n, "XGameSaveInitializeProvider hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+    XGameSaveContainerHandle container = nullptr;
+    hr = XGameSaveCreateContainer(provider, "test-container", &container);
+    if (FAILED(hr) || !container) {
+        snprintf(detail, n, "XGameSaveCreateContainer hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveCloseProvider(provider);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveCloseProvider hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    // XPackage: mount path + packaged flag.
+    uint32_t mountSize = 0;
+    hr = XPackageGetMountPathSize(&mountSize);
+    if (FAILED(hr) || mountSize == 0) {
+        snprintf(detail, n, "XPackageGetMountPathSize hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+    wchar_t mountPath[MAX_PATH] = {};
+    uint32_t mountCap = MAX_PATH;
+    hr = XPackageGetMountPath(mountPath, &mountCap);
+    if (FAILED(hr) || mountCap == 0 || mountPath[0] == 0) {
+        snprintf(detail, n, "XPackageGetMountPath hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    BOOL packaged = XPackageIsPackagedProcess();
+    if (!packaged) {
+        snprintf(detail, n, "XPackageIsPackagedProcess returned FALSE");
+        return false;
+    }
+    hr = XUserCloseHandle(user);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XUserCloseHandle hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    snprintf(detail, n,
+             "user xuid=0x%llx tag=%s local=%llu mount=%lu chars "
+             "packaged=%d",
+             (unsigned long long)xuid, tag,
+             (unsigned long long)localId.value, mountCap, (int)packaged);
+    return true;
 }
 
 // Per-section page protections (phase 2, milestone C): the loader must
@@ -560,31 +677,21 @@ int main() {
 
     // TLS (loader, milestone D): callback ran at load, __declspec(thread)
     // variable reads its template value (42) and is writable per-thread.
-    // Diagnostic: dump the TLS block + __tls_index so a mismatch between
-    // the loader's block and the guest's view is visible.
     detail[0] = 0;
     int tlsInit = g_tlsVar;
-    void* tlsBlk = TlsGetValue(_tls_index);
-    // The compiler's TLS access reads its index from the TLS directory's
-    // AddressOfIndex slot (0x1800080E8 per the loader log) — NOT from
-    // _tls_index. Read that slot directly to see if it still holds the
-    // loader's index at main time.
-    DWORD slotIdx = *(volatile DWORD*)0x1800080E8;
-    void* slotBlk = TlsGetValue(slotIdx);
-    const uint8_t* tb = (const uint8_t*)tlsBlk;
     bool tlsOk = g_tlsCallbackRan && (tlsInit == 42);
     g_tlsVar = 123;
     tlsOk = tlsOk && (g_tlsVar == 123);
-    snprintf(detail, sizeof(detail),
-             "callback=%d idx=%lu blk=%p bytes=%02x %02x %02x %02x %02x "
-             "%02x %02x %02x slotIdx=%lu slotBlk=%p varAddr=%p init=%d "
-             "set=%d",
-             (int)g_tlsCallbackRan, _tls_index, tlsBlk,
-             tb ? tb[0] : 0, tb ? tb[1] : 0, tb ? tb[2] : 0, tb ? tb[3] : 0,
-             tb ? tb[4] : 0, tb ? tb[5] : 0, tb ? tb[6] : 0, tb ? tb[7] : 0,
-             slotIdx, slotBlk, (void*)&g_tlsVar, tlsInit, g_tlsVar);
+    snprintf(detail, sizeof(detail), "callback=%d init=%d set=%d",
+             (int)g_tlsCallbackRan, tlsInit, g_tlsVar);
     Report("tls", tlsOk, detail);
     allBoot &= tlsOk;
+
+    // Services (milestone E): XUser / XAsync / XGameSave / XPackage.
+    detail[0] = 0;
+    ok = TestServices(detail, sizeof(detail));
+    Report("services", ok, detail);
+    allBoot &= ok;
 
     printf("[guest] boot path %s\n", allBoot ? "ALL PASS" : "FAIL");
     if (g_report) fclose(g_report);

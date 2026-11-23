@@ -1,5 +1,23 @@
 LIBRARY xgameruntime
 EXPORTS
     XGameRuntimeInitialize
+    XAsyncGetStatus
+    XAsyncGetResultSize
+    XAsyncCancel
+    XAsyncRun
     XUserAddAsync
+    XUserAddResult
     XUserGetId
+    XUserGetGamertag
+    XUserGetLocalId
+    XUserCloseHandle
+    XGameSaveInitializeProvider
+    XGameSaveCloseProvider
+    XGameSaveCreateContainer
+    XPackageGetMountPathSize
+    XPackageGetMountPath
+    XPackageIsPackagedProcess
+    XPackageGetCurrentProcessPackageIdentifier
+    XPackageMountWithUiAsync
+    XPackageMountWithUiResult
+    XPackageCloseMountHandle
