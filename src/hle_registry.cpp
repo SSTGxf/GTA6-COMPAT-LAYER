@@ -84,14 +84,14 @@ extern "C" void HleXMemFree(void* p) {
     if (p) HeapFree(GetProcessHeap(), 0, p);
 }
 
-// ---- kernelx!VirtualAlloc (FH2 boot #2 fix, 2026-11-23) ----
+// ---- kernelx!VirtualAlloc (VirtualAlloc flag-translation fix, 2026-11-23) ----
 // The ERA guest's region-descriptor builder calls kernelx!VirtualAlloc
 // with Xbox-specific allocation-type bits (0x30002000 / 0x40002000).
 // The loader used to forward kernelx!VirtualAlloc verbatim to the real
 // kernel32.dll, and desktop VirtualAlloc rejects those high bits with
 // ERROR_INVALID_PARAMETER (NULL, err 87 — confirmed on the PC), so the
 // guest's region base/size came back 0 and its descriptor-fill loop ran
-// away off a minimal HeapAlloc(0) block (fault at guest +0x125EFDA).
+// away off a minimal HeapAlloc(0) block until it faulted.
 // This wrapper strips every bit desktop VirtualAlloc does not accept,
 // keeping the desktop-valid allocation-type set, and retries with a
 // system-chosen address when the requested address fails (the guest
@@ -1701,152 +1701,152 @@ static const Export kExports[] = {
     // xg_x.dll / AcpHal.dll functions have no GDK equivalent: they get
     // explicit E_NOTIMPL stubs (logged) instead of the generic missing-
     // import stub, so the log shows exactly which no-equivalent call
-    // the title hit. Ordinals below are WinDurango's shim-DLL
-    // ordinals (dumpbin /exports 2026-11-23) — see kOrdinalExports.
+    // the title hit. Ordinals below are the Xbox One shim-DLL
+    // ordinals — see kOrdinalExports.
     {"kernelx.dll", "XMemAlloc", Status::kImplemented, (void*)HleXMemAlloc,
      "ERA 1:1 map (phase 5): same API as xmem.dll!XMemAlloc, real HeapAlloc."},
     {"kernelx.dll", "XMemFree", Status::kImplemented, (void*)HleXMemFree,
      "ERA 1:1 map (phase 5): same API as xmem.dll!XMemFree, real HeapFree."},
     {"kernelx.dll", "XMemAllocDefault", Status::kImplemented,
      (void*)EraXMemAllocDefault,
-     "ERA 1:1 map (phase 5, WinDurango ordinal 515): default CRT alloc "
+     "ERA 1:1 map (phase 5, Xbox One shim-DLL ordinal 515): default CRT alloc "
      "impl, "
      "real HeapAlloc."},
     {"kernelx.dll", "XMemFreeDefault", Status::kImplemented,
      (void*)EraXMemFreeDefault,
-     "ERA 1:1 map (phase 5, WinDurango ordinal 518): default CRT free "
+     "ERA 1:1 map (phase 5, Xbox One shim-DLL ordinal 518): default CRT free "
      "impl, "
      "real HeapFree."},
     {"kernelx.dll", "VirtualAlloc", Status::kImplemented,
      (void*)HleVirtualAlloc,
-     "IMPLEMENTED (FH2 boot #2 fix, 2026-11-23): flag translation — "
+     "IMPLEMENTED (VirtualAlloc flag-translation fix, 2026-11-23): flag translation — "
      "strips the Xbox-specific allocation-type bits (0x30002000 / "
      "0x40002000) desktop VirtualAlloc rejects (NULL, err 87), keeps "
      "the desktop-valid set, retries with a system-chosen address "
      "when the requested address fails. Without it the guest's region "
-     "builder got size 0 and ran away (fault at guest +0x125EFDA)."},
+     "builder got size 0 and ran away."},
     {"kernelx.dll", "HleVirtualAlloc", Status::kImplemented,
      (void*)HleVirtualAlloc,
-     "IMPLEMENTED (FH2 boot #2 fix). Test hook: the same wrapper under "
+     "IMPLEMENTED (VirtualAlloc flag-translation fix). Test hook: the same wrapper under "
      "its own name, so the era guest can unit-test the flag translation "
      "without importing the name VirtualAlloc from kernelx (which would "
      "reroute the CRT's VirtualAlloc calls). The real routing is the "
      "VirtualAlloc entry above."},
     {"kernelx.dll", "XMemSetAllocationHooks", Status::kStub,
      (void*)EraXMemSetAllocationHooks,
-     "ERA adaptation (phase 5, WinDurango ordinal 524): hooks accepted, "
+     "ERA adaptation (phase 5, Xbox One shim-DLL ordinal 524): hooks accepted, "
      "logged, not routed — layer allocations do not call title hooks."},
     {"kernelx.dll", "TitleMemoryStatus", Status::kStub,
      (void*)EraTitleMemoryStatus,
-     "ERA adaptation (phase 5, WinDurango ordinal 463): ASSUMED "
+     "ERA adaptation (phase 5, Xbox One shim-DLL ordinal 463): ASSUMED "
      "signature "
      "(one pointer); struct zero-filled, no fabricated budget."},
     {"d3d11_x.dll", "D3D11XCreateDevice", Status::kImplemented,
      (void*)EraD3D11XCreateDevice,
      "ERA adaptation (phase 5): real desktop D3D11 device. Form "
-     "matches WinDurango's public EraD3D11CreateDevice (10-arg "
-     "D3D11CreateDevice shape); the real FH2 exe does NOT import this "
+     "matches the public Xbox One shim-DLL EraD3D11CreateDevice (10-arg "
+     "D3D11CreateDevice shape); an Xbox One title does NOT import this "
      "entry (it imports D3D11XCreateDeviceX)."},
     {"d3d11_x.dll", "D3D11XCreateDeviceAndSwapChain", Status::kImplemented,
      (void*)EraD3D11XCreateDeviceAndSwapChain,
      "ERA adaptation (phase 5): real desktop D3D11 device + DXGI "
-     "swapchain. Same form as D3D11XCreateDevice (WinDurango's public "
+     "swapchain. Same form as D3D11XCreateDevice (the public Xbox One shim-DLL "
      "EraD3D11CreateDeviceAndSwapChain is a stub, so this entry is the "
      "layer's own adaptation)."},
     {"d3d11_x.dll", "D3D11XCreateDeviceX", Status::kImplemented,
      (void*)EraD3D11XCreateDeviceX,
-     "ERA adaptation (phase 5, WinDurango ordinal 4): the device entry "
-     "the real FH2 exe imports. Real desktop D3D11 device; GROUNDED "
-     "3-arg form (params struct, device, context — WinDurango's public "
+     "ERA adaptation (phase 5, Xbox One shim-DLL ordinal 4): the device entry "
+     "an Xbox One title imports. Real desktop D3D11 device; GROUNDED "
+     "3-arg form (params struct, device, context — the public Xbox One shim-DLL "
      "d3d11.x.cpp)."},
     {"d3d11_x.dll", "D3DMapEsramMemory", Status::kImplemented,
      (void*)EraD3DMapEsramMemory,
-     "ERA adaptation (phase 5, WinDurango ordinal 9): ESRAM mapping — "
+     "ERA adaptation (phase 5, Xbox One shim-DLL ordinal 9): ESRAM mapping — "
      "real committed memory at the requested VA, 32 MB arena budget "
-     "enforced; GROUNDED signature (WinDurango's public d3d11.x.cpp)."},
+     "enforced; GROUNDED signature (the public Xbox One shim-DLL d3d11.x.cpp)."},
     {"d3d11_x.dll", "DXGIXPresentArray", Status::kImplemented,
      (void*)EraDXGIXPresentArray,
-     "ERA adaptation (phase 5, WinDurango ordinal 11): presents every "
-     "swapchain in the array; GROUNDED signature (WinDurango's public "
+     "ERA adaptation (phase 5, Xbox One shim-DLL ordinal 11): presents every "
+     "swapchain in the array; GROUNDED signature (the public Xbox One shim-DLL "
      "d3d11.x.cpp)."},
     {"d3d11_x.dll", "D3DAllocateGraphicsMemory", Status::kImplemented,
      (void*)EraD3DAllocateGraphicsMemory,
      "ERA adaptation (phase 5, supporting): graphics-memory allocator, "
-     "VirtualAlloc-backed; GROUNDED shape (WinDurango's public "
-     "d3d11.x.cpp). The real FH2 exe does not import it."},
+     "VirtualAlloc-backed; GROUNDED shape (the public Xbox One shim-DLL "
+     "d3d11.x.cpp). An Xbox One title does not import it."},
     {"d3d11_x.dll", "D3DFreeGraphicsMemory", Status::kImplemented,
      (void*)EraD3DFreeGraphicsMemory,
      "ERA adaptation (phase 5, supporting): frees a graphics-memory "
      "allocation (VirtualFree); same source as above."},
     {"xg_x.dll", "XGComputeOptimalDepthStencilTileModes",
      Status::kNotImplemented, (void*)EraXGComputeOptimalDepthStencilTileModes,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 2): Xbox texture "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 2): Xbox texture "
      "tiling has no desktop equivalent; explicit E_NOTIMPL stub "
      "(logged)."},
     {"xg_x.dll", "XGComputeOptimalTileMode", Status::kNotImplemented,
      (void*)EraXGComputeOptimalTileMode,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 3): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 3): explicit "
      "E_NOTIMPL stub (logged)."},
     {"xg_x.dll", "XGComputeTexture2DLayout", Status::kNotImplemented,
      (void*)EraXGComputeTexture2DLayout,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 5): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 5): explicit "
      "E_NOTIMPL stub (logged)."},
     {"xg_x.dll", "XGComputeTexture3DLayout", Status::kNotImplemented,
      (void*)EraXGComputeTexture3DLayout,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 6): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 6): explicit "
      "E_NOTIMPL stub (logged)."},
     {"xg_x.dll", "XGCreateTexture1DComputer", Status::kNotImplemented,
      (void*)EraXGCreateTexture1DComputer,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 8): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 8): explicit "
      "E_NOTIMPL stub (logged)."},
     {"xg_x.dll", "XGCreateTexture2DComputer", Status::kNotImplemented,
      (void*)EraXGCreateTexture2DComputer,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 9): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 9): explicit "
      "E_NOTIMPL stub (logged)."},
     {"xg_x.dll", "XGCreateTexture3DComputer", Status::kNotImplemented,
      (void*)EraXGCreateTexture3DComputer,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 10): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 10): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "AcpHalAllocateShapeContexts", Status::kNotImplemented,
      (void*)EraAcpHalAllocateShapeContexts,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 1): the ACP audio "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 1): the ACP audio "
      "DSP has no desktop equivalent; explicit E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "AcpHalCreate", Status::kNotImplemented,
      (void*)EraAcpHalCreate,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 2): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 2): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "AcpHalReleaseShapeContexts", Status::kNotImplemented,
      (void*)EraAcpHalReleaseShapeContexts,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 3): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 3): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "ApuAlloc", Status::kNotImplemented, (void*)EraApuAlloc,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 4): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 4): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "ApuCreateHeap", Status::kNotImplemented,
      (void*)EraApuCreateHeap,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 5): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 5): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "ApuFree", Status::kNotImplemented, (void*)EraApuFree,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 6): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 6): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "ApuIsVirtualAddressValid", Status::kNotImplemented,
      (void*)EraApuIsVirtualAddressValid,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 8): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 8): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "ApuMapApuAddress", Status::kNotImplemented,
      (void*)EraApuMapApuAddress,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 9): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 9): explicit "
      "E_NOTIMPL stub (logged)."},
     {"AcpHal.dll", "ApuMapVirtualAddress", Status::kNotImplemented,
      (void*)EraApuMapVirtualAddress,
-     "ERA no-equivalent (phase 5, WinDurango ordinal 10): explicit "
+     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 10): explicit "
      "E_NOTIMPL stub (logged)."},
     {"d3d12_x.dll", "D3D12XCreateDevice", Status::kImplemented,
      (void*)HleD3D12XboxCreateDevice,
      "ERA adaptation (phase 5): same real-device passthrough as "
      "d3d12_xs!D3D12XboxCreateDevice. Signature is D3D12CreateDevice-"
-     "shaped (ASSUMED) — the real FH2 exe does NOT import d3d12_x at "
-     "all (D3D11.x-only title), so no real ordinal is known."},
+     "shaped (ASSUMED) — a D3D11.x-only title does NOT import d3d12_x at "
+     "all, so no real ordinal is known."},
     // Input.
     {"gameinput.dll", "GameInputCreate", Status::kStub,
      (void*)HleGameInputCreate, "STUB."},
@@ -1977,17 +1977,13 @@ const Export* FindExport(const char* module, const char* name) {
 
 // Ordinal table. GDK ordinals are synthetic (numbered in .def order
 // per module) — the GDK import libs have no real ordinal layout to
-// match. ERA ordinals are WinDurango's shim-DLL ordinals (dumpbin
-// /exports 2026-11-23) — the only real ordinal layout available. The
-// real FH2 exe imports by NAME, so its import table gives HINTS, not
-// ordinals: a hint is an index into the sorted export-name table, and
-// for every ERA module it differs from the ordinal (WinDurango's
-// ordinals run one higher than the exe's hints here, because
-// WinDurango numbers its exports sequentially from 1 in alphabetical
-// order). An earlier phase 5 pass wrote the hints into these rows by
-// mistake; the rows below are the corrected WinDurango ordinals. The
-// exe's name imports resolve through the name table and never touch
-// these rows — they only matter for a title that imports by ordinal.
+// match. ERA ordinals are the Xbox One shim-DLL ordinals — the only
+// real ordinal layout available; the real console ordinals are
+// unknown. ERA titles import by NAME, so the name imports resolve
+// through the name table and never touch these rows — they only
+// matter for a title that imports by ordinal. An earlier phase 5 pass
+// wrote wrong ordinals into these rows by mistake; the rows below are
+// the corrected Xbox One shim-DLL ordinals.
 static const OrdinalExport kOrdinalExports[] = {
     {"xgameruntime.dll", 1, (void*)HleXGameRuntimeInitialize,
      "XGameRuntimeInitialize"},
@@ -2062,19 +2058,11 @@ static const OrdinalExport kOrdinalExports[] = {
     {"gameinput.dll", 1, (void*)HleGameInputCreate, "GameInputCreate"},
     {"dstorage_xs.dll", 1, (void*)HleDStorageGetFactory,
      "DStorageGetFactory"},
-    // ERA ordinals — WinDurango's shim-DLL ordinals (dumpbin
-    // /exports 2026-11-23). The exe itself imports by NAME, so its
-    // import table gives HINTS, not ordinals — and the hints DIFFER
-    // from WinDurango's ordinals: exe hints for kernelx are
-    // TitleMemoryStatus 433, XMemAlloc 479, XMemAllocDefault 480,
-    // XMemFree 482, XMemFreeDefault 483, XMemSetAllocationHooks 487,
-    // while WinDurango's ordinals are 463, 514, 515, 517, 518, 524
-    // below. That is expected: WinDurango's kernelx is a
-    // reimplementation with its own export layout, and a hint is an
-    // index into the sorted name table, not an ordinal. The rows below
-    // use WinDurango's ordinals (the only real ordinal layout
-    // available); the exe's name imports resolve through the name
-    // table and never touch these rows.
+    // ERA ordinals — the Xbox One shim-DLL ordinals. The shim-DLL's
+    // kernelx is a reimplementation with its own export layout. The
+    // rows below use the Xbox One shim-DLL ordinals (the only real
+    // ordinal layout available); name imports resolve through the
+    // name table and never touch these rows.
     {"kernelx.dll", 463, (void*)EraTitleMemoryStatus, "TitleMemoryStatus"},
     {"kernelx.dll", 514, (void*)HleXMemAlloc, "XMemAlloc"},
     {"kernelx.dll", 515, (void*)EraXMemAllocDefault, "XMemAllocDefault"},

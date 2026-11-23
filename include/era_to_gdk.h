@@ -1,9 +1,8 @@
 // era_to_gdk.h — ERA (Xbox One) -> GDK translation boundary (phase 5).
 // ERA entry points -> GDK equivalents, wired into the HLE registry.
 // See docs/ERA-GDK-MAPPING.md for the inventory and the honesty notes.
-// The real FH2 exe's import table (read 2026-11-23, read-only) grounds
-// the ERA inventory; signatures marked GROUNDED come from WinDurango's
-// public XDK-derived d3d11.x.cpp. Anything still marked ASSUMED has an
+// Signatures marked GROUNDED follow the public Xbox One shim-DLL
+// XDK-derived d3d11.x.cpp. Anything still marked ASSUMED has an
 // XDK-gated real signature that no public source confirms yet.
 #pragma once
 #include "scarlett.h"
@@ -25,10 +24,9 @@ bool EraIsEraModule(const char* module);
 // the layer's allocations do not call back into title hooks).
 // TitleMemoryStatus fills a memory-status struct; its real signature
 // and struct layout are XDK-gated, so the declared form (one pointer,
-// zero-fill 64 bytes, return 0) is ASSUMED. All four are grounded in
-// the real FH2 exe's import table (it imports them by name; the
-// ordinals in the registry are WinDurango's shim-DLL ordinals —
-// dumpbin /exports 2026-11-23).
+// zero-fill 64 bytes, return 0) is ASSUMED. All four are in the ERA
+// surface (imported by name; the ordinals in the registry are the
+// Xbox One shim-DLL ordinals).
 extern "C" void* EraXMemAllocDefault(SIZE_T size, DWORD attrs);
 extern "C" void EraXMemFreeDefault(void* p);
 extern "C" HRESULT EraXMemSetAllocationHooks(void* allocHook,
@@ -37,24 +35,24 @@ extern "C" DWORD EraTitleMemoryStatus(void* status);
 
 // ---- ERA graphics (adaptation) ----
 // D3D11XCreateDevice / D3D11XCreateDeviceAndSwapChain —
-// D3D11CreateDevice-shaped (the same 10-arg form WinDurango's public
-// d3d11.x.cpp uses for EraD3D11CreateDevice). The translation lands on
-// a real desktop D3D11 device: GDK on Xbox does not support D3D11.x at
-// all, so there is no d3d12_xs equivalent for a D3D11.x title.
-// D3D11XCreateDeviceX is the entry the REAL FH2 exe imports (d3d11_x
-// hint 3, WinDurango ordinal 4 — dumpbin 2026-11-23). Its real form
-// (WinDurango's public d3d11.x.cpp, XDK-derived) is THREE args — a
-// D3D11X_CREATE_DEVICE_PARAMETERS pointer, a device out-pointer, and a
-// context out-pointer — NOT the 11-arg D3D11CreateDevice-shaped form
-// phase 5 first assumed. The struct is reproduced below from that
-// source. The other two d3d11_x imports from the real exe are now
-// IMPLEMENTED too: D3DMapEsramMemory (ESRAM mapping, see below) and
-// DXGIXPresentArray (present every swapchain in the array).
+// D3D11CreateDevice-shaped (the same 10-arg form the public Xbox One
+// shim-DLL d3d11.x.cpp uses for EraD3D11CreateDevice). The translation
+// lands on a real desktop D3D11 device: GDK on Xbox does not support
+// D3D11.x at all, so there is no d3d12_xs equivalent for a D3D11.x
+// title.
+// D3D11XCreateDeviceX is the device entry (Xbox One shim-DLL ordinal
+// 4). Its real form (the public Xbox One shim-DLL d3d11.x.cpp,
+// XDK-derived) is THREE args — a D3D11X_CREATE_DEVICE_PARAMETERS
+// pointer, a device out-pointer, and a context out-pointer — NOT the
+// 11-arg D3D11CreateDevice-shaped form phase 5 first assumed. The
+// struct is reproduced below from that source. The other two d3d11_x
+// imports in the ERA surface are now IMPLEMENTED too:
+// D3DMapEsramMemory (ESRAM mapping, see below) and DXGIXPresentArray
+// (present every swapchain in the array).
 // D3DAllocateGraphicsMemory / D3DFreeGraphicsMemory (d3d11_x ordinals
-// 6 / 8 in WinDurango's build) are the graphics-memory allocator the
-// ESRAM work sits alongside: VirtualAlloc-backed on the host. The
-// real FH2 exe does not import them; they are supporting
-// infrastructure, tested by the era guest.
+// 6 / 8 in the Xbox One shim-DLL build) are the graphics-memory
+// allocator the ESRAM work sits alongside: VirtualAlloc-backed on the
+// host. They are supporting infrastructure, tested by the era guest.
 struct D3D11X_CREATE_DEVICE_PARAMETERS {
     UINT Version;
     UINT Flags;
@@ -85,14 +83,15 @@ extern "C" HRESULT EraD3D11XCreateDeviceX(
 // ESRAM (Xbox One, 32 MB on-die SRAM — NOT the Xbox 360's 10 MB
 // EDRAM). D3DMapEsramMemory maps ESRAM pages into the title's virtual
 // address space: (Flags, pVirtualAddress, NumPages, pPageList) —
-// WinDurango's public d3d11.x.cpp. Flags bit 0 = large pages, bit 1 =
-// 4 MB pages. The host has no ESRAM, so the layer maps real committed
-// memory at the requested VA and enforces the 32 MB arena budget (see
-// src/era_to_gdk.cpp). DXGIXPresentArray presents every swapchain in
-// the array (SyncInterval, PresentImmediateThreshold, Flags,
-// NumSwapChains, ppSwapChains, pPresentParameters) — WinDurango's
-// public d3d11.x.cpp; per-swapchain present parameters (source rect,
-// scale) are accepted and ignored (full back buffer is presented).
+// the public Xbox One shim-DLL d3d11.x.cpp. Flags bit 0 = large pages,
+// bit 1 = 4 MB pages. The host has no ESRAM, so the layer maps real
+// committed memory at the requested VA and enforces the 32 MB arena
+// budget (see src/era_to_gdk.cpp). DXGIXPresentArray presents every
+// swapchain in the array (SyncInterval, PresentImmediateThreshold,
+// Flags, NumSwapChains, ppSwapChains, pPresentParameters) — the public
+// Xbox One shim-DLL d3d11.x.cpp; per-swapchain present parameters
+// (source rect, scale) are accepted and ignored (full back buffer is
+// presented).
 extern "C" HRESULT EraD3DMapEsramMemory(UINT Flags, void* pVirtualAddress,
                                         UINT NumPages,
                                         const UINT* pPageList);
@@ -107,13 +106,13 @@ extern "C" HRESULT EraD3DAllocateGraphicsMemory(SIZE_T SizeInBytes,
 extern "C" HRESULT EraD3DFreeGraphicsMemory(void* pAddress);
 
 // ---- ERA texture tiling (xg_x.dll — no GDK equivalent) ----
-// The real FH2 exe imports all seven (xg_x hints 1,2,4,5,7,8,9 —
-// dumpbin 2026-11-23; WinDurango ordinals 2,3,5,6,8,9,10). Xbox textures are tiled/swizzled for the
-// console GPU; desktop D3D11 has no equivalent layout computation, so
-// these are explicit E_NOTIMPL stubs (logged with their first four
-// raw args — the real signatures are XDK-gated). A real translation
-// would need to compute a linear layout and re-tile on upload; that
-// is genuinely missing, not stubbed as working.
+// Xbox One shim-DLL ordinals 2,3,5,6,8,9,10. Xbox textures are
+// tiled/swizzled for the console GPU; desktop D3D11 has no equivalent
+// layout computation, so these are explicit E_NOTIMPL stubs (logged
+// with their first four raw args — the real signatures are XDK-gated).
+// A real translation would need to compute a linear layout and
+// re-tile on upload; that is genuinely missing, not stubbed as
+// working.
 extern "C" HRESULT EraXGComputeOptimalDepthStencilTileModes(
     uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3);
 extern "C" HRESULT EraXGComputeOptimalTileMode(uintptr_t a0, uintptr_t a1,
@@ -130,10 +129,10 @@ extern "C" HRESULT EraXGCreateTexture3DComputer(uintptr_t a0, uintptr_t a1,
                                                 uintptr_t a2, uintptr_t a3);
 
 // ---- ERA audio DSP heap (AcpHal.dll — no GDK equivalent) ----
-// The real FH2 exe imports all nine (AcpHal hints 0-5,7-9 — dumpbin
-// 2026-11-23; WinDurango ordinals 1,2,3,4,5,6,8,9,10). The ACP is the
-// equivalent heap, so these are explicit E_NOTIMPL stubs (logged with
-// their first four raw args — the real signatures are XDK-gated).
+// Xbox One shim-DLL ordinals 1,2,3,4,5,6,8,9,10. The ACP is the
+// console's audio DSP; desktop has no equivalent heap, so these are
+// explicit E_NOTIMPL stubs (logged with their first four raw args —
+// the real signatures are XDK-gated).
 extern "C" HRESULT EraAcpHalAllocateShapeContexts(uintptr_t a0, uintptr_t a1,
                                                   uintptr_t a2, uintptr_t a3);
 extern "C" HRESULT EraAcpHalCreate(uintptr_t a0, uintptr_t a1, uintptr_t a2,

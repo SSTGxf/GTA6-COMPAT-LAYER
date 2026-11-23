@@ -1,14 +1,12 @@
 ; AcpHal.def — ERA (Xbox One) audio-DSP-heap import lib (phase 5).
 ; The ACP is the console's audio DSP; desktop has no equivalent heap,
 ; so the layer answers these with explicit E_NOTIMPL stubs (logged) —
-; see docs/ERA-GDK-MAPPING.md. Ordinals are WinDurango's AcpHal.dll
-; ordinals (dumpbin /exports 2026-11-23): 1, 2, 3, 4, 5, 6, 8, 9, 10.
-; The FH2 exe's import table gives HINTS (0, 1, 2, 3, 4, 5, 7, 8, 9)
-; — a hint is an index into the sorted export-name table, NOT an
-; ordinal. (An earlier phase 5 note claimed AcpHalAllocateShapeContexts
-; was ordinal 0 and could not be expressed in a .def — that was the
-; hint, not the ordinal; its WinDurango ordinal is 1.) Signatures are
-; XDK-gated; the stubs log their first four raw args.
+; see docs/ERA-GDK-MAPPING.md. Ordinals are the Xbox One shim-DLL
+; AcpHal.dll ordinals: 1, 2, 3, 4, 5, 6, 8, 9, 10. (An earlier phase 5
+; note claimed AcpHalAllocateShapeContexts was ordinal 0 and could not
+; be expressed in a .def — that was wrong; its Xbox One shim-DLL
+; ordinal is 1.) Signatures are XDK-gated; the stubs log their first
+; four raw args.
 LIBRARY AcpHal
 EXPORTS
     AcpHalAllocateShapeContexts @1

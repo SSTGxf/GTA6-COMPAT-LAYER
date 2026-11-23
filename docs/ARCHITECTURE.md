@@ -13,7 +13,7 @@ process and its API imports are intercepted. The work is threefold:
    resources, presentation, plus RDNA2 shader lifting (DXIL route).
 
 The template is ScarlettX's shim-DLL architecture with Xenia's HLE registry
-pattern. WinDurango (Xbox One ERA) proves the shim-DLL model; Azimuth/Mezcal
+pattern. The Xbox One ERA shim-DLL model proves the shim-DLL approach; Azimuth/Mezcal
 prove the translation model at AAA scale for one engine family — but all of
 those target Xbox One, not Series X Game Core. Nothing from them transfers
 directly; only the architecture does.

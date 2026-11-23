@@ -1,7 +1,6 @@
 // winrt_shim.h — WinRT activation routing + CoreApplication shim.
 //
-// The FH2 boot #3 diagnosis (docs: ~/workspace/fh2-diagnosis/
-// FH2-BOOT3-CRASH-DIAGNOSIS.md) proved the guest dies at the UWP
+// An Xbox One title boot diagnosis proved the guest dies at the UWP
 // app-model entry point: its CoreApplication::Run(viewSource) gets
 // E_INVALIDARG from the real desktop WinRT, because a manually-mapped,
 // unpackaged Xbox title has no package identity. The layer therefore
@@ -10,9 +9,9 @@
 // SetWindow -> Load -> Run -> Uninitialize) with a message pump.
 //
 // Interception points (both installed by the loader, pe_loader.cpp):
-//   - vccorlib110!GetActivationFactoryByPCWSTR — the path FH2 actually
-//     uses (the guest imports it from vccorlib110, not RoGetActivation-
-//     Factory directly). Patched in the guest IAT to
+//   - vccorlib110!GetActivationFactoryByPCWSTR — the path an Xbox One
+//     title actually uses (the guest imports it from vccorlib110, not
+//     RoGetActivationFactory directly). Patched in the guest IAT to
 //     ScGetActivationFactoryByPCWSTR.
 //   - combase!RoGetActivationFactory — patched in the guest IAT to
 //     WinRtRoGetActivationFactory, which routes CoreApplication to the
@@ -23,7 +22,8 @@
 // 10.0.26100.0 MIDL headers windows.applicationmodel.core.h and
 // windows.ui.core.h (vtable order + GUIDs read from those headers on
 // the build machine; ICoreApplication::Run at vtable index 13 also
-// proven independently by the FH2 boot #3 disassembly). The ABI
+// proven independently by disassembly of an Xbox One title's
+// activation path). The ABI
 // interfaces are hand-rolled here (the SDK headers are not included)
 // so the layer has no new header dependency; every method returns
 // HRESULT at the ABI level, as the MIDL headers declare.
@@ -37,8 +37,8 @@ namespace sc {
 
 // ---- IIDs (SDK 10.0.26100.0 winrt headers) ----
 // ICoreApplication {0AACF7A4-5E1D-49DF-8034-FB6A68BC5ED1} — also proven
-// from the FH2 guest (it builds this IID on the stack before calling
-// GetActivationFactoryByPCWSTR).
+// from an Xbox One title guest (it builds this IID on the stack before
+// calling GetActivationFactoryByPCWSTR).
 static const IID IID_ScCoreApplication = {
     0x0AACF7A4, 0x5E1D, 0x49DF,
     {0x80, 0x34, 0xFB, 0x6A, 0x68, 0xBC, 0x5E, 0xD1}};

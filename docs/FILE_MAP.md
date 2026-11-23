@@ -4,13 +4,10 @@ Measured 2026-11-22 by read-only inspection. **No game code or assets are
 in this repo** — this is packaging metadata only (names, sizes, manifest /
 config XML, PE headers of the shipped DLLs).
 
-> **ERA / FH2 note (phase 5):** this file is the GTA VI (Series X) package
-> inventory and is left as-is. The Xbox One (ERA) side — the real FH2 exe's
-> import table (648 imports, 14 modules), the ERA→GDK mapping, ESRAM, and
-> the first FH2 boot attempt (stops at the missing VS2012 CRT) — lives in
-> `docs/ERA-GDK-MAPPING.md`. No FH2 files are in this repo; the dump folder
-> `E:\Anthem_1.0.0.64_x64__8wekyb3d8bbwe` is read-only and the only copy
-> made is the harness copy at `F:\ScarlettCompat\out\fh2\`.
+> **ERA note (phase 5):** this file is the GTA VI (Series X) package
+> inventory and is left as-is. The Xbox One (ERA) side — the ERA→GDK
+> mapping and ESRAM — lives in `docs/ERA-GDK-MAPPING.md`. No Xbox One
+> title files are in this repo.
 
 ## Identity (from `appxmanifest.xml` + `MicrosoftGame.Config`)
 

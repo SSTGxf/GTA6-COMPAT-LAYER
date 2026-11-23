@@ -2,7 +2,8 @@
 // harness. A synthetic Xbox One-shaped PE (image base 0x180000000,
 // .xbld section) that imports the ERA DLL set (d3d11_x, d3d12_x,
 // kernelx, XAudio2_9, xgameruntime for the GDK service targets) and
-// boots in FH2's boot shape through the ERA -> GDK translation:
+// boots in an Xbox One title's boot shape through the ERA -> GDK
+// translation:
 //   profile sign-in -> profile save load early (before the renderer) ->
 //   package/DLC enumeration -> memory -> D3D11.x device -> D3D11.x
 //   surface -> D3D12.x device -> audio + input -> WinRT routing ->
@@ -12,12 +13,13 @@
 //   -> DXGIXPresentArray (multi-swapchain present) -> XGameSaveFiles
 //   -> package mount -> protections -> TLS -> TLS worker thread.
 // The bar is a real frame on screen through the translation — boot
-// stages passing alone is not enough. "FH2 showing" here means this
-// FH2-shaped guest rendering correctly through the translation.
+// stages passing alone is not enough. This guest rendering correctly
+// through the translation is what "the title showing" means here.
 // This file contains NO game code — it is a test program written for
 // the layer, and it is never run through the Windows loader directly
-// (its Xbox imports only resolve inside the layer). No real FH2 files
-// are loaded or run; the ERA .xbld strings below are synthetic (real
+// (its Xbox imports only resolve inside the layer). No real title
+// files are loaded or run; the ERA .xbld strings below are synthetic
+// (real
 // ERA .xbld strings are XDK-gated).
 // Every stage reports as era_<stage> in guest_report.txt; the harness
 // prints a dedicated era report.
@@ -71,13 +73,12 @@ extern "C" HRESULT D3D11XCreateDevice(
     UINT SDKVersion, ID3D11Device** ppDevice,
     D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppImmediateContext);
-// D3D11XCreateDeviceX is the entry the REAL FH2 exe imports (d3d11_x
-// hint 3, WinDurango ordinal 4 — dumpbin 2026-11-23). GROUNDED 3-arg
-// form (WinDurango's public d3d11.x.cpp, XDK-derived): a
-// D3D11X_CREATE_DEVICE_PARAMETERS pointer, a device out-pointer, and a
-// context out-pointer. (Phase 5 first assumed an 11-arg
-// D3D11CreateDevice-shaped form; that was wrong — the real exe calls
-// three args.) The guest passes a real params struct.
+// D3D11XCreateDeviceX is the device entry (Xbox One shim-DLL ordinal
+// 4). GROUNDED 3-arg form (the public Xbox One shim-DLL d3d11.x.cpp,
+// XDK-derived): a D3D11X_CREATE_DEVICE_PARAMETERS pointer, a device
+// out-pointer, and a context out-pointer. (Phase 5 first assumed an
+// 11-arg D3D11CreateDevice-shaped form; that was wrong — an Xbox One
+// title calls three args.) The guest passes a real params struct.
 struct D3D11X_CREATE_DEVICE_PARAMETERS {
     UINT Version;
     UINT Flags;
@@ -94,9 +95,9 @@ extern "C" HRESULT D3D11XCreateDeviceX(
     ID3D11Device** ppDevice, ID3D11DeviceContext** ppImmediateContext);
 // ESRAM (Xbox One, 32 MB — NOT the 360's 10 MB EDRAM) and the
 // multi-swapchain present + graphics-memory allocator: GROUNDED
-// signatures from WinDurango's public d3d11.x.cpp. D3DMapEsramMemory
-// is the one ESRAM entry the real FH2 exe imports (d3d11_x hint 8,
-// WinDurango ordinal 9).
+// signatures from the public Xbox One shim-DLL d3d11.x.cpp.
+// D3DMapEsramMemory is the one ESRAM entry an Xbox One title imports
+// (Xbox One shim-DLL ordinal 9).
 extern "C" HRESULT D3DMapEsramMemory(UINT Flags, void* pVirtualAddress,
                                      UINT NumPages, const UINT* pPageList);
 extern "C" HRESULT DXGIXPresentArray(UINT SyncInterval,
@@ -426,21 +427,22 @@ static bool TestMemory(char* detail, size_t n) {
     return ok;
 }
 
-// ---- stage: kernelx!VirtualAlloc flag translation (FH2 boot #2 fix,
-// 2026-11-23). The ERA guest's region-descriptor builder calls
+// ---- stage: kernelx!VirtualAlloc flag translation (VirtualAlloc
+// flag-translation fix, 2026-11-23). The ERA guest's
+// region-descriptor builder calls
 // kernelx!VirtualAlloc(0x800000000, size, 0x30002000 / 0x40002000,
 // PAGE_READWRITE); the desktop rejects those Xbox flag bits (NULL,
 // err 87), so the layer translates them (HleVirtualAlloc). The guest
 // calls the wrapper directly under its own name (imported from
 // kernelx.lib) — importing the name VirtualAlloc from kernelx would
-// reroute the CRT's VirtualAlloc calls through the wrapper. The FH2
-// boot retry is the end-to-end proof for the real import name.
+// reroute the CRT's VirtualAlloc calls through the wrapper. An Xbox
+// One title boot is the end-to-end proof for the real import name.
 // The VirtualAlloc / VirtualFree calls below are the guest's own
 // (kernel32) — they commit into / release the wrapper's reservation.
 extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
                                   DWORD flAllocationType, DWORD flProtect);
 static bool TestVirtualAlloc(char* detail, size_t n) {
-    // 1. The exact FH2 case: 0x30002000 at the Xbox VA.
+    // 1. The exact Xbox One title case: 0x30002000 at the Xbox VA.
     void* p1 = HleVirtualAlloc((LPVOID)0x800000000ULL, 1024 * 1024,
                                0x30002000, PAGE_READWRITE);
     bool ok1 = p1 != nullptr;
@@ -483,8 +485,8 @@ static bool TestVirtualAlloc(char* detail, size_t n) {
 }
 
 // ---- stage: D3D11.x device via D3D11XCreateDeviceX (ERA adaptation
-// -> desktop D3D11). This is the entry the REAL FH2 exe imports
-// (d3d11_x hint 3, WinDurango ordinal 4), so the guest exercises the
+// -> desktop D3D11). This is the device entry an Xbox One title
+// imports (Xbox One shim-DLL ordinal 4), so the guest exercises the
 // real path, not the non-X form. GROUNDED 3-arg form: a real
 // D3D11X_CREATE_DEVICE_PARAMETERS struct (Version 1, no flags, no
 // tessellation buffers, default rings) + device + context out-pointers.
@@ -511,8 +513,8 @@ static bool TestGfx11(char* detail, size_t n) {
         ok = ok && (removed == S_OK);
         snprintf(detail, n,
                  "hr=0x%08x device=%p FL=0x%x removed=0x%08x (REAL "
-                 "desktop D3D11 via D3D11XCreateDeviceX, the entry FH2 "
-                 "imports)",
+                 "desktop D3D11 via D3D11XCreateDeviceX, the entry an "
+                 "Xbox One title imports)",
                  (unsigned)hr, dev, (unsigned)fl, (unsigned)removed);
     } else {
         snprintf(detail, n, "hr=0x%08x device=%p FL=0x%x", (unsigned)hr,
@@ -1144,8 +1146,8 @@ static bool TestEsram(FrameCtx11* ctx, char* detail, size_t n) {
 }
 
 // ---- stage: DXGIXPresentArray (multi-swapchain present) ----
-// Presents the frame context's swapchain through the ERA entry the
-// real FH2 exe imports (d3d11_x hint 10, WinDurango ordinal 11).
+// Presents the frame context's swapchain through the ERA entry an
+// Xbox One title imports (Xbox One shim-DLL ordinal 11).
 // Also checks the empty-array case is rejected (E_INVALIDARG).
 static bool TestPresentArray(FrameCtx11* ctx, char* detail, size_t n) {
     if (!ctx || !ctx->sc) {
@@ -1430,8 +1432,8 @@ static bool TestWinRt(char* detail, size_t n) {
 // xg_x texture tiling and AcpHal audio DSP heap have no desktop
 // equivalent (see docs/ERA-GDK-MAPPING.md). This stage passes iff the
 // translation routes the calls and returns the documented E_NOTIMPL
-// instead of crashing or faking success. A real FH2 boot will hit
-// these — the stage proves the layer fails honestly at that wall.
+// instead of crashing or faking success. An Xbox One title boot will
+// hit these — the stage proves the layer fails honestly at that wall.
 static bool TestNoEquiv(char* detail, size_t n) {
     HRESULT hrXg = XGComputeTexture2DLayout(0, 0, 0, 0);
     HRESULT hrAcp = AcpHalCreate(0, 0, 0, 0);
@@ -1614,7 +1616,8 @@ int main() {
     bool allBoot = true;
     char detail[512];
 
-    // Boot order mirrors FH2's boot (in ERA terms, via the translation):
+    // Boot order mirrors an Xbox One title's boot (in ERA terms, via
+    // the translation):
     // profile first, because the profile drives the save; profile save
     // early, before the renderer; DLC enumeration; memory; graphics;
     // audio + input; WinRT routing; then the rendered scene + frame loop.
@@ -1645,7 +1648,8 @@ int main() {
     Report("era_memory", ok, detail);
     allBoot &= ok;
 
-    // 4b. kernelx!VirtualAlloc flag translation (FH2 boot #2 fix).
+    // 4b. kernelx!VirtualAlloc flag translation (VirtualAlloc
+    // flag-translation fix).
     detail[0] = 0;
     ok = TestVirtualAlloc(detail, sizeof(detail));
     Report("era_virtualalloc", ok, detail);

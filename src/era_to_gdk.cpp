@@ -1,12 +1,11 @@
 // era_to_gdk.cpp — ERA (Xbox One) -> GDK translation (phase 5).
 // ERA entry points -> GDK equivalents. See docs/ERA-GDK-MAPPING.md.
-// Grounded in the real FH2 exe's import table (dumpbin 2026-11-23,
-// read-only inspection; no game code, exe, or data is copied into
-// this tree) for the INVENTORY (which names the exe imports), in
-// WinDurango's shim-DLL exports for the ORDINALS (the exe imports by
-// name, so its table gives hints, not ordinals), and in WinDurango's
-// public d3d11.x.cpp (XDK-derived) for the D3D11XCreateDeviceX /
-// D3DMapEsramMemory / DXGIXPresentArray SIGNATURES.
+// The INVENTORY (which ERA names the layer translates) and the
+// D3D11XCreateDeviceX / D3DMapEsramMemory / DXGIXPresentArray
+// SIGNATURES follow the public Xbox One shim-DLL d3d11.x.cpp
+// (XDK-derived); the ORDINALS are the Xbox One shim-DLL exports
+// (ERA titles import by name, so their tables give hints, not
+// ordinals).
 #include "era_to_gdk.h"
 #include <roapi.h>     // RoGetActivationFactory (real one, for forwarding)
 #include <winstring.h> // WindowsGetStringRawBuffer
@@ -63,8 +62,8 @@ bool EraIsEraModule(const char* module) {
 // ---- ERA graphics: D3D11.x -> desktop D3D11 (adaptation) ----
 // GDK on Xbox does not support D3D11.x at all (Microsoft Learn), so a
 // D3D11.x title has no d3d12_xs equivalent — the faithful host is a real
-// desktop D3D11 device. D3D11XCreateDeviceX's real form is GROUNDED in
-// WinDurango's public d3d11.x.cpp (XDK-derived): three args — a
+// desktop D3D11 device. D3D11XCreateDeviceX's real form follows the
+// public Xbox One shim-DLL d3d11.x.cpp (XDK-derived): three args — a
 // D3D11X_CREATE_DEVICE_PARAMETERS pointer, a device out-pointer, and a
 // context out-pointer. (Phase 5 first assumed an 11-arg
 // D3D11CreateDevice-shaped form; that was wrong — the real exe calls
@@ -110,8 +109,6 @@ extern "C" HRESULT EraD3D11XCreateDeviceAndSwapChain(
 }
 
 // ---- ERA kernel memory (1:1 maps + defaults) ----
-// Grounded in the real FH2 exe's import table (it imports these by
-// name; registry ordinals are WinDurango's — dumpbin 2026-11-23).
 // The Default pair are
 // the implementations the CRT's alloc hooks point at on console; on
 // the host they are the same real HeapAlloc/Free as XMemAlloc/Free.
@@ -155,13 +152,12 @@ extern "C" DWORD EraTitleMemoryStatus(void* status) {
     return 0;
 }
 
-// D3D11XCreateDeviceX — the entry the REAL FH2 exe imports (d3d11_x
-// hint 3, WinDurango ordinal 4). GROUNDED 3-arg form (WinDurango's
-// public d3d11.x.cpp): (pParameters, ppDevice, ppImmediateContext).
-// The params struct's ESRAM/display/ring fields have no desktop
-// meaning and are logged, not acted on; a NULL struct means defaults.
-// Desktop D3D11 manages its own command rings, so the ring sizes are
-// informational only.
+// D3D11XCreateDeviceX — the device entry (Xbox One shim-DLL ordinal
+// 4). 3-arg form (the public Xbox One shim-DLL d3d11.x.cpp):
+// (pParameters, ppDevice, ppImmediateContext). The params struct's
+// ESRAM/display/ring fields have no desktop meaning and are logged,
+// not acted on; a NULL struct means defaults. Desktop D3D11 manages
+// its own command rings, so the ring sizes are informational only.
 extern "C" HRESULT EraD3D11XCreateDeviceX(
     const D3D11X_CREATE_DEVICE_PARAMETERS* pParameters,
     ID3D11Device** ppDevice, ID3D11DeviceContext** ppImmediateContext) {
@@ -196,13 +192,13 @@ extern "C" HRESULT EraD3D11XCreateDeviceX(
 // NOT the Xbox 360's 10 MB EDRAM. On the console, ESRAM is a separate
 // 32 MB high-bandwidth pool the title manages explicitly: render
 // targets and depth buffers that fit live there, anything bigger is
-// tiled and resolved to DRAM. The only ESRAM entry point the real FH2
-// exe imports is D3DMapEsramMemory (d3d11_x hint 8, WinDurango
-// ordinal 9) — GROUNDED signature from WinDurango's public
-// d3d11.x.cpp: (Flags, pVirtualAddress, NumPages, pPageList). It maps
-// ESRAM pages into the title's virtual address space: Flags bit 0 =
-// large pages, bit 1 = 4 MB pages; pPageList holds the ESRAM page
-// numbers (4 KB pages) to map at pVirtualAddress.
+// tiled and resolved to DRAM. The ESRAM entry point is
+// D3DMapEsramMemory (Xbox One shim-DLL ordinal 9) — signature from
+// the public Xbox One shim-DLL d3d11.x.cpp: (Flags, pVirtualAddress,
+// NumPages, pPageList). It maps ESRAM pages into the title's virtual
+// address space: Flags bit 0 = large pages, bit 1 = 4 MB pages;
+// pPageList holds the ESRAM page numbers (4 KB pages) to map at
+// pVirtualAddress.
 //
 // Host translation: there is no ESRAM on a PC, so the layer maps REAL
 // committed memory at the requested VA (VirtualAlloc) and enforces the
@@ -309,7 +305,7 @@ extern "C" HRESULT EraD3DMapEsramMemory(UINT Flags, void* pVirtualAddress,
 }
 
 // ---- ERA multi-swapchain present (DXGIXPresentArray) ----
-// GROUNDED signature from WinDurango's public d3d11.x.cpp:
+// Signature from the public Xbox One shim-DLL d3d11.x.cpp:
 // (SyncInterval, PresentImmediateThreshold, Flags, NumSwapChains,
 // ppSwapChains, pPresentParameters). The translation presents every
 // swapchain in the array with the given SyncInterval through the real
@@ -349,15 +345,14 @@ extern "C" HRESULT EraDXGIXPresentArray(
 
 // ---- ERA graphics memory (D3DAllocateGraphicsMemory /
 // D3DFreeGraphicsMemory) ----
-// GROUNDED shape from WinDurango's public d3d11.x.cpp: allocate GPU
+// Shape from the public Xbox One shim-DLL d3d11.x.cpp: allocate GPU
 // memory at a desired GPU virtual address. On the host the allocation
 // is plain VirtualAlloc (PAGE_READWRITE) — CPU-visible, like the
 // console's graphics memory from the CPU's side. Alignment over 128 KB
-// is rejected (same limit as WinDurango's). The Flags coherency hints
-// are accepted and logged; the host protection is uniform
-// PAGE_READWRITE. The real FH2 exe does not import these; they are
-// supporting infrastructure for the ESRAM work, tested by the era
-// guest.
+// is rejected (same limit as the Xbox One shim-DLL's). The Flags
+// coherency hints are accepted and logged; the host protection is
+// uniform PAGE_READWRITE. They are supporting infrastructure for the
+// ESRAM work, tested by the era guest.
 extern "C" HRESULT EraD3DAllocateGraphicsMemory(
     SIZE_T SizeInBytes, UINT64 AlignmentBytes,
     UINT64 DesiredGpuVirtualAddress, UINT Flags, void** ppAddress) {

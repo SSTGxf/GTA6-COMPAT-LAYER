@@ -1,7 +1,7 @@
 // guest_winrt.cpp — WinRT shim proof guest (WinRT phase).
 //
 // Proves the layer's CoreApplication shim end to end, through the
-// exact activation path the real FH2 guest uses:
+// exact activation path an Xbox One title guest uses:
 //   1. The guest imports GetActivationFactoryByPCWSTR from vccorlib110
 //      (the real VS2012 C++/CX runtime) and calls it for
 //      "Windows.ApplicationModel.Core.CoreApplication" — the loader
@@ -15,14 +15,15 @@
 //      Uninitialize. The test view's Run pumps the CoreDispatcher for
 //      ~500 ms, then closes the window; Run must return only after the
 //      view exits (elapsed >= 400 ms) — an early S_OK would end the
-//      game without running it (the FH2 boot #3 failure mode).
+//      game without running it (the WinRT app-model failure mode).
 //
 // The guest is ERA-shaped (one kernelx import, XMemAlloc) so the
 // loader installs the WinRT hooks (eraDetected gate). It links
 // vccorlib110.lib (generated from defs/vccorlib110.def — the MANGLED
 // export name, so the import resolves against the real DLL exactly
-// like the FH2 exe's) + runtimeobject.lib (direct RoGetActivationFactory,
-// whose import descriptor is api-ms-win-core-winrt-l1-1-0.dll).
+// like an Xbox One title's) + runtimeobject.lib (direct
+// RoGetActivationFactory, whose import descriptor is
+// api-ms-win-core-winrt-l1-1-0.dll).
 //
 // Every stage reports as winrt_<stage> in guest_report.txt; the
 // harness verdict requires all PASS. The guest links NO layer headers
@@ -40,16 +41,18 @@
 #include <string.h>
 #include "xbox_shims.h"  // XMemAlloc / XMemFree (ERA shape)
 
-// vccorlib110!GetActivationFactoryByPCWSTR — the FH2 activation path.
+// vccorlib110!GetActivationFactoryByPCWSTR — the Xbox One title
+// activation path.
 // The real vccorlib110.dll exports it ONLY under its C++ mangled name
 // (dumpbin /EXPORTS on System32\vccorlib110.dll; undname:
 // long __cdecl GetActivationFactoryByPCWSTR(void*, Platform::Guid&,
 // void**)). The guest declares it exactly so — Platform::Guid as a
 // CLASS (the mangling encodes the class tag V, not struct U) with the
 // GUID layout — so the linker emits the mangled reference and the
-// import resolves against the real DLL exactly like the FH2 exe's
-// does. A plain extern "C" declaration does NOT resolve (there is no
-// plain-name export); the first build caught that as IMPORT FAILED.
+// import resolves against the real DLL exactly like an Xbox One
+// title's does. A plain extern "C" declaration does NOT resolve
+// (there is no plain-name export); the first build caught that as
+// IMPORT FAILED.
 namespace Platform {
 class Guid {
 public:
@@ -420,7 +423,8 @@ int main() {
              (unsigned)hrRoGet, (void*)fRoGet);
     Report("winrt_roget", SUCCEEDED(hrRoGet) && fRoGet != nullptr, detail);
 
-    // Stage 2: vccorlib110 GetActivationFactoryByPCWSTR (the FH2 path).
+    // Stage 2: vccorlib110 GetActivationFactoryByPCWSTR (the Xbox One
+    // title path).
     // Platform::Guid has the GUID layout, so the ICoreApplication IID
     // is copied into a non-const Guid (the C++/CX signature takes a
     // non-const reference).

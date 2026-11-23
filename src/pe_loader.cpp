@@ -1,7 +1,7 @@
 // pe_loader.cpp — Xbox Series X PE32+ loader (scaffolding).
 // Same ISA as the host (x86-64), so the guest maps straight into the
 // process and its imports are intercepted at the DLL boundary (ScarlettX /
-// WinDurango shim-DLL model). No CPU emulation, no JIT.
+// Xbox One shim-DLL model). No CPU emulation, no JIT.
 #include "pe_loader.h"
 #include "era_to_gdk.h"  // ERA -> GDK translation (phase 5)
 #include "winrt_shim.h"  // WinRT CoreApplication shim (WinRT phase)
@@ -338,13 +338,14 @@ void HookThreadCreation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
 //     WinRtRoGetActivationFactory, which routes CoreApplication to the
 //     shim and delegates everything else to EraRoGetActivationFactory
 //     (phase 5 behaviour preserved).
-//   - vccorlib110!GetActivationFactoryByPCWSTR — THE path FH2 actually
-//     uses (the guest imports it from vccorlib110 and never imports
-//     RoGetActivationFactory directly; the old warning "no
-//     RoGetActivationFactory import found (WinRT routing not
-//     installed)" was therefore misleading — see the FH2 boot #3
-//     diagnosis). Patched to ScGetActivationFactoryByPCWSTR, with the
-//     real address stashed for forwarding non-CoreApplication classes.
+//   - vccorlib110!GetActivationFactoryByPCWSTR — THE path an Xbox One
+//     title actually uses (the guest imports it from vccorlib110 and
+//     never imports RoGetActivationFactory directly; the old warning
+//     "no RoGetActivationFactory import found (WinRT routing not
+//     installed)" was therefore misleading — an Xbox One title boot
+//     diagnosis proved it). Patched to
+//     ScGetActivationFactoryByPCWSTR, with the real address stashed
+//     for forwarding non-CoreApplication classes.
 // Only installed for ERA titles (see the call site). Runs after import
 // resolution (the FT holds the real addresses) and before section
 // protections (.rdata -> R). A missing hook is logged, not fatal: the
@@ -405,7 +406,7 @@ void HookWinRtActivation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
                         // C++ mangled name (undname: long __cdecl
                         // GetActivationFactoryByPCWSTR(void*,
                         // Platform::Guid&, void**)) — that is the name
-                        // the real FH2 exe imports, so the hook must
+                        // an Xbox One title imports, so the hook must
                         // match it too. The plain name is kept for
                         // robustness (a title could import it that way
                         // through a different import lib).
@@ -419,7 +420,8 @@ void HookWinRtActivation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
                     (uint64_t)(void*)ScGetActivationFactoryByPCWSTR;
                 Log("loader",
                     "hooked vccorlib110!GetActivationFactoryByPCWSTR "
-                    "for WinRT routing (the FH2 activation path)");
+                    "for WinRT routing (the Xbox One title activation "
+                    "path)");
                 hookedVccorlib = true;
             }
         }
@@ -428,8 +430,8 @@ void HookWinRtActivation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
         Log("loader",
             "note: no RoGetActivationFactory import found — the guest "
             "activates via vccorlib110's GetActivationFactoryByPCWSTR "
-            "instead (see FH2 boot #3); WinRT routing is installed "
-            "there when that import exists");
+            "instead; WinRT routing is installed there when that "
+            "import exists");
     if (!hookedVccorlib)
         Log("loader",
             "note: no vccorlib110!GetActivationFactoryByPCWSTR import "
@@ -730,10 +732,11 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
             if (!oft || !ft) continue;
             for (size_t k = 0; oft[k].u1.Ordinal != 0; ++k) {
                 void* target = nullptr;
-                // Per-import failure logging (WinRT phase): the FH2 boot
-                // showed 647/648 resolved with the 1 failure
-                // unidentified. The name/ordinal is captured here so
-                // the failure branch below can name the exact import.
+                // Per-import failure logging (WinRT phase): a title
+                // boot can leave a failure unidentified when only the
+                // count is logged. The name/ordinal is captured here
+                // so the failure branch below can name the exact
+                // import.
                 const char* curFnName = nullptr;
                 bool curIsOrdinal = false;
                 uint16_t curOrd = 0;
@@ -743,9 +746,8 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
                     // resolve via GetProcAddress(MAKEINTRESOURCE); shim
                     // modules resolve through the ordinal table
                     // (kOrdinalExports — synthetic ordinals in .def order
-                    // for GDK modules; REAL ordinals for ERA modules,
-                    // read from the FH2 exe's import table, dumpbin
-                    // 2026-11-23).
+                    // for GDK modules; Xbox One shim-DLL ordinals for
+                    // ERA modules).
                     uint16_t ord =
                         (uint16_t)(oft[k].u1.Ordinal & 0xFFFF);
                     curIsOrdinal = true;
@@ -799,12 +801,8 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
                                 // (CreateFileW, HeapAlloc, VirtualAlloc,
                                 // ...) that the real kernelx.dll
                                 // forwards to kernel32.dll on console.
-                                // The real FH2 exe imports ~135 of
-                                // them by name — all kernel32 exports
-                                // (verified from its import table,
-                                // dumpbin 2026-11-23). Forward them to
-                                // the real kernel32.dll here instead of
-                                // stubbing them.
+                                // Forward them to the real kernel32.dll
+                                // here instead of stubbing them.
                                 static HMODULE hKernel32 = nullptr;
                                 if (!hKernel32)
                                     hKernel32 =
@@ -876,9 +874,9 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
 
     // WinRT activation hooks (WinRT phase): only for ERA titles —
     // routes CoreApplication activation through the layer's shim (both
-    // the direct RoGet path and the vccorlib110 path FH2 actually uses).
-    // Same window as the thread hooks (after imports, before
-    // protections).
+    // the direct RoGet path and the vccorlib110 path an Xbox One title
+    // actually uses). Same window as the thread hooks (after imports,
+    // before protections).
     if (out->eraDetected) HookWinRtActivation(buf, nt, base);
 
     // Final page protections: per-section (text XR, rodata R, data RW).

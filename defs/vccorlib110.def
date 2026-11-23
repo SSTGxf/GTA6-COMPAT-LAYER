@@ -1,7 +1,7 @@
 ; vccorlib110.def — import library for the REAL vccorlib110.dll
 ; (Visual C++ 2012 C++/CX runtime, installed by the VS2012 redist).
 ; Used ONLY by the WinRT proof guest (tests/guest_winrt.cpp), so it can
-; call GetActivationFactoryByPCWSTR the way the real FH2 guest does.
+; call GetActivationFactoryByPCWSTR the way an Xbox One title guest does.
 ; The layer itself never links this: it gets the real address from the
 ; guest's IAT at hook time (pe_loader.cpp HookWinRtActivation).
 ;
@@ -14,7 +14,8 @@
 ; GetActivationFactoryByPCWSTR), which the first WinRT build caught.
 ; The guest declares the C++ signature exactly so (see
 ; tests/guest_winrt.cpp), so the linker emits the mangled reference and
-; the import resolves against the real DLL exactly like the FH2 exe's.
+; the import resolves against the real DLL exactly like an Xbox One
+; title's.
 LIBRARY vccorlib110
 EXPORTS
     ?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z

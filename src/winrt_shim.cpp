@@ -1,12 +1,13 @@
 // winrt_shim.cpp — WinRT activation routing + CoreApplication shim.
 //
-// See include/winrt_shim.h and docs/WINRT-SHIM.md. The FH2 boot #3
-// diagnosis proved the guest's CoreApplication::Run gets E_INVALIDARG
-// from the real desktop WinRT (no package identity for a manually
-// mapped, unpackaged title), so the layer intercepts activation and
-// drives the view lifecycle itself. Returning S_OK from Run would NOT
-// work — the guest's Main returns 0 right after Run returns — so Run
-// blocks inside the view's own Run loop until the view exits.
+// See include/winrt_shim.h and docs/WINRT-SHIM.md. An Xbox One title
+// boot diagnosis proved the guest's CoreApplication::Run gets
+// E_INVALIDARG from the real desktop WinRT (no package identity for a
+// manually mapped, unpackaged title), so the layer intercepts
+// activation and drives the view lifecycle itself. Returning S_OK from
+// Run would NOT work — the guest's Main returns 0 right after Run
+// returns — so Run blocks inside the view's own Run loop until the
+// view exits.
 #include "winrt_shim.h"
 #include "era_to_gdk.h"  // EraRoGetActivationFactory (delegate target)
 #include <cstring>       // _stricmp
@@ -971,9 +972,10 @@ private:
 
 // ---- CoreApplication (singleton) ----
 // One object implements IActivationFactory + ICoreApplication (+ 2/3).
-// The FH2 guest asks GetActivationFactoryByPCWSTR for IID_ICoreApplication
-// and calls Run on the returned pointer directly (never
-// ActivateInstance), so the factory pointer MUST QI to ICoreApplication.
+// An Xbox One title guest asks GetActivationFactoryByPCWSTR for
+// IID_ICoreApplication and calls Run on the returned pointer directly
+// (never ActivateInstance), so the factory pointer MUST QI to
+// ICoreApplication.
 class ScCoreApplication : public ComBase,
                           public IScActivationFactory,
                           public IScCoreApplication,

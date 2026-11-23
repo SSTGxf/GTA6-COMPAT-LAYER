@@ -74,8 +74,8 @@ if errorlevel 1 exit /b 1
 REM WinRT shim proof guest (activation via vccorlib110 + direct RoGet,
 REM CoreApplication lifecycle through the layer's shim; see
 REM docs/WINRT-SHIM.md). Links kernelx.lib (one ERA import so the
-REM loader installs the WinRT hooks) + vccorlib110.lib (the FH2
-REM activation path) + runtimeobject.lib (RoGetActivationFactory).
+REM loader installs the WinRT hooks) + vccorlib110.lib (the Xbox One
+REM title activation path) + runtimeobject.lib (RoGetActivationFactory).
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_winrt.cpp" /Fe"%OUT%\guest_winrt.exe" /Fo%OUT%\ /Fd%OUT%\guest_winrt.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" kernelx.lib vccorlib110.lib runtimeobject.lib
 if errorlevel 1 exit /b 1
 

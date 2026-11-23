@@ -2,30 +2,28 @@
 
 ## Why this exists
 
-FH2 boot attempt #3 (2026-11-23 ~04:26 EST) got past the VirtualAlloc
-crash and died at the game's main-loop entry: the guest's
+An Xbox One title boot got past the VirtualAlloc crash and died at the
+title's main-loop entry: the guest's
 `CoreApplication::Run(viewSource)` returned **E_INVALIDARG** from the
 real desktop WinRT, which rejects an unpackaged, manually-mapped Xbox
 title with no package identity. The guest's C++/CX handler threw an
-uncaught `Platform::InvalidArgumentException` (child exit 0xe06d7363).
-
-Full diagnosis: `~/workspace/fh2-diagnosis/FH2-BOOT3-CRASH-DIAGNOSIS.md`.
+uncaught `Platform::InvalidArgumentException`.
 
 The activation itself had already **succeeded** — via vccorlib110's
 `GetActivationFactoryByPCWSTR`, not a direct `RoGetActivationFactory`
-import (the FH2 exe has no such import; the loader's old warning "no
-RoGetActivationFactory import found (WinRT routing not installed)" was
-therefore misleading and is fixed in this phase). The gap is the
-app-model object itself: the real `CoreApplication` refuses to run an
-unpackaged title. So the layer intercepts activation and provides its
-own `ICoreApplication` whose `Run` actually drives the guest view's
-lifecycle.
+import (an Xbox One title that activates via vccorlib110 has no such
+import; the loader's old warning "no RoGetActivationFactory import
+found (WinRT routing not installed)" was therefore misleading and is
+fixed in this phase). The gap is the app-model object itself: the real
+`CoreApplication` refuses to run an unpackaged title. So the layer
+intercepts activation and provides its own `ICoreApplication` whose
+`Run` actually drives the guest view's lifecycle.
 
 ## The critical constraint
 
 **Returning S_OK from Run does NOT work.** The guest's `Main`
-returns 0 right after `Run` returns (guest function 0x30c440, proven
-in the boot #3 disassembly), so an early S_OK would end the game
+returns 0 right after `Run` returns (proven by disassembly of an Xbox
+One title's activation path), so an early S_OK would end the game
 without running it. `Run` must drive the main loop: it returns only
 when the view exits.
 
@@ -38,7 +36,7 @@ protections:
 | Guest import | Patched to | Behaviour |
 |---|---|---|
 | `combase!RoGetActivationFactory` — in practice recorded under the WinRT API set `api-ms-win-core-winrt-l1-1-0.dll` by runtimeobject.lib (the hook matches `combase.dll`, `api-ms-win-core-com-l1-1-0.dll` and that API-set name; the first build proved the descriptor name with dumpbin — matching only the first two missed the hook entirely, and the era guest's phase-5 WinRT stage was a false pass on the real RoGet) | `WinRtRoGetActivationFactory` | `Windows.ApplicationModel.Core.CoreApplication` → layer factory; everything else → `EraRoGetActivationFactory` (phase 5 behaviour preserved: Xbox-namespace refusal + forward to the real function) |
-| `vccorlib110!GetActivationFactoryByPCWSTR` — **the path FH2 actually uses**, exported by the real DLL ONLY under its C++ mangled name (`?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z`, undname: `long __cdecl GetActivationFactoryByPCWSTR(void*, Platform::Guid&, void**)`); the hook matches both the mangled name and the plain name | `ScGetActivationFactoryByPCWSTR` | CoreApplication → layer factory; everything else → the real function (stashed from the IAT at hook time; E_FAIL if no real function was stashed) |
+| `vccorlib110!GetActivationFactoryByPCWSTR` — **the path an Xbox One title actually uses**, exported by the real DLL ONLY under its C++ mangled name (`?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z`, undname: `long __cdecl GetActivationFactoryByPCWSTR(void*, Platform::Guid&, void**)`); the hook matches both the mangled name and the plain name | `ScGetActivationFactoryByPCWSTR` | CoreApplication → layer factory; everything else → the real function (stashed from the IAT at hook time; E_FAIL if no real function was stashed) |
 
 Both hooks are logged; a missing hook is a note, not a failure (the
 guest may simply not use that path). Only if *neither* hook installs
@@ -54,14 +52,15 @@ Hand-rolled ABI interfaces — no SDK header dependency. Layouts and
 GUIDs grounded in SDK 10.0.26100.0 `winrt\windows.applicationmodel.core.h`
 and `winrt\windows.ui.core.h` (vtable order + GUIDs read from those
 headers on the build machine; `ICoreApplication::Run` at vtable index
-13 also proven independently by the FH2 boot #3 disassembly). Every
+13 also proven independently by disassembly of an Xbox One title's
+activation path). Every
 ABI method returns HRESULT, as the MIDL headers declare.
 
 ### CoreApplication (singleton)
 
 One object implements `IActivationFactory` + `ICoreApplication` +
-`ICoreApplication2` + `ICoreApplication3`. This matters because the
-FH2 guest asks `GetActivationFactoryByPCWSTR` for
+`ICoreApplication2` + `ICoreApplication3`. This matters because an
+Xbox One title guest asks `GetActivationFactoryByPCWSTR` for
 `IID_ICoreApplication` and calls `Run` on the returned pointer
 directly — it never calls `ActivateInstance` — so the factory pointer
 MUST QI to `ICoreApplication`.
@@ -166,10 +165,9 @@ guest_winrt proof guest does not create a swapchain.
 
 ## Per-import failure logging (same phase)
 
-The FH2 boot showed 647/648 imports resolved with the 1 failure
-unidentified. The loader now logs the exact failed import
+The loader now logs the exact failed import
 (`IMPORT FAILED: <module>!<name>` or `<module>:#<ordinal>`) instead of
-only the count, so the next boot pins it down.
+only the count, so a boot pins down failures by name.
 
 ## Proof (tests/guest_winrt.cpp, RC8)
 
@@ -186,7 +184,7 @@ Stages (`winrt_<stage>` in `guest_report.txt`):
 |---|---|
 | `winrt_era` | ERA shape: `XMemAlloc(64)` non-null through the kernelx translation |
 | `winrt_roget` | Direct `RoGetActivationFactory(CoreApplication)` returns the layer factory (S_OK, non-null) — through the hooked `api-ms-win-core-winrt-l1-1-0.dll` import |
-| `winrt_activation` | `vccorlib110!GetActivationFactoryByPCWSTR(CoreApplication)` returns the layer factory (the FH2 path) — imported by its mangled name, like the real exe |
+| `winrt_activation` | `vccorlib110!GetActivationFactoryByPCWSTR(CoreApplication)` returns the layer factory (the Xbox One title activation path) — imported by its mangled name, like an Xbox One title's import |
 | `winrt_same_factory` | Both activation paths return the **same** singleton (identical `ICoreApplication` pointers) |
 | `winrt_qi2` | The factory also exposes `ICoreApplication2` |
 | `winrt_id` | `get_Id` returns `"ScarlettCompat.CoreApplication"` |
@@ -231,32 +229,18 @@ Both loader hooks confirmed installed in the clean run
 (`hooked vccorlib110!GetActivationFactoryByPCWSTR…`,
 `hooked combase!RoGetActivationFactory…`).
 
-**FH2 boot attempt #5 — the verification for this phase**
-(`F:\ScarlettCompat\fh2_boot5.log`, 306 lines; local copy
-`~/workspace/fh2-diagnosis/fh2_boot5.log`; minidump
-`%LOCALAPPDATA%\CrashDumps\scarlett_verify.exe.16192.dmp`, local copy
-`~/workspace/fh2-diagnosis/`). Fresh build binaries in
-`F:\ScarlettCompat\fh2test\`, harness timeout 300 s, interactive
-session. Result: **the shim moved the boot past the boot #3 wall.**
-Loader PASS (647/648 imports); the vccorlib110 hook installed on the
-real exe; the guest's activation returned the layer factory;
-`CoreApplication::Run` entered the lifecycle; `CreateView` returned
-the game's view (`00000191007109D0`); the layer CoreWindow was created
-(hwnd `000000000014079A`, 1280×720). The guest then died **inside its
-own `IFrameworkView::Initialize`** — the next log line after the
-CoreWindow creation would have been `view Initialize -> S_OK`; it
-never appears. Child exit `0xe06d7363` (unhandled Microsoft C++
-exception). The game still does not run — but the failure moved from
-"Run rejected" (boot #3) to "Initialize threw" (boot #5). What
-Initialize calls that throws is the next diagnosis (the minidump is
-preserved for it; no debugger — cdb/WinDbg — is installed on the
-build machine, so the dump was not analyzed in this phase).
+**Xbox One title boot — the end-to-end verification for this phase.**
+Result: **the shim moved the boot past the Run wall.** The vccorlib110
+hook installed on the title; the title's activation returned the layer
+factory; `CoreApplication::Run` entered the lifecycle; `CreateView`
+returned the title's view; the layer CoreWindow was created (1280×720).
+The title then died **inside its own `IFrameworkView::Initialize`** —
+the next log line after the CoreWindow creation would have been `view
+Initialize -> S_OK`; it never appears. The title still does not run —
+but the failure moved from "Run rejected" to "Initialize threw". What
+Initialize calls that throws is the next diagnosis.
 
-Side findings from boot #5:
-- The per-import failure logging NEW in this phase identified the 1
-  still-unidentified failed FH2 import: **`MMDevAPI.DLL!
-  SetWasapiThreadAffinityMask` (no handler)**. Audio thread-affinity
-  setup; the guest survived on the stub this far.
+Side finding:
 - The era guest's phase-5 WinRT stage was a **false pass**: its
   `RoGetActivationFactory` import lives under
   `api-ms-win-core-winrt-l1-1-0.dll`, which the phase-5 hook did not
@@ -264,20 +248,6 @@ Side findings from boot #5:
   its own. The WinRT phase's hook fix (matching that API-set name)
   makes the era guest's WinRT stage genuinely layer-routed now; the
   era guest still passes 21/21.
-
-**Manifest registration (Seth's approach, tried before this phase):**
-the manifest at `E:\Anthem_1.0.0.64_x64__8wekyb3d8bbwe\Mount\AppxManifest.xml`
-was registered successfully from the interactive session
-(`Add-AppxPackage -Register`, package
-`Anthem_1.0.0.64_x64__8wekyb3d8bbwe`, Status Ok) — but boot attempt #4
-with the package registered was IDENTICAL to boot #3 (died at
-`CoreApplication::Run`): registration does NOT give the in-harness
-guest package identity, because the harness process itself is
-unpackaged. The shim remains the route, and boot #5 proves it moves
-the game forward where registration did not. As of the boot #5 check
-the package is no longer registered (`Get-AppxPackage` returns
-nothing) — it was not re-registered, since it changes nothing for the
-boot.
 
 ## Known gaps / follow-ups
 

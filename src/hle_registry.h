@@ -23,8 +23,8 @@ namespace sc {
 extern "C" HRESULT HleXGameRuntimeInitialize();
 extern "C" void* HleXMemAlloc(SIZE_T size, DWORD attrs);
 extern "C" void HleXMemFree(void* p);
-// kernelx!VirtualAlloc flag translation (FH2 boot #2 fix, 2026-11-23):
-// strips the Xbox-specific allocation-type bits the desktop rejects
+// kernelx!VirtualAlloc flag translation (VirtualAlloc
+// flag-translation fix, 2026-11-23): strips the Xbox-specific allocation-type bits the desktop rejects
 // (see HleVirtualAlloc in hle_registry.cpp) and retries with a
 // system-chosen address when the requested address fails.
 extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,

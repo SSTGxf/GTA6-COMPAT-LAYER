@@ -11,16 +11,16 @@
 //   shaders compiled at runtime, pixel-verified via readback) ->
 //   60-frame loop (render + fence + Present + frame pacing, timing
 //   stats) -> XGameSaveFiles -> package mount.
-// The boot SHAPE mirrors a Forza title's boot (Forza Horizon 2 as the
-// reference): a Forza game signs the profile in first, because the
+// The boot SHAPE mirrors an Xbox One title's boot (an Xbox One title
+// as the reference): a title signs the profile in first, because the
 // profile drives the save; it loads the profile save early, before the
 // renderer is up; it enumerates related packages for DLC car packs;
 // audio and input init before the main loop, which then runs at 60 Hz.
-// FH2 itself is an Xbox One / ERA title, NOT a Game Core title —
-// nothing from FH2 is loaded or run here, and no ERA support is added.
-// Every call below is translated into its GDK / Game Core equivalent,
-// so the guest stays a Game Core title; FH2 only sets the order and
-// what a real title touches at boot.
+// An Xbox One title is an ERA title, NOT a Game Core title — nothing
+// from a real title is loaded or run here, and no ERA support is
+// added. Every call below is translated into its GDK / Game Core
+// equivalent, so the guest stays a Game Core title; the Xbox One title
+// only sets the order and what a real title touches at boot.
 // Every stage reports as proof_<stage> in guest_report.txt; the harness
 // prints a dedicated proof report. This file contains NO game code — it
 // is a test program written for the layer, and it is never run through
@@ -156,8 +156,9 @@ static bool TestPackageEarly(char* detail, size_t n) {
                  (unsigned)hr, enumCount);
         return false;
     }
-    // Forza shape: enumerate related packages too (DLC car packs live
-    // there). The layer has one synthetic package for every scope.
+    // Xbox One title shape: enumerate related packages too (DLC car
+    // packs live there). The layer has one synthetic package for every
+    // scope.
     int enumRelated = 0;
     hr = XPackageEnumeratePackages(XPackageKind_Game,
                                    XPackageEnumerationScope_ThisAndRelated,
@@ -1294,10 +1295,10 @@ int main() {
     bool allBoot = true;
     char detail[512];
 
-    // Boot order mirrors a Forza title's boot (FH2 as the reference, in
-    // GDK terms — see the file header): profile first, because the
-    // profile drives the save; profile save early, before the renderer;
-    // DLC enumeration; graphics; audio + input before the loop.
+    // Boot order mirrors an Xbox One title's boot (in GDK terms — see
+    // the file header): profile first, because the profile drives the
+    // save; profile save early, before the renderer; DLC enumeration;
+    // graphics; audio + input before the loop.
     //
     // 1. Runtime init — the first call a GDK title makes.
     HRESULT hr = XGameRuntimeInitialize();
@@ -1307,23 +1308,24 @@ int main() {
     allBoot &= ok;
 
     // 2. Profile sign-in (silent default user) — first, because the
-    // profile drives the save. Forza signs the profile in before it
-    // touches storage.
+    // profile drives the save. An Xbox One title signs the profile in
+    // before it touches storage.
     detail[0] = 0;
     ok = TestUser(detail, sizeof(detail));
     Report("proof_user", ok, detail);
     allBoot &= ok;
 
-    // 3. Profile save load — EARLY, before the renderer is up. A Forza
-    // title reads the profile save (cars, credits, progress) before the
-    // title screen, not after.
+    // 3. Profile save load — EARLY, before the renderer is up. An
+    // Xbox One title reads the profile save (cars, credits, progress)
+    // before the title screen, not after.
     detail[0] = 0;
     ok = TestSave(detail, sizeof(detail));
     Report("proof_save", ok, detail);
     allBoot &= ok;
 
     // 4. Package check + DLC enumeration — real titles verify they are
-    // packaged and enumerate related packages (Forza's car packs).
+    // packaged and enumerate related packages (an Xbox One title's car
+    // packs).
     detail[0] = 0;
     ok = TestPackageEarly(detail, sizeof(detail));
     Report("proof_package", ok, detail);
@@ -1362,7 +1364,8 @@ int main() {
     Report("proof_gfx_surface", ok, detail);
     allBoot &= ok;
 
-    // 8. Audio init (stub — must still return S_OK). Forza's audio
+    // 8. Audio init (stub — must still return S_OK). An Xbox One
+    // title's audio
     // engine starts before the main loop.
     void* xa = nullptr;
     hr = XAudio2Create((IXAudio2**)&xa, 0, 0);
