@@ -198,11 +198,57 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-23 (phase 5 complete: ERA→GDK translation + ESRAM)
+## Status — 2026-11-23 (optimizations items 1–9 verified 13/13; RT mode selector; FH2 VirtualAlloc fix — boot attempt #3 past the region builder; fixed-timestep 7/7; phase 5 complete: ERA→GDK translation + ESRAM)
 
-**What works now (verified on the build machine, all five harness guests
+**What works now (verified on the build machine, all seven harness guests
 ALL PASS):**
 
+- **Optimizations (`docs/OPTIMIZATION.md`, `tests/guest_opt.cpp`):**
+  all nine items built and measured on the RX 5700 XT — **13/13 stages
+  pass, build 8 BUILD_EXIT=0**. (1) PSO + root-signature cache: raw 10x
+  CreateGraphicsPipelineState 2.072 ms vs cached 0.425 ms. (2) De-tiled
+  texture cache: CPU round-trip byte-exact (miss 1.169 ms / hit 0.257 ms)
+  plus a GPU cache with a VRAM budget and LRU eviction — de-tile
+  byte-exact, LRU order verified, streaming workload 55 hits / 5 misses
+  = **91.7%** (want ≥ 80%). (3) Mesh-shader fallback: CPU meshlet
+  expansion drawn and pixel-verified (correctness path, not a
+  performance claim). (4) Async compute: serial 0.292 ms vs async
+  0.259 ms — **async FASTER 11.6%** on the measured workload,
+  checksums equal. (5) Descriptor heap pool: 10,000 alloc/free 0.280 ms
+  vs heap-create 10,000x 8,355.408 ms. (6) DirectStorage + BCPack: batch
+  16x4 MB 26.998 ms vs sync 70.993 ms (overlapped I/O — the desktop
+  DirectStorage runtime is not on the build machine); ZLIB stored/fixed/
+  dynamic all decode; BCPack BC7 E_NOTIMPL (rANS format not public).
+  (7) Shader precompilation cache: compile 2.764 ms vs load 0.223 ms,
+  blobs byte-identical, corruption recovered. (8) RT mode selector — see
+  below. (9) Frame batching: 16 separate submits 0.260 ms vs 1 batched
+  0.040 ms; draws 8→3, sets 10→6 (recording slightly slower on 8 draws
+  — the win is fewer draw calls); frames in flight depth 3 sweet spot
+  (0.213 ms frame / 0.183 ms wait; depth 2 starves, depth 4 adds
+  nothing). All as flat `ScOpt_*` entry points — the COM wrapper that
+  routes a real title's device calls to them is future work.
+- **RT mode selector (item 8, `src/software_rt.cpp`,
+  `docs/SOFTWARE-RT.md`):** `SCARLETT_RT_MODE` selects `off` /
+  `software` (default) / `hardware`. The software-rt guest passes
+  **7/7 under all three modes**: `off` — RT calls succeed as no-ops
+  (no RT reflections/GI/shadows, rasterized lighting only); `software`
+  — the existing compute path; `hardware` — on the tier-0 5700 XT it
+  falls back to software with a log line, never fails. Hardware DXR
+  passthrough itself is E_NOTIMPL and unverifiable on this card.
+- **FH2 VirtualAlloc fix (`src/hle_registry.cpp`,
+  `tests/guest_era.cpp` `era_virtualalloc`):** the FH2 region-builder's
+  `kernelx!VirtualAlloc(0x800000000, …, 0x30002000/0x40002000)` calls
+  were forwarded verbatim and rejected by desktop VirtualAlloc (NULL,
+  err 87), crashing the guest at +0x125EFDA. The HLE wrapper strips
+  the Xbox bits, retries at NULL, and retries without MEM_LARGE_PAGES.
+  **Boot attempt #3 got past the diagnosed crash**: 647/648 imports
+  resolved, 80 VirtualAlloc calls through the wrapper ALL err 0
+  (including the exact 12 GB / 4 GB diagnosis cases), and the guest
+  died later with an unhandled C++ exception (0xe06d7363) — a new,
+  undiagnosed failure in game init, not the VirtualAlloc issue. The
+  era guest is now **21/21 stages** (the new `era_virtualalloc`
+  stage proves the wrapper: 0x30002000 commit + write/read-back ok,
+  0x40002000 ok, plain reserve+commit ok).
 - **Phase 5 — ERA→GDK translation (`src/era_to_gdk.cpp`,
   `tests/guest_era.cpp`, `docs/ERA-GDK-MAPPING.md`):** an Xbox One (ERA)
   title boots through the translation into the GDK layer and renders a
@@ -225,10 +271,14 @@ ALL PASS):**
   real boot was attempted: the loader mapped the exe and resolved
   203/648 imports (all 106 kernelx Win32 forwards), then stopped at
   the first wall, the missing **VS2012 CRT** (MSVCR110/MSVCP110/
-  vccorlib110/EtwPlus; child exit 0xFF). All 3 existing guests still
-  ALL PASS (no regressions). Known intermittent: a TLS `__declspec
-  (thread)` init-value flake in full builds (never in isolated
-  re-runs) — see `docs/STATUS.md`.
+  vccorlib110/EtwPlus; child exit 0xFF). That wall is since cleared
+  (the VS2012 redist is installed; boot attempt #2 resolved 647/648
+  and reached the entry point, then crashed at guest +0x125EFDA on a
+  VirtualAlloc translation gap — fixed by the HLE wrapper above, and
+  boot attempt #3 got past it to an unhandled C++ exception). All
+  existing guests still ALL PASS (no regressions). Known intermittent:
+  a TLS `__declspec (thread)` init-value flake in full builds (never
+  in isolated re-runs) — see `docs/STATUS.md`.
 - **Phase 4 — realistic proof guest (`tests/guest_proof.cpp`):** a Game Core
   title shaped on FH2's boot order (service init order, what a real title
   touches at boot) translated into GDK equivalents — runtime init, profile
@@ -244,7 +294,8 @@ ALL PASS):**
   an Xbox One / ERA title, so it only sets the boot *shape* — the guest
   stays Game Core; ERA support arrived in phase 5 (above), grounded in
   the real FH2 exe's import table and first boot attempt.
-- **Software ray tracing (`src/software_rt.cpp`, `tests/guest_software_rt.cpp`):** the layer replaces hardware DXR with a compute-shader ray tracer (raygen + stack BVH walk + Möller–Trumbore + closest-hit/miss) on GPUs with no RT cores — the RX 5700 XT reports `RaytracingTier == NOT_SUPPORTED`, so the layer takes the software path. `ScSoftwareRT_*` entry points (ScarlettCompat-defined, not Xbox APIs): path query, init (compute PSO), CPU BVH scene build, dispatch into the caller's UAV. Proof: a one-triangle scene ray-traced at 256x256, pixel-verified (center red 255,0,0,255; corner miss color 51,102,204,255), **6/6 stages pass** through the harness, and a standalone host test passes first. All 5 guests ALL PASS in the full build. Not covered: any-hit, procedural primitives, recursion, multi-BLAS TLAS, hardware DXR passthrough, the COM wrapper that would route a real title's `ID3D12Device5` RT calls here, mesh shaders. See `docs/SOFTWARE-RT.md`.
+- **Software ray tracing (`src/software_rt.cpp`, `tests/guest_software_rt.cpp`):** the layer replaces hardware DXR with a compute-shader ray tracer (raygen + stack BVH walk + Möller–Trumbore + closest-hit/miss) on GPUs with no RT cores — the RX 5700 XT reports `RaytracingTier == NOT_SUPPORTED`, so the layer takes the software path. `ScSoftwareRT_*` entry points (ScarlettCompat-defined, not Xbox APIs): path query, init (compute PSO), CPU BVH scene build, dispatch into the caller's UAV. Proof: a one-triangle scene ray-traced at 256x256, pixel-verified (center red 255,0,0,255; corner miss color 51,102,204,255), **7/7 stages pass** through the harness (the mode-aware guest: srt_mode + tier + init + scene + dispatch + summary), and a standalone host test passes first. All 7 guests ALL PASS in the full build (the software-rt guest now runs 7/7 under all three RT modes — see the RT mode selector above). Not covered: any-hit, procedural primitives, recursion, multi-BLAS TLAS, hardware DXR passthrough, the COM wrapper that would route a real title's `ID3D12Device5` RT calls here, mesh shaders. See `docs/SOFTWARE-RT.md`.
+- **Fixed-timestep physics decoupling (`src/fixed_timestep.cpp`, `tests/guest_physics.cpp`, `docs/FIXED-TIMESTEP.md`):** a title that steps physics once per frame event has physics tied to the frame rate — at 30 FPS physics runs at half speed. The layer's `ScFixedTimestep_*` entry points (ScarlettCompat-defined, not Xbox APIs) break the tie the standard way: a QPC accumulator, physics steps in fixed 1/60 s increments (default 60 Hz, `SCARLETT_PHYSICS_HZ` override), interpolation between the last two physics states (`alpha = accumulator / dt`), and a spiral-of-death guard (max 5 steps per pump; excess time is dropped, not fast-forwarded). The pump runs on the game's thread — from `WaitFrameEventX` when a step callback is registered, or directly by the title — because the physics state is the game's memory and cannot be stepped from another thread. Proof guest: a constant-velocity point (analytic answer x = v·t) at render rates 30 and 120 FPS, plus the naive-path control that shows the tie, the frame-event hook path, and the hitch guard. Proof: **7/7 stages pass** — physics at fixed 60 Hz while rendering at 30 FPS (137 steps in 2.288 s, final x within 0.05 of analytic) and 120 FPS (221 steps in 3.690 s), max interpolation error 0.167 against a 0.250 bound, the naive control at exactly 50% of analytic. The real title's physics-step function address is exe-dependent and unknown until the exe lands — the mechanism is proven, the hook waits on the exe. See `docs/FIXED-TIMESTEP.md`.
 - Xbox PE32+ loader: maps a native x86-64 PE into the host process,
   validates the `.xbld` section (GXDK build strings), applies base
   relocations, and resolves imports — Xbox DLLs to the HLE registry,

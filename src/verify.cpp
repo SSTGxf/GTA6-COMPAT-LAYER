@@ -238,8 +238,74 @@ static int ParentRun(const wchar_t* guestPath, DWORD timeoutMs) {
         }
     }
     if (!srtBlock.empty()) {
-        printf("--- software-rt report ---\n%ssrt stages: %d/%d pass\n",
+        // RT mode (item 8): the harness prints which mode this run
+        // used, read from the environment the child inherited
+        // (SCARLETT_RT_MODE; unset = software default).
+        char rtMode[64] = {};
+        DWORD n = GetEnvironmentVariableA("SCARLETT_RT_MODE", rtMode,
+                                          sizeof(rtMode));
+        if (n == 0) rtMode[0] = 0;
+        printf("--- software-rt report (RT mode: %s) ---\n%ssrt stages: "
+               "%d/%d pass\n",
+               rtMode[0] ? rtMode : "(unset, default software)",
                srtBlock.c_str(), srtPassed, srtTotal);
+    }
+
+    // Optimization report: same shape as the software-RT block, for
+    // lines the optimization guest writes (opt_<stage>). Presentation
+    // only.
+    int optTotal = 0, optPassed = 0;
+    std::string optBlock;
+    {
+        size_t pos = 0;
+        while (pos < guestRep.size()) {
+            size_t eol = guestRep.find('\n', pos);
+            std::string line = guestRep.substr(
+                pos, eol == std::string::npos ? eol : eol - pos);
+            if (line.rfind("opt", 0) == 0) {
+                optBlock += line + "\n";
+                if (line.rfind("opt_", 0) == 0 &&
+                    line.find("_detail") == std::string::npos) {
+                    optTotal++;
+                    if (line.find("=PASS") != std::string::npos)
+                        optPassed++;
+                }
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+    }
+    if (!optBlock.empty()) {
+        printf("--- optimization report ---\n%sopt stages: %d/%d pass\n",
+               optBlock.c_str(), optPassed, optTotal);
+    }
+
+    // Fixed-timestep report: same shape as the optimization block, for
+    // lines the physics guest writes (ft_<stage>). Presentation only.
+    int ftTotal = 0, ftPassed = 0;
+    std::string ftBlock;
+    {
+        size_t pos = 0;
+        while (pos < guestRep.size()) {
+            size_t eol = guestRep.find('\n', pos);
+            std::string line = guestRep.substr(
+                pos, eol == std::string::npos ? eol : eol - pos);
+            if (line.rfind("ft", 0) == 0) {
+                ftBlock += line + "\n";
+                if (line.rfind("ft_", 0) == 0 &&
+                    line.find("_detail") == std::string::npos) {
+                    ftTotal++;
+                    if (line.find("=PASS") != std::string::npos)
+                        ftPassed++;
+                }
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+    }
+    if (!ftBlock.empty()) {
+        printf("--- fixed-timestep report ---\n%sft stages: %d/%d pass\n",
+               ftBlock.c_str(), ftPassed, ftTotal);
     }
 
     // Verdict: every reported line must be PASS.

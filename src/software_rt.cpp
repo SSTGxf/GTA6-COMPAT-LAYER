@@ -55,6 +55,8 @@ ID3D12DescriptorHeap* g_uavHeap = nullptr;
 UINT g_uavHeapSize = 0;
 ScRtPath g_path = SC_RT_PATH_SOFTWARE;
 bool g_pathKnown = false;
+ScRtMode g_mode = SC_RT_MODE_SOFTWARE;
+bool g_modeKnown = false;
 
 // ---- the compute shader ----
 // Root signature (declared in HLSL via root signature syntax is NOT used
@@ -258,6 +260,45 @@ struct ScSoftwareRTScene {
     uint32_t nodeCount = 0;
 };
 
+extern "C" const char* ScSoftwareRT_ModeName(ScRtMode mode) {
+    switch (mode) {
+        case SC_RT_MODE_OFF: return "off";
+        case SC_RT_MODE_HARDWARE: return "hardware";
+        case SC_RT_MODE_SOFTWARE:
+        default: return "software";
+    }
+}
+
+extern "C" ScRtMode ScSoftwareRT_GetMode(void) {
+    if (g_modeKnown) return g_mode;
+    g_modeKnown = true;
+    char value[64] = {};
+    DWORD n = GetEnvironmentVariableA("SCARLETT_RT_MODE", value,
+                                      sizeof(value));
+    if (n == 0 || n >= sizeof(value)) {
+        // Unset (or unreadably long): the default is software.
+        g_mode = SC_RT_MODE_SOFTWARE;
+        SrtLog("RT mode: SCARLETT_RT_MODE unset -> software (default)");
+        return g_mode;
+    }
+    // Case-insensitive match; anything else is a typo, not a mode.
+    if (_stricmp(value, "off") == 0) {
+        g_mode = SC_RT_MODE_OFF;
+    } else if (_stricmp(value, "software") == 0) {
+        g_mode = SC_RT_MODE_SOFTWARE;
+    } else if (_stricmp(value, "hardware") == 0) {
+        g_mode = SC_RT_MODE_HARDWARE;
+    } else {
+        SrtLog("RT mode: SCARLETT_RT_MODE='%s' unrecognized -> software "
+               "(want off / software / hardware)",
+               value);
+        g_mode = SC_RT_MODE_SOFTWARE;
+    }
+    SrtLog("RT mode selected: %s (SCARLETT_RT_MODE='%s')",
+           ScSoftwareRT_ModeName(g_mode), value);
+    return g_mode;
+}
+
 extern "C" HRESULT ScSoftwareRT_QueryPath(ID3D12Device* device,
                                           ScRtPath* path, uint32_t* rtTier) {
     if (!device || !path || !rtTier) return E_INVALIDARG;
@@ -267,11 +308,37 @@ extern "C" HRESULT ScSoftwareRT_QueryPath(ID3D12Device* device,
     uint32_t tier = 0;
     if (SUCCEEDED(hr)) tier = (uint32_t)opts5.RaytracingTier;
     *rtTier = tier;
-    *path = (tier == 0) ? SC_RT_PATH_SOFTWARE : SC_RT_PATH_HARDWARE;
+    ScRtMode mode = ScSoftwareRT_GetMode();
+    if (mode == SC_RT_MODE_OFF) {
+        // RT is off: the path is off regardless of what the adapter
+        // could do. The tier is still reported (information only).
+        *path = SC_RT_PATH_OFF;
+        SrtLog("QueryPath rtTier=%u mode=off -> path=off (RT calls are "
+               "no-ops)",
+               tier);
+    } else if (mode == SC_RT_MODE_SOFTWARE) {
+        // Explicit software: the compute path, whatever the tier is.
+        *path = SC_RT_PATH_SOFTWARE;
+        SrtLog("QueryPath rtTier=%u mode=software -> path=software", tier);
+    } else {
+        // Hardware asked for: only real when the adapter has a tier.
+        // Tier 0 (this card) falls back to software with a clear log
+        // line — never a failure.
+        if (tier == 0) {
+            *path = SC_RT_PATH_SOFTWARE;
+            SrtLog("QueryPath rtTier=0 mode=hardware -> FALLBACK to "
+                   "software (adapter has no RT cores; hardware DXR "
+                   "cannot be verified on this card)");
+        } else {
+            *path = SC_RT_PATH_HARDWARE;
+            SrtLog("QueryPath rtTier=%u mode=hardware -> path=hardware "
+                   "(passthrough not yet implemented; DispatchRays will "
+                   "return E_NOTIMPL)",
+                   tier);
+        }
+    }
     g_path = *path;
     g_pathKnown = true;
-    SrtLog("QueryPath rtTier=%u path=%s", tier,
-           (*path == SC_RT_PATH_SOFTWARE) ? "software" : "hardware");
     return S_OK;
 }
 
@@ -282,6 +349,18 @@ extern "C" HRESULT ScSoftwareRT_Init(ID3D12Device* device) {
         ScRtPath path = SC_RT_PATH_SOFTWARE;
         uint32_t tier = 0;
         ScSoftwareRT_QueryPath(device, &path, &tier);
+    }
+    if (g_path == SC_RT_PATH_OFF) {
+        // RT is off: there is no PSO to compile. S_OK, nothing built.
+        SrtLog("Init off mode: no ray-tracing PSO (RT calls are no-ops)");
+        return S_OK;
+    }
+    if (g_path == SC_RT_PATH_HARDWARE) {
+        // Hardware path: the compute PSO is not used (real DXR state
+        // objects are the passthrough's job, still future work).
+        SrtLog("Init hardware mode: no software PSO (hardware passthrough "
+               "not yet implemented)");
+        return S_OK;
     }
     // Compile the compute shader at runtime (same technique as the proof
     // guest's triangle shaders).
@@ -382,8 +461,27 @@ extern "C" HRESULT ScSoftwareRT_BuildScene(ID3D12Device* device,
                                            const ScRtTriangle* tris,
                                            uint32_t triCount,
                                            ScSoftwareRTSceneHandle* scene) {
-    if (!device || !tris || triCount == 0 || !scene) return E_INVALIDARG;
+    if (!device || !scene) return E_INVALIDARG;
     *scene = nullptr;
+    if (!g_pathKnown) {
+        ScRtPath path = SC_RT_PATH_SOFTWARE;
+        uint32_t tier = 0;
+        ScSoftwareRT_QueryPath(device, &path, &tier);
+    }
+    if (g_path == SC_RT_PATH_OFF) {
+        // RT is off: no scene is built; the caller gets a null handle
+        // and DispatchRays is a no-op. S_OK, not an error.
+        SrtLog("BuildScene off mode: no scene (null handle)");
+        return S_OK;
+    }
+    if (g_path == SC_RT_PATH_HARDWARE) {
+        // Real BLAS/TLAS construction is part of the hardware
+        // passthrough (future work, unverifiable on this card).
+        SrtLog("BuildScene hardware mode: E_NOTIMPL (passthrough not yet "
+               "implemented)");
+        return E_NOTIMPL;
+    }
+    if (!tris || triCount == 0) return E_INVALIDARG;
     std::vector<BuildItem> items(triCount);
     std::vector<float> verts(3 * 3 * triCount);
     std::vector<float> colors(4 * triCount);
@@ -439,22 +537,35 @@ extern "C" HRESULT ScSoftwareRT_DispatchRays(ID3D12Device* device,
                                              const ScRtCamera* camera,
                                              ID3D12Resource* outputUav,
                                              uint32_t width, uint32_t height) {
-    if (!device || !cmdList || !scene || !camera || !outputUav || width == 0 ||
-        height == 0)
-        return E_INVALIDARG;
+    if (!device || !cmdList) return E_INVALIDARG;
     if (!g_pathKnown) {
         ScRtPath path = SC_RT_PATH_SOFTWARE;
         uint32_t tier = 0;
         ScSoftwareRT_QueryPath(device, &path, &tier);
     }
+    if (g_path == SC_RT_PATH_OFF) {
+        // RT is off: the dispatch is a no-op that succeeds. The scene
+        // may be null (BuildScene returned a null handle); the output
+        // texture is left exactly as the rasterizer left it — the
+        // title renders with its rasterized lighting only (no RT
+        // reflections / GI / shadows). Nothing is recorded, nothing is
+        // written.
+        SrtLog("DispatchRays off mode: no-op (output left untouched)");
+        return S_OK;
+    }
     if (g_path == SC_RT_PATH_HARDWARE) {
         // The adapter has real RT cores: hardware DXR passthrough is
         // future work (it cannot be verified on this card). Refuse
         // honestly instead of running the software path where hardware
-        // was asked for.
+        // was asked for. This check comes BEFORE the scene null check
+        // on purpose: in hardware mode BuildScene returns E_NOTIMPL
+        // and no valid scene can ever exist, so a null scene must not
+        // mask the path refusal with E_INVALIDARG.
         SrtLog("hardware path requested but passthrough not implemented");
         return E_NOTIMPL;
     }
+    if (!scene || !camera || !outputUav || width == 0 || height == 0)
+        return E_INVALIDARG;
     if (!g_pso) {
         SrtLog("DispatchRays before Init");
         return E_FAIL;

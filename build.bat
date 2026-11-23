@@ -22,7 +22,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OUT%\lib" mkdir "%OUT%\lib"
 
 echo === 1. ScarlettCompat.dll (layer) ===
-cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" "%ROOT%src\era_to_gdk.cpp" "%ROOT%src\software_rt.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib d3d11.lib d3dcompiler.lib winmm.lib runtimeobject.lib
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" "%ROOT%src\era_to_gdk.cpp" "%ROOT%src\software_rt.cpp" "%ROOT%src\fixed_timestep.cpp" "%ROOT%src\opt_pso_cache.cpp" "%ROOT%src\opt_detile.cpp" "%ROOT%src\opt_mesh_fallback.cpp" "%ROOT%src\opt_async_compute.cpp" "%ROOT%src\opt_desc_heap.cpp" "%ROOT%src\opt_dstorage.cpp" "%ROOT%src\opt_shader_cache.cpp" "%ROOT%src\opt_texcache.cpp" "%ROOT%src\opt_batching.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib d3d11.lib d3dcompiler.lib winmm.lib runtimeobject.lib
 if errorlevel 1 exit /b 1
 
 echo === 2. Shim import libs (Xbox DLL names mapped to layer exports) ===
@@ -57,6 +57,14 @@ REM Software ray tracing proof guest (compute ray tracer through the
 REM layer's ScSoftwareRT_* entry points, pixel-verified on the 5700 XT).
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_software_rt.cpp" /Fe"%OUT%\guest_software_rt.exe" /Fo%OUT%\ /Fd%OUT%\guest_software_rt.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime.lib d3d12_xs.lib d3d12.lib dxgi.lib
 if errorlevel 1 exit /b 1
+REM Optimization proof guest (one stage per optimization item in
+REM docs/OPTIMIZATION.md, each reporting measured before/after numbers).
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_opt.cpp" /Fe"%OUT%\guest_opt.exe" /Fo%OUT%\ /Fd%OUT%\guest_opt.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime.lib d3d12_xs.lib d3d12.lib dxgi.lib d3dcompiler.lib
+if errorlevel 1 exit /b 1
+REM Fixed-timestep physics proof guest (physics at a fixed 60 Hz
+REM while rendering at 30 and 120 FPS; see docs/FIXED-TIMESTEP.md).
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_physics.cpp" /Fe"%OUT%\guest_physics.exe" /Fo%OUT%\ /Fd%OUT%\guest_physics.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime.lib d3d12_xs.lib winmm.lib
+if errorlevel 1 exit /b 1
 
 echo === 4. Verification harness ===
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\verify.cpp" /Fe"%OUT%\scarlett_verify.exe" /Fo%OUT%\ /Fd%OUT%\scarlett_verify.pdb /link "%OUT%\ScarlettCompat.lib"
@@ -73,13 +81,34 @@ set RC2=%ERRORLEVEL%
 set RC3=%ERRORLEVEL%
 "%OUT%\scarlett_verify.exe" "%OUT%\guest_era.exe" 120000
 set RC4=%ERRORLEVEL%
+REM RT mode (item 8): the software-rt guest runs once per mode. The
+REM harness passes its environment through to the child, so
+REM SCARLETT_RT_MODE reaches the guest. software = the default path,
+REM off = RT calls are no-ops, hardware = falls back to software on
+REM this tier-0 card (must NOT fail).
+set SCARLETT_RT_MODE=software
 "%OUT%\scarlett_verify.exe" "%OUT%\guest_software_rt.exe" 120000
 set RC5=%ERRORLEVEL%
+set SCARLETT_RT_MODE=off
+"%OUT%\scarlett_verify.exe" "%OUT%\guest_software_rt.exe" 120000
+set RC5b=%ERRORLEVEL%
+set SCARLETT_RT_MODE=hardware
+"%OUT%\scarlett_verify.exe" "%OUT%\guest_software_rt.exe" 120000
+set RC5c=%ERRORLEVEL%
+set SCARLETT_RT_MODE=
+"%OUT%\scarlett_verify.exe" "%OUT%\guest_opt.exe" 180000
+set RC6=%ERRORLEVEL%
+"%OUT%\scarlett_verify.exe" "%OUT%\guest_physics.exe" 120000
+set RC7=%ERRORLEVEL%
 cd /d "%ROOT%"
 if %RC1% neq 0 (echo guest_minimal FAILED & exit /b 1)
 if %RC2% neq 0 (echo guest_ordinal FAILED & exit /b 1)
 if %RC3% neq 0 (echo guest_proof FAILED & exit /b 1)
 if %RC4% neq 0 (echo guest_era FAILED & exit /b 1)
-if %RC5% neq 0 (echo guest_software_rt FAILED & exit /b 1)
+if %RC5% neq 0 (echo guest_software_rt [software] FAILED & exit /b 1)
+if %RC5b% neq 0 (echo guest_software_rt [off] FAILED & exit /b 1)
+if %RC5c% neq 0 (echo guest_software_rt [hardware] FAILED & exit /b 1)
+if %RC6% neq 0 (echo guest_opt FAILED & exit /b 1)
+if %RC7% neq 0 (echo guest_physics FAILED & exit /b 1)
 echo === verify exit code: 0 ===
 exit /b 0

@@ -59,11 +59,60 @@ things, translated.
 | Any-hit shader / alpha-tested geometry | No equivalent — any-hit runs per candidate intersection before closest-hit is known; the software walk takes the first hit as closest-hit and stops | Not implemented |
 | Intersection shader (procedural primitives) | No equivalent — the software walk only intersects triangles (Möller–Trumbore) | Not implemented |
 | Recursion (rays spawning rays) | No equivalent — one ray per pixel, no secondary rays, no recursion | Not implemented |
-| Hardware path (tier ≥ 1_0) | `ScSoftwareRT_DispatchRays` returns `E_NOTIMPL` with a log line when the adapter reports a real RT tier. Real hardware DXR passthrough (state objects, real shader tables, real BLAS/TLAS) is future work — it cannot be verified on this card, and faking it would be worse than refusing it | Stub (honest refusal) |
+| Hardware path (tier ≥ 1_0) | `ScSoftwareRT_DispatchRays` returns `E_NOTIMPL` with a log line when the adapter reports a real RT tier. Real hardware DXR passthrough (state objects, real shader tables, real BLAS/TLAS) is future work — it cannot be verified on this card, and faking it would be worse than refusing it. When the mode is `hardware` on a tier-0 adapter, the layer falls back to software with a clear log line instead of failing (see the RT mode section below) | Stub (honest refusal) |
 
 Counts: **7 DXR concepts implemented, 1 partial (single-instance TLAS),
 4 with no software equivalent, 1 honest stub (hardware passthrough).**
 0 faked.
+
+## RT mode launch setting (item 8)
+
+The layer reads one launch setting at startup that selects the RT
+mode: the environment variable **`SCARLETT_RT_MODE`**. The harness
+passes its environment through to the child process automatically
+(`verify.cpp` uses `lpEnvironment=NULL`), so a mode set in
+`build.bat` reaches the guest; no config file is needed — the env
+var is the simplest robust mechanism. The mode is read once per
+process and cached; it is a per-process launch setting, not a
+per-call flag.
+
+| Value | Meaning |
+|---|---|
+| `off` | RT calls succeed but do nothing (no-op). The title renders without RT effects — **no RT reflections, no RT global illumination, no RT shadows** — and relies on its rasterized lighting. `BuildScene` returns `S_OK` with a null scene handle; `DispatchRays` returns `S_OK` and writes nothing (the output texture is left exactly as the rasterizer left it). |
+| `software` | The existing Lumen-style compute-shader path above. **Default** on the 5700 XT (which reports RT tier 0). Also the mode for an unset, empty, or unrecognized value (an unrecognized value logs a warning and falls back to software). |
+| `hardware` | Hardware DXR when the adapter reports an RT tier above 0. On the 5700 XT (tier 0) it **falls back to software with a clear log line, NOT a failure** — the title still renders, through the software path. On a tier>0 adapter the path is hardware, and `BuildScene`/`DispatchRays` return `E_NOTIMPL` (the passthrough is future work, unverifiable on this card — see the honest stub above). |
+
+How to set it:
+
+```
+REM cmd (and build.bat, which runs the guest three times, once per mode):
+set SCARLETT_RT_MODE=off
+set SCARLETT_RT_MODE=software
+set SCARLETT_RT_MODE=hardware
+
+# PowerShell:
+$env:SCARLETT_RT_MODE = 'off'
+```
+
+Values are case-insensitive (`OFF`, `Software`, `HARDWARE` all work).
+The selected mode is visible two ways: the harness prints it in the
+software-rt report header (`--- software-rt report (RT mode: off) ---`)
+and the guest reports an `srt_mode` stage (requested value vs the
+layer's effective mode) plus an `srt_tier` stage that shows the
+effective path and, for `hardware` on tier 0, the fallback. The
+mode is also readable at runtime through the new entry point
+`ScSoftwareRT_GetMode()` (see the interface below).
+
+Mode logic lives in `src/software_rt.cpp` + `include/software_rt.h`
+only (`ScRtMode` enum, `ScSoftwareRT_GetMode`,
+`ScSoftwareRT_ModeName` — the latter is layer-side only, not an HLE
+export). `ScSoftwareRT_QueryPath` is mode-aware: `off` → path OFF
+(the tier is still reported, for information only); `software` →
+path SOFTWARE regardless of tier; `hardware` → tier > 0 → path
+HARDWARE, tier == 0 → path SOFTWARE with the fallback log line.
+`ScSoftwareRT_Init` compiles the compute PSO only on the software
+path; `BuildScene` and `DispatchRays` branch on the same effective
+path, so every entry point agrees about which mode is in force.
 
 ## The layer interface (flat entry points, not COM)
 
@@ -76,6 +125,9 @@ through the normal loader:
 
 - `ScSoftwareRT_QueryPath(device, &path, &rtTier)` — which path this
   adapter takes, and the tier it reported.
+- `ScSoftwareRT_GetMode()` — the selected RT mode (`off` /
+  `software` / `hardware`) from `SCARLETT_RT_MODE` (see the mode
+  section above).
 - `ScSoftwareRT_Init(device)` — compile the compute PSO once, cache
   it. S_OK on success.
 - `ScSoftwareRT_BuildScene(device, tris, triCount, &scene)` — CPU BVH
@@ -151,11 +203,23 @@ takes the hardware path instead (once that passthrough exists).
 ## Verification (bar)
 
 `tests/guest_software_rt.cpp` — a synthetic guest through the
-harness: boots like the proof guest (runtime init → device), queries
-the RT tier (expects `NOT_SUPPORTED` on the 5700 XT), inits the
-software backend, builds a one-triangle scene, dispatches rays into
-a 256x256 UAV, reads the pixels back, and checks center == triangle
-red (255,0,0,255) and corner == miss clear color (51,102,204,255).
-Stages report as `srt_*` in guest_report.txt. Bar: clean rebuild
-`BUILD_EXIT=0`; `guest_software_rt` ALL PASS; all existing guests
-still ALL PASS (no regressions).
+harness: boots like the proof guest (runtime init → device), reads
+the RT mode (`srt_mode` stage: requested vs effective), queries the
+RT path (`srt_tier` stage — the expected path depends on the mode
+and the tier), inits the backend, builds a one-triangle scene, and
+dispatches rays into a 256x256 UAV. What "correct" means depends on
+the mode: `software` — center == triangle red (255,0,0,255) and
+corner == miss clear color (51,102,204,255); `off` — the output is
+pre-filled with the miss color and the dispatch is a no-op, so
+center AND corner must still be the miss color (proving the no-op
+wrote nothing); `hardware` — on this tier-0 card it falls back to
+software (same check as software); on a tier>0 adapter
+`BuildScene`/`DispatchRays` return `E_NOTIMPL` and the stages pass
+on that honest refusal.
+Stages report as `srt_*` in guest_report.txt (7 stages: runtime,
+device, mode, tier, init, scene, dispatch). `build.bat` runs the
+guest three times — `SCARLETT_RT_MODE=software` (RC5), `=off`
+(RC5b), `=hardware` (RC5c) — and the build fails if any of them
+fails. Bar: clean rebuild `BUILD_EXIT=0`;
+`guest_software_rt` ALL PASS under all three modes; all existing
+guests still ALL PASS (no regressions).

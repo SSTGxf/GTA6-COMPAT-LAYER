@@ -27,10 +27,38 @@ extern "C" {
 // Which path the adapter takes. Software when the device reports no RT
 // tier; hardware when it reports tier >= 1_0 (passthrough not yet
 // implemented — DispatchRays refuses it with E_NOTIMPL; see the doc).
+// Off when the launch setting disables RT entirely (see ScRtMode).
 typedef enum ScRtPath {
     SC_RT_PATH_SOFTWARE = 0,
     SC_RT_PATH_HARDWARE = 1,
+    SC_RT_PATH_OFF = 2,
 } ScRtPath;
+
+// Launch setting: which RT mode the layer runs in. Read from the
+// SCARLETT_RT_MODE environment variable at first use (cached per
+// process) — see docs/SOFTWARE-RT.md for the values and the default.
+//   off       — RT calls succeed but do nothing (no-op); the title
+//               renders with its rasterized lighting only (no RT
+//               reflections / GI / shadows).
+//   software  — Lumen-style compute-shader RT (the default; also the
+//               fallback when hardware is asked for on a tier-0 card).
+//   hardware  — hardware DXR when the adapter reports an RT tier above
+//               0; on a tier-0 adapter it falls back to software with
+//               a clear log line, never a failure.
+typedef enum ScRtMode {
+    SC_RT_MODE_SOFTWARE = 0,
+    SC_RT_MODE_OFF = 1,
+    SC_RT_MODE_HARDWARE = 2,
+} ScRtMode;
+
+// The selected launch mode (SCARLETT_RT_MODE; unset/empty/unrecognized
+// -> SOFTWARE, with a log line for an unrecognized value). Cached at
+// first use; the mode is a per-process launch setting.
+ScRtMode ScSoftwareRT_GetMode(void);
+
+// Human-readable mode name ("off" / "software" / "hardware"), for the
+// layer's log lines. Layer-side only (not an HLE export).
+const char* ScSoftwareRT_ModeName(ScRtMode mode);
 
 // Query the path for a device. rtTier receives the raw
 // D3D12_RAYTRACING_TIER value (0 == NOT_SUPPORTED).

@@ -5,7 +5,72 @@ EXPORTS
     ScheduleFrameEventX
     WaitFrameEventX
     ScSoftwareRT_QueryPath
+    ScSoftwareRT_GetMode
     ScSoftwareRT_Init
     ScSoftwareRT_BuildScene
     ScSoftwareRT_FreeScene
     ScSoftwareRT_DispatchRays
+    ScOpt_PsoCacheInit
+    ScOpt_PsoCacheGetGraphics
+    ScOpt_PsoCacheGetCompute
+    ScOpt_PsoCacheGetRootSignature
+    ScOpt_PsoCacheStats
+    ScOpt_PsoCacheDestroy
+    ScOpt_Tile2D
+    ScOpt_Detile2D
+    ScOpt_DetileCached
+    ScOpt_DetileStats
+    ScOpt_DetileDestroy
+    ScOpt_MeshFallbackInit
+    ScOpt_MeshFallbackGetShaders
+    ScOpt_MeshFallbackExpand
+    ScOpt_MeshFallbackFreeExpanded
+    ScOpt_MeshFallbackDestroy
+    ScOpt_AsyncInit
+    ScOpt_AsyncRunTimed
+    ScOpt_AsyncChecksum
+    ScOpt_AsyncDestroy
+    ScOpt_DescHeapInit
+    ScOpt_DescAlloc
+    ScOpt_DescFree
+    ScOpt_DescHeapStats
+    ScOpt_DescHeapDestroy
+    ScOpt_DStorageInit
+    ScOpt_DStorageReadFile
+    ScOpt_DStorageReadFileBatch
+    ScOpt_DStorageDecompress
+    ScOpt_ShaderCacheInit
+    ScOpt_CompileCached
+    ScOpt_ShaderCacheStats
+    ScOpt_TexCacheInit
+    ScOpt_TexCacheLookup
+    ScOpt_TexCacheStore
+    ScOpt_TexCacheEvict
+    ScOpt_TexCacheStats
+    ScOpt_TexCacheDestroy
+    ScOpt_BatchInit
+    ScOpt_BatchAdd
+    ScOpt_BatchFlush
+    ScOpt_BatchStats
+    ScOpt_BatchDestroy
+    ScOpt_DrawBatchBegin
+    ScOpt_DrawBatchSetPSO
+    ScOpt_DrawBatchSetRootSignature
+    ScOpt_DrawBatchSetRenderTargets
+    ScOpt_DrawBatchSetVertexBuffer
+    ScOpt_DrawBatchDrawInstanced
+    ScOpt_DrawBatchFlushDraw
+    ScOpt_DrawBatchEnd
+    ScOpt_DrawBatchStats
+    ScOpt_DrawBatchDestroy
+    ScOpt_FlightInit
+    ScOpt_FlightBeginFrame
+    ScOpt_FlightEndFrame
+    ScOpt_FlightStats
+    ScOpt_FlightDestroy
+    ScFixedTimestep_Init
+    ScFixedTimestep_SetStepCallback
+    ScFixedTimestep_Pump
+    ScFixedTimestep_Alpha
+    ScFixedTimestep_GetStats
+    ScFixedTimestep_Shutdown

@@ -426,6 +426,62 @@ static bool TestMemory(char* detail, size_t n) {
     return ok;
 }
 
+// ---- stage: kernelx!VirtualAlloc flag translation (FH2 boot #2 fix,
+// 2026-11-23). The ERA guest's region-descriptor builder calls
+// kernelx!VirtualAlloc(0x800000000, size, 0x30002000 / 0x40002000,
+// PAGE_READWRITE); the desktop rejects those Xbox flag bits (NULL,
+// err 87), so the layer translates them (HleVirtualAlloc). The guest
+// calls the wrapper directly under its own name (imported from
+// kernelx.lib) — importing the name VirtualAlloc from kernelx would
+// reroute the CRT's VirtualAlloc calls through the wrapper. The FH2
+// boot retry is the end-to-end proof for the real import name.
+// The VirtualAlloc / VirtualFree calls below are the guest's own
+// (kernel32) — they commit into / release the wrapper's reservation.
+extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
+                                  DWORD flAllocationType, DWORD flProtect);
+static bool TestVirtualAlloc(char* detail, size_t n) {
+    // 1. The exact FH2 case: 0x30002000 at the Xbox VA.
+    void* p1 = HleVirtualAlloc((LPVOID)0x800000000ULL, 1024 * 1024,
+                               0x30002000, PAGE_READWRITE);
+    bool ok1 = p1 != nullptr;
+    bool commit1 = false, rw1 = false;
+    if (ok1) {
+        // Prove the reservation is real, committable memory: commit
+        // the first page, write and read back a byte. (A reserve-only
+        // region cannot be written to, so the commit is the proof.)
+        void* c = VirtualAlloc(p1, 4096, MEM_COMMIT, PAGE_READWRITE);
+        commit1 = c != nullptr;
+        if (commit1) {
+            ((uint8_t*)p1)[0] = 0x5A;
+            rw1 = ((uint8_t*)p1)[0] == 0x5A;
+        }
+        VirtualFree(p1, 0, MEM_RELEASE);
+    }
+    // 2. The other Xbox flag set: 0x40002000 at the Xbox VA.
+    void* p2 = HleVirtualAlloc((LPVOID)0x800000000ULL, 1024 * 1024,
+                               0x40002000, PAGE_READWRITE);
+    bool ok2 = p2 != nullptr;
+    if (p2) VirtualFree(p2, 0, MEM_RELEASE);
+    // 3. Plain desktop flags through the wrapper (must not regress).
+    void* p3 = HleVirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT,
+                               PAGE_READWRITE);
+    bool ok3 = p3 != nullptr;
+    bool rw3 = false;
+    if (ok3) {
+        ((uint8_t*)p3)[0] = 0xA5;
+        rw3 = ((uint8_t*)p3)[0] == 0xA5;
+        VirtualFree(p3, 0, MEM_RELEASE);
+    }
+    bool ok = ok1 && commit1 && rw1 && ok2 && ok3 && rw3;
+    snprintf(detail, n,
+             "0x30002000@0x800000000 %s commit %s rw %s; 0x40002000 %s; "
+             "plain reserve+commit %s rw %s",
+             ok1 ? "ok" : "FAIL", commit1 ? "ok" : "FAIL",
+             rw1 ? "ok" : "FAIL", ok2 ? "ok" : "FAIL",
+             ok3 ? "ok" : "FAIL", rw3 ? "ok" : "FAIL");
+    return ok;
+}
+
 // ---- stage: D3D11.x device via D3D11XCreateDeviceX (ERA adaptation
 // -> desktop D3D11). This is the entry the REAL FH2 exe imports
 // (d3d11_x hint 3, WinDurango ordinal 4), so the guest exercises the
@@ -1587,6 +1643,12 @@ int main() {
     detail[0] = 0;
     ok = TestMemory(detail, sizeof(detail));
     Report("era_memory", ok, detail);
+    allBoot &= ok;
+
+    // 4b. kernelx!VirtualAlloc flag translation (FH2 boot #2 fix).
+    detail[0] = 0;
+    ok = TestVirtualAlloc(detail, sizeof(detail));
+    Report("era_virtualalloc", ok, detail);
     allBoot &= ok;
 
     // 5. D3D11.x device (device-only entry point).
