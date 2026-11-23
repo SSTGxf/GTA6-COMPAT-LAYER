@@ -156,6 +156,35 @@ static int ParentRun(const wchar_t* guestPath, DWORD timeoutMs) {
                ? "guest=NO REPORT (guest died before writing results)\n"
                : guestRep.c_str());
 
+    // Proof report (phase 4): if the guest wrote proof_* stages, surface
+    // them as a dedicated block with a stage count. The verdict logic
+    // below already counts these lines, so this is presentation only.
+    int proofTotal = 0, proofPassed = 0;
+    std::string proofBlock;
+    {
+        size_t pos = 0;
+        while (pos < guestRep.size()) {
+            size_t eol = guestRep.find('\n', pos);
+            std::string line = guestRep.substr(
+                pos, eol == std::string::npos ? eol : eol - pos);
+            if (line.rfind("proof", 0) == 0) {
+                proofBlock += line + "\n";
+                if (line.rfind("proof_", 0) == 0 &&
+                    line.find("_detail") == std::string::npos) {
+                    proofTotal++;
+                    if (line.find("=PASS") != std::string::npos)
+                        proofPassed++;
+                }
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+    }
+    if (!proofBlock.empty()) {
+        printf("--- proof report ---\n%sproof stages: %d/%d pass\n",
+               proofBlock.c_str(), proofPassed, proofTotal);
+    }
+
     // Verdict: every reported line must be PASS.
     bool allPass = !timedOut && childCode == 0 &&
                    loadRep.find("loader=PASS") != std::string::npos;

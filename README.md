@@ -198,11 +198,25 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-23 (phase 3 complete: bug fixes + more surface)
+## Status — 2026-11-23 (phase 4 complete: realistic proof guest)
 
-**What works now (verified on the build machine, both harness guests
+**What works now (verified on the build machine, all three harness guests
 ALL PASS):**
 
+- **Phase 4 — realistic proof guest (`tests/guest_proof.cpp`):** a Game Core
+  title shaped on FH2's boot order (service init order, what a real title
+  touches at boot) translated into GDK equivalents — runtime init, profile
+  sign-in first, profile save load early (before the renderer), package
+  check + DLC enumeration, memory, `D3D12XboxCreateDevice`, device surface,
+  audio + input init, storage, a real rendered triangle scene, a 60-frame
+  loop, XGameSaveFiles, package mount, protections, TLS, TLS worker thread.
+  The triangle goes through a real PSO + runtime-compiled HLSL and is
+  pixel-verified via readback (center red 255,0,0,255; corner clear color
+  51,102,204,255). The 60-frame loop averages **17.2 ms** (min 17.0, max
+  19.1) with **Present 60/60**. All **17/17 boot stages pass**, and
+  `guest_minimal` / `guest_ordinal` still pass with no regressions. FH2 is
+  an Xbox One / ERA title, so it only sets the boot *shape* — the guest
+  stays Game Core, no ERA support, no FH2 files loaded or run.
 - Xbox PE32+ loader: maps a native x86-64 PE into the host process,
   validates the `.xbld` section (GXDK build strings), applies base
   relocations, and resolves imports — Xbox DLLs to the HLE registry,
@@ -240,7 +254,17 @@ ALL PASS):**
   the layer in a throwaway child process and reports **pass/fail per
   subsystem**. Final clean build: `guest_minimal` ALL PASS (real device,
   frame, surface, protections, TLS, worker TLS, services, services2),
-  `guest_ordinal` ALL PASS (57 imports resolved, 0 failed).
+  `guest_ordinal` ALL PASS (57 imports resolved, 0 failed),
+  `guest_proof` ALL PASS (17/17 boot stages, triangle pixel-verified,
+  60-frame loop at 17.2 ms avg, Present 60/60).
+- **Harness must run in an interactive session (session 1).** The build
+  task is created with `schtasks /it` for this reason: in session 0
+  (SYSTEM) the guests crash after the TLS stage with an access violation
+  in `gdi32full.dll` (NULL+0x20 read, AMD driver + RTSSHooks on the
+  faulting thread's stack). The layer never calls GDI — it is the
+  session-0 window station + graphics stack, not a layer bug. Same
+  binaries pass in session 1 and in a foreground run, and crash 100%
+  in session 0.
 - Swapchain Present: **proven in an interactive session** — a one-shot
   interactive scheduled task ran the standalone probe (`Present
   hr=0x00000000`, `PRESENT OK`) and then the full harness, whose guest
@@ -253,9 +277,11 @@ ALL PASS):**
 boot path for a synthetic guest title and a first `d3d12_xs`
 frame — **not GTA 6 playable.** No public project boots this game; the
 realistic ladder is (1) synthetic guest boots, (2) first `d3d12_xs` frame
-on screen, (3) one small real Game Core title boots, (4) only then point
-the layer at the GTA VI exe once it lands and read its import table.
-Steps 1 and 2 are done and verified (above).
+on screen, (2.5) a realistic guest boots a full title-shaped boot with a
+real rendered scene and a 60-frame loop, (3) one small real Game Core
+title boots, (4) only then point the layer at the GTA VI exe once it lands
+and read its import table.
+Steps 1, 2, and 2.5 are done and verified (above).
 
 **Blocked on the exe (nothing here can substitute):**
 
