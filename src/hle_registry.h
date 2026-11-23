@@ -47,14 +47,45 @@ extern "C" HRESULT HleXGameSaveCloseProvider(XGameSaveProviderHandle provider);
 extern "C" HRESULT HleXGameSaveCreateContainer(XGameSaveProviderHandle provider,
                                                 const char* displayName,
                                                 XGameSaveContainerHandle* container);
+// XGameSave update flow + XGameSaveFiles (phase 3).
+extern "C" HRESULT HleXGameSaveCreateUpdate(XGameSaveContainerHandle container,
+                                            const char* containerDisplayName,
+                                            XGameSaveUpdateHandle* update);
+extern "C" HRESULT HleXGameSaveSubmitBlobWrite(XGameSaveUpdateHandle update,
+                                               const char* blobName,
+                                               const uint8_t* data,
+                                               size_t byteCount);
+extern "C" HRESULT HleXGameSaveSubmitBlobDelete(XGameSaveUpdateHandle update,
+                                                const char* blobName);
+extern "C" HRESULT HleXGameSaveSubmitUpdate(XGameSaveUpdateHandle update);
+extern "C" HRESULT HleXGameSaveSubmitUpdateAsync(XGameSaveUpdateHandle update,
+                                                 struct XAsyncBlock* async);
+extern "C" HRESULT HleXGameSaveSubmitUpdateResult(struct XAsyncBlock* async);
+extern "C" HRESULT HleXGameSaveCloseUpdate(XGameSaveUpdateHandle update);
+extern "C" HRESULT HleXGameSaveCloseContainer(XGameSaveContainerHandle container);
+extern "C" HRESULT HleXGameSaveReadBlobData(XGameSaveContainerHandle container,
+                                            const char* blobName,
+                                            size_t* bytesRead,
+                                            size_t bufferSize,
+                                            uint8_t* buffer);
+extern "C" HRESULT HleXGameSaveFilesGetFolderWithUiAsync(
+    XUserHandle requestingUser, const char* configurationId,
+    struct XAsyncBlock* async);
+extern "C" HRESULT HleXGameSaveFilesGetFolderWithUiResult(
+    struct XAsyncBlock* async, size_t bufferSize, char* folder);
 extern "C" HRESULT HleXPackageGetMountPathSize(uint32_t* size);
 extern "C" HRESULT HleXPackageGetMountPath(wchar_t* path, uint32_t* pathSize);
 extern "C" BOOL HleXPackageIsPackagedProcess(void);
-extern "C" HRESULT HleXPackageGetCurrentProcessPackageIdentifier(void* identifier);
-extern "C" HRESULT HleXPackageMountWithUiAsync(struct XAsyncBlock* async);
+extern "C" HRESULT HleXPackageGetCurrentProcessPackageIdentifier(
+    size_t bufferSize, char* buffer);
+extern "C" HRESULT HleXPackageEnumeratePackages(
+    XPackageKind kind, XPackageEnumerationScope scope, void* context,
+    XPackageEnumerationCallback* callback);
+extern "C" HRESULT HleXPackageMountWithUiAsync(const char* packageIdentifier,
+                                               struct XAsyncBlock* async);
 extern "C" HRESULT HleXPackageMountWithUiResult(struct XAsyncBlock* async,
-                                                 void** mountHandle);
-extern "C" HRESULT HleXPackageCloseMountHandle(void* mountHandle);
+                                                XPackageMountHandle* mount);
+extern "C" HRESULT HleXPackageCloseMountHandle(XPackageMountHandle mount);
 
 // Guest directory for XPackageGetMountPath (set by the loader).
 void SetGuestDir(const wchar_t* dir);

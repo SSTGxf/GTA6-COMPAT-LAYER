@@ -14,10 +14,22 @@ EXPORTS
     XGameSaveInitializeProvider
     XGameSaveCloseProvider
     XGameSaveCreateContainer
+    XGameSaveCreateUpdate
+    XGameSaveSubmitBlobWrite
+    XGameSaveSubmitBlobDelete
+    XGameSaveSubmitUpdate
+    XGameSaveSubmitUpdateAsync
+    XGameSaveSubmitUpdateResult
+    XGameSaveCloseUpdate
+    XGameSaveCloseContainer
+    XGameSaveReadBlobData
+    XGameSaveFilesGetFolderWithUiAsync
+    XGameSaveFilesGetFolderWithUiResult
     XPackageGetMountPathSize
     XPackageGetMountPath
     XPackageIsPackagedProcess
     XPackageGetCurrentProcessPackageIdentifier
+    XPackageEnumeratePackages
     XPackageMountWithUiAsync
     XPackageMountWithUiResult
     XPackageCloseMountHandle

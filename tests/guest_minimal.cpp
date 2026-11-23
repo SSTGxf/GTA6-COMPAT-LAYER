@@ -66,6 +66,297 @@ static void CALLBACK UserAddCallback(XAsyncBlock* async) {
     g_userCallbackRan = true;
 }
 
+static bool g_genericCallbackRan = false;
+static void CALLBACK GenericCallback(XAsyncBlock* async) {
+    (void)async;
+    g_genericCallbackRan = true;
+}
+
+static bool CALLBACK EnumPackagesCallback(void* context,
+                                          const XPackageDetails* details) {
+    int* count = (int*)context;
+    (*count)++;
+    // The synthetic package must identify itself consistently.
+    if (strcmp(details->packageIdentifier,
+               "ScarlettCompat-Guest-7952987A") != 0)
+        return false;
+    if (details->kind != XPackageKind_Game) return false;
+    if (strcmp(details->titleID, "7952987A") != 0) return false;
+    return true;  // continue enumerating
+}
+
+// Services part 2 (phase 3): XGameSave update flow (sync + async),
+// XGameSaveFiles folder + Win32 file I/O, XPackage identifier /
+// enumerate / mount.
+static bool TestServices2(char* detail, size_t n) {
+    // A user for the XGameSaveFiles call.
+    XAsyncBlock userAsync = {};
+    userAsync.callback = GenericCallback;
+    g_genericCallbackRan = false;
+    HRESULT hr = XUserAddAsync(XUserAddOptions_AddDefaultUserSilently,
+                               &userAsync);
+    if (FAILED(hr) || !g_genericCallbackRan) {
+        snprintf(detail, n, "XUserAddAsync hr=0x%08x cb=%d",
+                 (unsigned)hr, (int)g_genericCallbackRan);
+        return false;
+    }
+    XUserHandle user = nullptr;
+    hr = XUserAddResult(&userAsync, &user);
+    if (FAILED(hr) || !user) {
+        snprintf(detail, n, "XUserAddResult hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+
+    // XGameSave update flow, sync submit + read-back.
+    XGameSaveProviderHandle provider = nullptr;
+    hr = XGameSaveInitializeProvider(
+        user, "00000000-0000-0000-0000-000000000002", FALSE, &provider);
+    if (FAILED(hr) || !provider) {
+        snprintf(detail, n, "XGameSaveInitializeProvider hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+    XGameSaveContainerHandle container = nullptr;
+    hr = XGameSaveCreateContainer(provider, "save-slot-1", &container);
+    if (FAILED(hr) || !container) {
+        snprintf(detail, n, "XGameSaveCreateContainer hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    XGameSaveUpdateHandle update = nullptr;
+    hr = XGameSaveCreateUpdate(container, "save-slot-1", &update);
+    if (FAILED(hr) || !update) {
+        snprintf(detail, n, "XGameSaveCreateUpdate hr=0x%08x", (unsigned)hr);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    static const uint8_t kPlayerState[8] = {'A', 'B', 'C', 'D',
+                                            'E', 'F', 'G', 'H'};
+    hr = XGameSaveSubmitBlobWrite(update, "PlayerState", kPlayerState,
+                                  sizeof(kPlayerState));
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveSubmitBlobWrite hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseUpdate(update);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveSubmitBlobDelete(update, "OldBlob");
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveSubmitBlobDelete hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseUpdate(update);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveSubmitUpdate(update);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveSubmitUpdate hr=0x%08x", (unsigned)hr);
+        XGameSaveCloseUpdate(update);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveCloseUpdate(update);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveCloseUpdate hr=0x%08x", (unsigned)hr);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    // Read the blob back and verify the bytes.
+    uint8_t readBack[16] = {};
+    size_t bytesRead = 0;
+    hr = XGameSaveReadBlobData(container, "PlayerState", &bytesRead,
+                               sizeof(readBack), readBack);
+    if (FAILED(hr) || bytesRead != sizeof(kPlayerState) ||
+        memcmp(readBack, kPlayerState, sizeof(kPlayerState)) != 0) {
+        snprintf(detail, n,
+                 "XGameSaveReadBlobData hr=0x%08x bytes=%zu",
+                 (unsigned)hr, bytesRead);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    // Async submit path on a second update.
+    XGameSaveUpdateHandle update2 = nullptr;
+    hr = XGameSaveCreateUpdate(container, "save-slot-1", &update2);
+    if (FAILED(hr) || !update2) {
+        snprintf(detail, n, "XGameSaveCreateUpdate#2 hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    static const uint8_t kAsyncBlob[4] = {'1', '2', '3', '4'};
+    hr = XGameSaveSubmitBlobWrite(update2, "AsyncBlob", kAsyncBlob,
+                                  sizeof(kAsyncBlob));
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveSubmitBlobWrite#2 hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseUpdate(update2);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    XAsyncBlock submitAsync = {};
+    submitAsync.callback = GenericCallback;
+    g_genericCallbackRan = false;
+    hr = XGameSaveSubmitUpdateAsync(update2, &submitAsync);
+    if (FAILED(hr) || !g_genericCallbackRan) {
+        snprintf(detail, n,
+                 "XGameSaveSubmitUpdateAsync hr=0x%08x cb=%d",
+                 (unsigned)hr, (int)g_genericCallbackRan);
+        XGameSaveCloseUpdate(update2);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveSubmitUpdateResult(&submitAsync);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveSubmitUpdateResult hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseUpdate(update2);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveCloseUpdate(update2);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveCloseUpdate#2 hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseContainer(container);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveCloseContainer(container);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveCloseContainer hr=0x%08x",
+                 (unsigned)hr);
+        XGameSaveCloseProvider(provider);
+        return false;
+    }
+    hr = XGameSaveCloseProvider(provider);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XGameSaveCloseProvider hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+
+    // XGameSaveFiles: get the folder, write a file with Win32 FileIO,
+    // read it back.
+    XAsyncBlock filesAsync = {};
+    filesAsync.callback = GenericCallback;
+    g_genericCallbackRan = false;
+    hr = XGameSaveFilesGetFolderWithUiAsync(
+        user, "00000000-0000-0000-0000-000000000003", &filesAsync);
+    if (FAILED(hr) || !g_genericCallbackRan) {
+        snprintf(detail, n,
+                 "XGameSaveFilesGetFolderWithUiAsync hr=0x%08x cb=%d",
+                 (unsigned)hr, (int)g_genericCallbackRan);
+        return false;
+    }
+    char folder[MAX_PATH] = {};
+    hr = XGameSaveFilesGetFolderWithUiResult(&filesAsync, sizeof(folder),
+                                             folder);
+    if (FAILED(hr) || folder[0] == 0) {
+        snprintf(detail, n,
+                 "XGameSaveFilesGetFolderWithUiResult hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+    char filePath[MAX_PATH] = {};
+    snprintf(filePath, sizeof(filePath), "%s\\files-test.txt", folder);
+    HANDLE hf = CreateFileA(filePath, GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) {
+        snprintf(detail, n, "CreateFileA in save folder failed (%lu)",
+                 GetLastError());
+        return false;
+    }
+    DWORD written = 0;
+    const char* kText = "hello-files";
+    BOOL wok = WriteFile(hf, kText, (DWORD)strlen(kText), &written, nullptr);
+    CloseHandle(hf);
+    if (!wok || written != strlen(kText)) {
+        snprintf(detail, n, "WriteFile in save folder failed");
+        return false;
+    }
+    hf = CreateFileA(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) {
+        snprintf(detail, n, "reopen save file failed (%lu)",
+                 GetLastError());
+        return false;
+    }
+    char back[32] = {};
+    DWORD read = 0;
+    BOOL rok = ReadFile(hf, back, sizeof(back) - 1, &read, nullptr);
+    CloseHandle(hf);
+    if (!rok || read != strlen(kText) || strcmp(back, kText) != 0) {
+        snprintf(detail, n, "save file round-trip mismatch (read=%lu)",
+                 read);
+        return false;
+    }
+
+    // XPackage: identifier, enumerate, mount, close.
+    char pkgId[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    hr = XPackageGetCurrentProcessPackageIdentifier(sizeof(pkgId), pkgId);
+    if (FAILED(hr) || pkgId[0] == 0) {
+        snprintf(detail, n,
+                 "XPackageGetCurrentProcessPackageIdentifier hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+    int enumCount = 0;
+    hr = XPackageEnumeratePackages(XPackageKind_Game,
+                                   XPackageEnumerationScope_ThisOnly,
+                                   &enumCount, EnumPackagesCallback);
+    if (FAILED(hr) || enumCount != 1) {
+        snprintf(detail, n,
+                 "XPackageEnumeratePackages hr=0x%08x count=%d",
+                 (unsigned)hr, enumCount);
+        return false;
+    }
+    XAsyncBlock mountAsync = {};
+    mountAsync.callback = GenericCallback;
+    g_genericCallbackRan = false;
+    hr = XPackageMountWithUiAsync(pkgId, &mountAsync);
+    if (FAILED(hr) || !g_genericCallbackRan) {
+        snprintf(detail, n,
+                 "XPackageMountWithUiAsync hr=0x%08x cb=%d",
+                 (unsigned)hr, (int)g_genericCallbackRan);
+        return false;
+    }
+    XPackageMountHandle mount = nullptr;
+    hr = XPackageMountWithUiResult(&mountAsync, &mount);
+    if (FAILED(hr) || !mount) {
+        snprintf(detail, n, "XPackageMountWithUiResult hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+    hr = XPackageCloseMountHandle(mount);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XPackageCloseMountHandle hr=0x%08x",
+                 (unsigned)hr);
+        return false;
+    }
+    hr = XUserCloseHandle(user);
+    if (FAILED(hr)) {
+        snprintf(detail, n, "XUserCloseHandle#2 hr=0x%08x", (unsigned)hr);
+        return false;
+    }
+    snprintf(detail, n,
+             "gamesave round-trip ok (8B + 4B async), files folder "
+             "\"%s\", pkg \"%s\" enum=1 mount ok",
+             folder, pkgId);
+    return true;
+}
+
 static void CALLBACK TestAsyncWork(XAsyncBlock* async) {
     async->internal[1] = (void*)42;
 }
@@ -178,6 +469,43 @@ static bool TestServices(char* detail, size_t n) {
              (unsigned long long)xuid, tag,
              (unsigned long long)localId.value, mountCap, (int)packaged);
     return true;
+}
+
+// TLS on worker threads (phase 3): a second __declspec(thread)
+// variable, untouched by the main-thread TLS test, so the worker
+// thread's fresh template copy (77) can be told apart from the main
+// thread's value — per-thread isolation, not shared state.
+static __declspec(thread) int g_tlsThreadVar = 77;
+static volatile LONG g_workerSaw = -1;
+static volatile LONG g_workerSet = 0;
+static DWORD WINAPI WorkerThread(LPVOID param) {
+    (void)param;
+    g_workerSaw = g_tlsThreadVar;  // expect 77 (fresh template copy)
+    g_tlsThreadVar = 88;
+    g_workerSet = g_tlsThreadVar;  // 88
+    return 0;
+}
+static bool TestTlsThread(char* detail, size_t n) {
+    g_workerSaw = -1;
+    g_workerSet = 0;
+    int mainBefore = g_tlsThreadVar;  // 77 on the main thread
+    HANDLE h = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+    if (!h) {
+        snprintf(detail, n, "CreateThread failed (%lu)", GetLastError());
+        return false;
+    }
+    DWORD w = WaitForSingleObject(h, 10000);
+    CloseHandle(h);
+    if (w != WAIT_OBJECT_0) {
+        snprintf(detail, n, "worker thread timed out");
+        return false;
+    }
+    int mainAfter = g_tlsThreadVar;  // must still be 77
+    bool ok = (g_workerSaw == 77) && (g_workerSet == 88) &&
+              (mainBefore == 77) && (mainAfter == 77);
+    snprintf(detail, n, "worker saw=%ld set=%ld main=%d->%d",
+             (long)g_workerSaw, (long)g_workerSet, mainBefore, mainAfter);
+    return ok;
 }
 
 // Per-section page protections (phase 2, milestone C): the loader must
@@ -570,6 +898,191 @@ static bool TestXsFrame(ID3D12Device* dev, char* detail, size_t n) {
     return true;
 }
 
+// d3d12_xs surface (phase 3): exercise the full D3D12 device-method
+// surface THROUGH the shim device (the one D3D12XboxCreateDevice
+// returned) — queues of all three types, allocators/lists, committed +
+// placed resources, descriptor heaps, root signature, feature query,
+// and a GPU copy round-trip verified on the CPU. Xbox titles call these
+// as COM methods on the device, so a real desktop device behind the
+// shim already answers them; this test proves the path end to end.
+static bool TestXsSurface(ID3D12Device* dev, char* detail, size_t n) {
+    HRESULT hr = S_OK;
+    ID3D12CommandQueue* qDirect = nullptr;
+    ID3D12CommandQueue* qCompute = nullptr;
+    ID3D12CommandQueue* qCopy = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE fenceEv = nullptr;
+    ID3D12Resource* bufDefault = nullptr;
+    ID3D12Resource* bufUpload = nullptr;
+    ID3D12Resource* bufReadback = nullptr;
+    ID3D12DescriptorHeap* cbvHeap = nullptr;
+    ID3D12RootSignature* rootSig = nullptr;
+    ID3D12Heap* heap = nullptr;
+    ID3D12Resource* placed = nullptr;
+    UINT64 fenceVal = 0;
+    int queues = 0, buffers = 0;
+    bool copyOk = false, rootSigOk = false, heapOk = false;
+    uint32_t bindingTier = 0;
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&qDirect));
+    if (SUCCEEDED(hr)) { queues++; qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE; hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&qCompute)); }
+    if (SUCCEEDED(hr)) { queues++; qd.Type = D3D12_COMMAND_LIST_TYPE_COPY; hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&qCopy)); }
+    if (SUCCEEDED(hr)) queues++;
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    if (SUCCEEDED(hr)) {
+        fenceEv = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (!fenceEv) hr = E_FAIL;
+    }
+    // Three committed buffers: DEFAULT / UPLOAD / READBACK, 256 bytes.
+    auto makeBuffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state,
+                          ID3D12Resource** out) {
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = type;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 256;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                            state, nullptr,
+                                            IID_PPV_ARGS(out));
+    };
+    if (SUCCEEDED(hr)) hr = makeBuffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, &bufDefault);
+    if (SUCCEEDED(hr)) { buffers++; hr = makeBuffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, &bufUpload); }
+    if (SUCCEEDED(hr)) { buffers++; hr = makeBuffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, &bufReadback); }
+    if (SUCCEEDED(hr)) buffers++;
+    // Descriptor heap (CBV_SRV_UAV) + a CBV on the upload buffer.
+    if (SUCCEEDED(hr)) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 1;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cbvHeap));
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
+        cbv.BufferLocation = bufUpload->GetGPUVirtualAddress();
+        cbv.SizeInBytes = 256;
+        dev->CreateConstantBufferView(&cbv, cbvHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+    // Empty root signature (no shaders needed).
+    if (SUCCEEDED(hr)) {
+        D3D12_ROOT_SIGNATURE_DESC rs = {};
+        rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* errBlob = nullptr;
+        hr = D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errBlob);
+        if (SUCCEEDED(hr)) {
+            hr = dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rootSig));
+            blob->Release();
+        }
+        if (errBlob) errBlob->Release();
+        rootSigOk = SUCCEEDED(hr) && rootSig != nullptr;
+    }
+    // Feature query.
+    if (SUCCEEDED(hr)) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+        hr = dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts));
+        if (SUCCEEDED(hr)) bindingTier = opts.ResourceBindingTier;
+    }
+    // Heap + placed resource.
+    if (SUCCEEDED(hr)) {
+        D3D12_HEAP_DESC hd = {};
+        hd.SizeInBytes = 64 * 1024;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hr = dev->CreateHeap(&hd, IID_PPV_ARGS(&heap));
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 256;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hr = dev->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&placed));
+        heapOk = SUCCEEDED(hr) && placed != nullptr;
+    }
+    // GPU copy round-trip: fill the upload buffer, copy upload -> default
+    // -> readback, fence-wait, verify bytes on the CPU.
+    if (SUCCEEDED(hr)) {
+        void* mapped = nullptr;
+        D3D12_RANGE wr = {0, 0};
+        hr = bufUpload->Map(0, &wr, &mapped);
+        if (SUCCEEDED(hr) && mapped) {
+            uint8_t* p = (uint8_t*)mapped;
+            for (int i = 0; i < 256; ++i) p[i] = (uint8_t)(i ^ 0x5A);
+            D3D12_RANGE empty = {0, 0};
+            bufUpload->Unmap(0, &empty);
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        list->CopyBufferRegion(bufDefault, 0, bufUpload, 0, 256);
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = bufDefault;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(bufReadback, 0, bufDefault, 0, 256);
+        hr = list->Close();
+    }
+    if (SUCCEEDED(hr)) {
+        ID3D12CommandList* lists[] = {list};
+        qDirect->ExecuteCommandLists(1, lists);
+        qDirect->Signal(fence, ++fenceVal);
+        fence->SetEventOnCompletion(fenceVal, fenceEv);
+        if (WaitForSingleObject(fenceEv, 10000) != WAIT_OBJECT_0) hr = E_FAIL;
+    }
+    if (SUCCEEDED(hr)) {
+        void* mapped = nullptr;
+        D3D12_RANGE rd = {0, 256};
+        hr = bufReadback->Map(0, &rd, &mapped);
+        if (SUCCEEDED(hr) && mapped) {
+            const uint8_t* p = (const uint8_t*)mapped;
+            copyOk = true;
+            for (int i = 0; i < 256; ++i)
+                if (p[i] != (uint8_t)(i ^ 0x5A)) { copyOk = false; break; }
+            D3D12_RANGE empty = {0, 0};
+            bufReadback->Unmap(0, &empty);
+        }
+    }
+    bool ok = SUCCEEDED(hr) && copyOk && rootSigOk && heapOk &&
+              queues == 3 && buffers == 3;
+    snprintf(detail, n,
+             "queues=%d buffers=%d copy=%d rootSig=%d heap+placed=%d "
+             "bindingTier=%u hr=0x%08x",
+             queues, buffers, (int)copyOk, (int)rootSigOk, (int)heapOk,
+             bindingTier, (unsigned)hr);
+    if (fenceEv) CloseHandle(fenceEv);
+    if (fence) fence->Release();
+    if (placed) placed->Release();
+    if (heap) heap->Release();
+    if (rootSig) rootSig->Release();
+    if (cbvHeap) cbvHeap->Release();
+    if (bufReadback) bufReadback->Release();
+    if (bufUpload) bufUpload->Release();
+    if (bufDefault) bufDefault->Release();
+    if (list) list->Release();
+    if (alloc) alloc->Release();
+    if (qCopy) qCopy->Release();
+    if (qCompute) qCompute->Release();
+    if (qDirect) qDirect->Release();
+    return ok;
+}
+
 int main() {
     fopen_s(&g_report, "guest_report.txt", "w");
     printf("[guest] synthetic Xbox guest starting\n");
@@ -620,6 +1133,14 @@ int main() {
     ok = false;
     if (dev) ok = TestXsFrame((ID3D12Device*)dev, detail, sizeof(detail));
     Report("frame_xs", ok, detail);
+    allBoot &= ok;
+
+    // d3d12_xs surface (phase 3): full device-method surface through the
+    // shim device.
+    detail[0] = 0;
+    ok = false;
+    if (dev) ok = TestXsSurface((ID3D12Device*)dev, detail, sizeof(detail));
+    Report("gfx_xs_surface", ok, detail);
     allBoot &= ok;
 
     hr = SetFrameIntervalX(1, 0);
@@ -687,10 +1208,24 @@ int main() {
     Report("tls", tlsOk, detail);
     allBoot &= tlsOk;
 
+    // TLS on worker threads (phase 3): the guest's CreateThread import
+    // is hooked by the loader, so the worker gets its own TLS block.
+    detail[0] = 0;
+    ok = TestTlsThread(detail, sizeof(detail));
+    Report("tls_thread", ok, detail);
+    allBoot &= ok;
+
     // Services (milestone E): XUser / XAsync / XGameSave / XPackage.
     detail[0] = 0;
     ok = TestServices(detail, sizeof(detail));
     Report("services", ok, detail);
+    allBoot &= ok;
+
+    // Services part 2 (phase 3): XGameSave update flow, XGameSaveFiles,
+    // XPackage identifier / enumerate / mount.
+    detail[0] = 0;
+    ok = TestServices2(detail, sizeof(detail));
+    Report("services2", ok, detail);
     allBoot &= ok;
 
     printf("[guest] boot path %s\n", allBoot ? "ALL PASS" : "FAIL");

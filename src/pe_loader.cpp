@@ -141,6 +141,193 @@ void ApplySectionProtections(void* base, const IMAGE_NT_HEADERS64* nt) {
     }
 }
 
+// Per-thread TLS for guest worker threads (phase 3). SetupTls fills
+// this in for the main thread; a guest thread created through the
+// guest's own CreateThread/CreateRemoteThread import gets the same
+// template copy + .CRT$XLB callbacks via the trampoline below. The
+// template/callback pointers live in the mapped image, which stays
+// mapped for the guest's lifetime.
+struct TlsTemplateInfo {
+    const void* templateData = nullptr;
+    SIZE_T templateSize = 0;
+    DWORD index = 0;
+    PIMAGE_TLS_CALLBACK* callbacks = nullptr;
+    bool valid = false;
+};
+static TlsTemplateInfo g_tlsInfo;
+
+// Real thread-creation functions, captured when the guest's IAT is
+// hooked (their FT entries hold the real addresses after import
+// resolution).
+using CreateThreadFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T,
+                                       LPTHREAD_START_ROUTINE, LPVOID,
+                                       DWORD, LPDWORD);
+using CreateRemoteThreadFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES,
+                                             SIZE_T, LPTHREAD_START_ROUTINE,
+                                             LPVOID, DWORD, LPDWORD);
+static CreateThreadFn g_realCreateThread = nullptr;
+static CreateRemoteThreadFn g_realCreateRemoteThread = nullptr;
+
+// Set up TLS for the calling thread: allocate a block, copy the
+// template, write it into the TEB TLS array, and run the .CRT$XLB
+// callbacks with DLL_THREAD_ATTACH. Returns the block (owned by the
+// caller) or nullptr. No-op when the guest has no TLS directory.
+static void* EnsureThreadTls() {
+    if (!g_tlsInfo.valid) return nullptr;
+    void* block = nullptr;
+    if (g_tlsInfo.templateSize > 0) {
+        block = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                          g_tlsInfo.templateSize);
+        if (!block) return nullptr;
+        memcpy(block, g_tlsInfo.templateData, g_tlsInfo.templateSize);
+    }
+    if (!TlsSetValue(g_tlsInfo.index, block)) {
+        if (block) HeapFree(GetProcessHeap(), 0, block);
+        return nullptr;
+    }
+    PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+    tlsArr[g_tlsInfo.index] = block;
+    if (g_tlsInfo.callbacks) {
+        for (size_t i = 0; g_tlsInfo.callbacks[i]; ++i) {
+            __try {
+                g_tlsInfo.callbacks[i](nullptr, DLL_THREAD_ATTACH, nullptr);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log("loader",
+                    "WARNING: TLS callback %zu faulted on thread attach "
+                    "(0x%08x)",
+                    i, GetExceptionCode());
+                continue;
+            }
+        }
+    }
+    return block;
+}
+
+// Tear down TLS for the calling thread: DLL_THREAD_DETACH callbacks,
+// clear the slot, free the block.
+static void CleanupThreadTls() {
+    if (!g_tlsInfo.valid) return;
+    if (g_tlsInfo.callbacks) {
+        for (size_t i = 0; g_tlsInfo.callbacks[i]; ++i) {
+            __try {
+                g_tlsInfo.callbacks[i](nullptr, DLL_THREAD_DETACH, nullptr);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+        }
+    }
+    void* block = TlsGetValue(g_tlsInfo.index);
+    TlsSetValue(g_tlsInfo.index, nullptr);
+    PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+    tlsArr[g_tlsInfo.index] = nullptr;
+    if (block) HeapFree(GetProcessHeap(), 0, block);
+}
+
+struct ThreadStartInfo {
+    LPTHREAD_START_ROUTINE realStart;
+    LPVOID realParam;
+};
+
+static DWORD WINAPI ScarlettThreadStart(LPVOID param) {
+    ThreadStartInfo* info = (ThreadStartInfo*)param;
+    LPTHREAD_START_ROUTINE realStart = info->realStart;
+    LPVOID realParam = info->realParam;
+    HeapFree(GetProcessHeap(), 0, info);
+    EnsureThreadTls();  // best effort; guest TLS vars work on this thread
+    DWORD rc = realStart(realParam);
+    CleanupThreadTls();
+    return rc;
+}
+
+static HANDLE WINAPI ScarlettCreateThread(LPSECURITY_ATTRIBUTES sa,
+                                          SIZE_T stack,
+                                          LPTHREAD_START_ROUTINE start,
+                                          LPVOID param, DWORD flags,
+                                          LPDWORD threadId) {
+    if (!g_realCreateThread) return nullptr;
+    ThreadStartInfo* info = (ThreadStartInfo*)HeapAlloc(
+        GetProcessHeap(), 0, sizeof(*info));
+    if (!info) return nullptr;
+    info->realStart = start;
+    info->realParam = param;
+    HANDLE h = g_realCreateThread(sa, stack, ScarlettThreadStart, info,
+                                  flags, threadId);
+    if (!h) HeapFree(GetProcessHeap(), 0, info);
+    return h;
+}
+
+static HANDLE WINAPI ScarlettCreateRemoteThread(
+    HANDLE hProcess, LPSECURITY_ATTRIBUTES sa, SIZE_T stack,
+    LPTHREAD_START_ROUTINE start, LPVOID param, DWORD flags,
+    LPDWORD threadId) {
+    if (!g_realCreateRemoteThread) return nullptr;
+    // The trampoline lives in this process's layer DLL — it is only
+    // valid for a thread in this process. Remote processes get the
+    // real function unwrapped.
+    if (hProcess != GetCurrentProcess()) {
+        return g_realCreateRemoteThread(hProcess, sa, stack, start, param,
+                                        flags, threadId);
+    }
+    ThreadStartInfo* info = (ThreadStartInfo*)HeapAlloc(
+        GetProcessHeap(), 0, sizeof(*info));
+    if (!info) return nullptr;
+    info->realStart = start;
+    info->realParam = param;
+    HANDLE h = g_realCreateRemoteThread(hProcess, sa, stack,
+                                        ScarlettThreadStart, info, flags,
+                                        threadId);
+    if (!h) HeapFree(GetProcessHeap(), 0, info);
+    return h;
+}
+
+// Hook the guest's own CreateThread / CreateRemoteThread imports so
+// worker threads get TLS set up. Runs after import resolution (the FT
+// entries hold the real addresses) and before section protections
+// (.rdata becomes read-only). Only the guest image's IAT is patched —
+// the layer's own calls are untouched. Threads created any other way
+// (CRT _beginthreadex internals, the OS, etc.) do not get guest TLS;
+// that limitation stays documented.
+void HookThreadCreation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
+                        void* base) {
+    const IMAGE_DATA_DIRECTORY& impDir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!impDir.VirtualAddress || !impDir.Size) return;
+    auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)RvaToFile(
+        file, nt, impDir.VirtualAddress, nullptr);
+    for (; desc && desc->Name; ++desc) {
+        const char* modName =
+            (const char*)RvaToFile(file, nt, desc->Name, nullptr);
+        if (!modName || !CiEq(modName, "kernel32.dll")) continue;
+        uint32_t oftRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                   : desc->FirstThunk;
+        auto* oft = (const IMAGE_THUNK_DATA64*)RvaToFile(file, nt, oftRva,
+                                                         nullptr);
+        auto* ft = (IMAGE_THUNK_DATA64*)((uint8_t*)base + desc->FirstThunk);
+        if (!oft || !ft) continue;
+        for (size_t k = 0; oft[k].u1.Ordinal != 0; ++k) {
+            if (oft[k].u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            auto* ibn = (const IMAGE_IMPORT_BY_NAME*)RvaToFile(
+                file, nt, (uint32_t)oft[k].u1.AddressOfData, nullptr);
+            if (!ibn) continue;
+            const char* fnName = (const char*)ibn->Name;
+            if (CiEq(fnName, "CreateThread") && !g_realCreateThread) {
+                g_realCreateThread =
+                    (CreateThreadFn)ft[k].u1.Function;
+                ft[k].u1.Function = (uint64_t)(void*)ScarlettCreateThread;
+                Log("loader", "hooked kernel32!CreateThread for guest TLS");
+            } else if (CiEq(fnName, "CreateRemoteThread") &&
+                       !g_realCreateRemoteThread) {
+                g_realCreateRemoteThread =
+                    (CreateRemoteThreadFn)ft[k].u1.Function;
+                ft[k].u1.Function =
+                    (uint64_t)(void*)ScarlettCreateRemoteThread;
+                Log("loader",
+                    "hooked kernel32!CreateRemoteThread for guest TLS");
+            }
+        }
+    }
+}
+
 // Set up TLS for the calling thread: allocate a TLS slot + block, copy
 // the template, and run the .CRT$XLB callbacks (DLL_PROCESS_ATTACH).
 // The OS normally does this for a loaded module; a manually mapped PE
@@ -214,6 +401,14 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
     out->tlsBlock = block;
     out->tlsIndex = index;
     out->tlsIndexValid = true;
+    // Remember the template for worker threads (phase 3): the template
+    // and callback pointers live in the mapped image, which stays
+    // mapped for the guest's lifetime.
+    g_tlsInfo.templateData = (const void*)tls->StartAddressOfRawData;
+    g_tlsInfo.templateSize = templateSize;
+    g_tlsInfo.index = index;
+    g_tlsInfo.callbacks = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
+    g_tlsInfo.valid = true;
     if (tls->AddressOfCallBacks) {
         auto* callbacks = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
         for (size_t i = 0; callbacks[i]; ++i) {
@@ -456,6 +651,12 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     }
     Log("loader", "imports: %u modules, %u resolved, %u failed (E_NOTIMPL stub)",
         out->importModules, out->importsResolved, out->importsFailed);
+
+    // Thread-creation hooks (phase 3): guest CreateThread /
+    // CreateRemoteThread imports point at the layer wrappers so worker
+    // threads get TLS. Must run after import resolution (FT holds the
+    // real addresses) and before section protections (.rdata -> R).
+    HookThreadCreation(buf, nt, base);
 
     // Final page protections: per-section (text XR, rodata R, data RW).
     // Applied AFTER relocations + imports, which write into the image.

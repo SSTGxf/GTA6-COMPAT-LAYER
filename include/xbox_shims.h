@@ -114,17 +114,101 @@ HRESULT XGameSaveCreateContainer(XGameSaveProviderHandle provider,
                                  const char* displayName,
                                  XGameSaveContainerHandle* container);
 
-// ---- XPackage (phase 2, milestone E) ----
+// ---- XGameSave update flow (phase 3) ----
+// Signatures grounded from Microsoft Learn (XGameSave.h, xgameruntime.lib).
+// An update is a staged, atomic set of blob writes/deletes for one
+// container; XGameSaveSubmitUpdate applies it to the container folder.
+// GS_MAX_BLOB_SIZE is 16 MB per blob and per update (GDK docs).
+typedef void* XGameSaveUpdateHandle;
+#define GS_MAX_BLOB_SIZE (16u * 1024u * 1024u)
+HRESULT XGameSaveCreateUpdate(XGameSaveContainerHandle container,
+                              const char* containerDisplayName,
+                              XGameSaveUpdateHandle* update);
+HRESULT XGameSaveSubmitBlobWrite(XGameSaveUpdateHandle update,
+                                 const char* blobName,
+                                 const uint8_t* data, size_t byteCount);
+HRESULT XGameSaveSubmitBlobDelete(XGameSaveUpdateHandle update,
+                                  const char* blobName);
+HRESULT XGameSaveSubmitUpdate(XGameSaveUpdateHandle update);
+HRESULT XGameSaveSubmitUpdateAsync(XGameSaveUpdateHandle update,
+                                   struct XAsyncBlock* async);
+HRESULT XGameSaveSubmitUpdateResult(struct XAsyncBlock* async);
+HRESULT XGameSaveCloseUpdate(XGameSaveUpdateHandle update);
+HRESULT XGameSaveCloseContainer(XGameSaveContainerHandle container);
+HRESULT XGameSaveReadBlobData(XGameSaveContainerHandle container,
+                              const char* blobName, size_t* bytesRead,
+                              size_t bufferSize, uint8_t* buffer);
+
+// ---- XGameSaveFiles (phase 3) ----
+// File-style saves (the GDK-recommended API): GetFolderWithUiAsync
+// returns a folder path and the title uses plain Win32 FileIO under it.
+// Headless: no UI is shown; the local provider folder is returned.
+// NOTE: the real GDK errors with E_GS_PROVIDER_MISMATCH if a title mixes
+// XGameSave and XGameSaveFiles; this layer's local-only model keeps their
+// roots separate, so both work locally (deliberate deviation, flagged).
+HRESULT XGameSaveFilesGetFolderWithUiAsync(XUserHandle requestingUser,
+                                           const char* configurationId,
+                                           struct XAsyncBlock* async);
+HRESULT XGameSaveFilesGetFolderWithUiResult(struct XAsyncBlock* async,
+                                            size_t bufferSize, char* folder);
+
+// ---- XPackage (phase 2, milestone E; completed phase 3) ----
 // The mount path is the directory holding the guest PE (set by the
 // loader). The layer presents the guest as a packaged Game Core title.
+// Package identifier is synthetic (local-only, no store install).
+#define XPACKAGE_IDENTIFIER_MAX_LENGTH 64
+typedef void* XPackageMountHandle;
+// XVersion / XPackageKind / XPackageEnumerationScope / XPackageDetails
+// layouts are from the public GDK docs (XPackage.h); enum values are
+// the public ones (Game=0, Content=1; ThisOnly=0, ThisAndRelated=1,
+// ThisPublisher=2).
+typedef struct XVersion {
+    uint32_t major;
+    uint32_t minor;
+    uint32_t build;
+    uint32_t revision;
+} XVersion;
+typedef enum XPackageKind {
+    XPackageKind_Game = 0,
+    XPackageKind_Content = 1,
+} XPackageKind;
+typedef enum XPackageEnumerationScope {
+    XPackageEnumerationScope_ThisOnly = 0,
+    XPackageEnumerationScope_ThisAndRelated = 1,
+    XPackageEnumerationScope_ThisPublisher = 2,
+} XPackageEnumerationScope;
+typedef struct XPackageDetails {
+    const char* packageIdentifier;
+    XVersion version;
+    XPackageKind kind;
+    const char* displayName;
+    const char* description;
+    const char* publisher;
+    const char* storeId;
+    bool installing;
+    uint32_t index;
+    uint32_t count;
+    bool ageRestricted;
+    const char* titleID;
+} XPackageDetails;
+typedef bool (CALLBACK XPackageEnumerationCallback)(
+    void* context, const XPackageDetails* details);
 HRESULT XPackageGetMountPathSize(uint32_t* size);
 HRESULT XPackageGetMountPath(wchar_t* path, uint32_t* pathSize);
 BOOL XPackageIsPackagedProcess(void);
-HRESULT XPackageGetCurrentProcessPackageIdentifier(void* identifier);
-HRESULT XPackageMountWithUiAsync(struct XAsyncBlock* async);
+// Real signature (Microsoft Learn): (bufferSize, char* buffer). Phase 2
+// had this wrong as (void*) — fixed in phase 3.
+HRESULT XPackageGetCurrentProcessPackageIdentifier(size_t bufferSize,
+                                                   char* buffer);
+HRESULT XPackageEnumeratePackages(XPackageKind kind,
+                                  XPackageEnumerationScope scope,
+                                  void* context,
+                                  XPackageEnumerationCallback* callback);
+HRESULT XPackageMountWithUiAsync(const char* packageIdentifier,
+                                 struct XAsyncBlock* async);
 HRESULT XPackageMountWithUiResult(struct XAsyncBlock* async,
-                                  void** mountHandle);
-HRESULT XPackageCloseMountHandle(void* mountHandle);
+                                  XPackageMountHandle* mount);
+HRESULT XPackageCloseMountHandle(XPackageMountHandle mount);
 
 #ifdef __cplusplus
 }

@@ -5,7 +5,9 @@
 // see docs/STATUS.md.
 #include "hle_registry.h"
 #include "xbox_shims.h"
+#include <mmsystem.h>  // timeBeginPeriod (frame pacing, phase 3)
 #include <string.h>
+#include <vector>
 
 namespace sc {
 
@@ -128,6 +130,15 @@ extern "C" HRESULT HleDStorageGetFactory(void** ppFactory) {
 extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags) {
     if (interval == 0) interval = 1;
     g_frameInterval = interval;
+    // Raise the system timer resolution once (phase 3): at the default
+    // 15.6 ms clock tick, a waitable timer set for 16.7 ms can fire up
+    // to a full tick late (measured 27.7 ms). timeBeginPeriod(1) makes
+    // the timer fire within ~1 ms of the due time. Games do this
+    // routinely; the resolution is process-wide.
+    static bool timerResRaised = false;
+    if (!timerResRaised) {
+        if (timeBeginPeriod(1) == TIMERR_NOERROR) timerResRaised = true;
+    }
     Log("present",
         "SetFrameIntervalX(%u, 0x%x) -> S_OK (real pacing: %.1f ms/frame)",
         interval, flags, FramePeriodMs());
@@ -157,26 +168,42 @@ extern "C" HRESULT HleWaitFrameEventX(UINT64 frameId, DWORD timeoutMs) {
     double elapsedMs = (double)(now.QuadPart - g_lastFrameQpc.QuadPart) *
                        1000.0 / (double)freq.QuadPart;
     double remainMs = FramePeriodMs() - elapsedMs;
-    if (remainMs > 0) {
-        double waitMs = remainMs < (double)timeoutMs ? remainMs
-                                                     : (double)timeoutMs;
-        // Waitable timer (100ns units) — precise to ~1 ms, unlike Sleep's
-        // ~15.6 ms granularity at default timer resolution.
-        HANDLE timer = CreateWaitableTimer(nullptr, TRUE, nullptr);
-        if (timer) {
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)(waitMs * 10000.0);
-            if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-                WaitForSingleObject(timer, (DWORD)(waitMs + 100) + 100);
-            CloseHandle(timer);
-        } else {
-            DWORD ms = (DWORD)(waitMs + 0.5);
-            if (ms > 0) Sleep(ms);
+    double waitMs = remainMs < (double)timeoutMs ? remainMs
+                                                 : (double)timeoutMs;
+    if (waitMs > 0) {
+        // Two-phase wait (phase 3): the waitable timer covers all but
+        // the last ~1.5 ms (it fires at the system clock granularity),
+        // then a QPC spin covers the tail so the wait lands on the
+        // deadline instead of overshooting by a tick. The spin is
+        // bounded to ~2 ms.
+        double timerMs = waitMs - 1.5;
+        if (timerMs > 0) {
+            HANDLE timer = CreateWaitableTimer(nullptr, TRUE, nullptr);
+            if (timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -(LONGLONG)(timerMs * 10000.0);
+                if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr,
+                                     FALSE))
+                    WaitForSingleObject(timer, (DWORD)(timerMs + 100) + 100);
+                CloseHandle(timer);
+            }
         }
+        LARGE_INTEGER deadline;
+        deadline.QuadPart = now.QuadPart +
+                            (LONGLONG)(waitMs * (double)freq.QuadPart /
+                                       1000.0);
+        LARGE_INTEGER spin;
+        do {
+            QueryPerformanceCounter(&spin);
+        } while (spin.QuadPart < deadline.QuadPart);
+        QueryPerformanceCounter(&now);
+        double actualMs = (double)(now.QuadPart - g_lastFrameQpc.QuadPart) *
+                          1000.0 / (double)freq.QuadPart;
         Log("present",
             "WaitFrameEventX(%llu) waited ~%.1f ms (period %.1f ms, "
             "timeout %lu ms)",
-            (unsigned long long)frameId, waitMs, FramePeriodMs(), timeoutMs);
+            (unsigned long long)frameId, actualMs, FramePeriodMs(),
+            timeoutMs);
     } else {
         Log("present",
             "WaitFrameEventX(%llu) already past deadline (%.1f ms elapsed)",
@@ -414,6 +441,344 @@ extern "C" HRESULT HleXGameSaveCreateContainer(XGameSaveProviderHandle provider,
     return S_OK;
 }
 
+// ---- XGameSave update flow (phase 3) ----
+// An update stages blob writes/deletes in memory; SubmitUpdate applies
+// them to the container folder. Total staged size is capped at
+// GS_MAX_BLOB_SIZE (16 MB, GDK docs); one action per blob per update
+// (GDK rule); an update cannot be reused after submit (GDK rule).
+
+#define E_GS_UPDATE_TOO_BIG ((HRESULT)0x80830005)
+
+struct XGameSaveUpdateImpl {
+    XGameSaveContainerImpl* container;
+    char displayName[256];
+    struct Action {
+        bool isDelete;
+        char blobName[256];
+        uint8_t* data;  // null for deletes
+        size_t size;
+    };
+    std::vector<Action> actions;
+    size_t totalBytes = 0;
+    bool submitted = false;
+};
+
+static bool ValidBlobName(const char* name) {
+    if (!name || !*name || strlen(name) >= 256) return false;
+    for (const char* p = name; *p; ++p) {
+        if (*p == '/' || *p == '\\' || *p == ':' || *p == '*' ||
+            *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|')
+            return false;
+    }
+    return true;
+}
+
+static XGameSaveUpdateImpl::Action* FindUpdateAction(XGameSaveUpdateImpl* u,
+                                                     const char* blobName) {
+    for (auto& a : u->actions)
+        if (strcmp(a.blobName, blobName) == 0) return &a;
+    return nullptr;
+}
+
+static bool WriteFileAtomic(const char* path, const uint8_t* data,
+                            size_t size) {
+    // Write to a temp file in the same folder, then rename over the
+    // target — per-blob atomic. (Whole-update atomicity would need a
+    // journal; the local model documents this as best-effort.)
+    char tmp[MAX_PATH];
+    snprintf(tmp, sizeof(tmp), "%s.tmp-%lu", path, GetCurrentProcessId());
+    HANDLE h = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = TRUE;
+    if (size > 0)
+        ok = WriteFile(h, data, (DWORD)size, &written, nullptr) &&
+             written == size;
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileA(tmp);
+        return false;
+    }
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(tmp);
+        return false;
+    }
+    return true;
+}
+
+extern "C" HRESULT HleXGameSaveCreateUpdate(
+    XGameSaveContainerHandle container, const char* containerDisplayName,
+    XGameSaveUpdateHandle* update) {
+    if (!container || !containerDisplayName || !*containerDisplayName ||
+        !update)
+        return E_INVALIDARG;
+    XGameSaveUpdateImpl* u = (XGameSaveUpdateImpl*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*u));
+    if (!u) return E_OUTOFMEMORY;
+    u->container = (XGameSaveContainerImpl*)container;
+    strcpy_s(u->displayName, sizeof(u->displayName), containerDisplayName);
+    *update = u;
+    Log("xgamesave", "XGameSaveCreateUpdate(%s) -> S_OK",
+        containerDisplayName);
+    return S_OK;
+}
+
+extern "C" HRESULT HleXGameSaveSubmitBlobWrite(XGameSaveUpdateHandle update,
+                                               const char* blobName,
+                                               const uint8_t* data,
+                                               size_t byteCount) {
+    if (!update || !ValidBlobName(blobName) || (!data && byteCount != 0))
+        return E_INVALIDARG;
+    XGameSaveUpdateImpl* u = (XGameSaveUpdateImpl*)update;
+    if (u->submitted) return E_INVALIDARG;  // cannot reuse after submit
+    if (FindUpdateAction(u, blobName)) {
+        Log("xgamesave",
+            "XGameSaveSubmitBlobWrite(%s) -> E_INVALIDARG (already an "
+            "action for this blob in this update)",
+            blobName);
+        return E_INVALIDARG;
+    }
+    if (byteCount > GS_MAX_BLOB_SIZE ||
+        u->totalBytes + byteCount > GS_MAX_BLOB_SIZE) {
+        Log("xgamesave", "XGameSaveSubmitBlobWrite(%s, %zu) -> "
+                         "E_GS_UPDATE_TOO_BIG",
+            blobName, byteCount);
+        return E_GS_UPDATE_TOO_BIG;
+    }
+    uint8_t* copy = nullptr;
+    if (byteCount > 0) {
+        copy = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, byteCount);
+        if (!copy) return E_OUTOFMEMORY;
+        memcpy(copy, data, byteCount);
+    }
+    XGameSaveUpdateImpl::Action a = {};
+    a.isDelete = false;
+    strcpy_s(a.blobName, sizeof(a.blobName), blobName);
+    a.data = copy;
+    a.size = byteCount;
+    u->actions.push_back(a);
+    u->totalBytes += byteCount;
+    Log("xgamesave", "XGameSaveSubmitBlobWrite(%s, %zu bytes) -> S_OK "
+                     "(staged, total %zu)",
+        blobName, byteCount, u->totalBytes);
+    return S_OK;
+}
+
+extern "C" HRESULT HleXGameSaveSubmitBlobDelete(XGameSaveUpdateHandle update,
+                                                const char* blobName) {
+    if (!update || !ValidBlobName(blobName)) return E_INVALIDARG;
+    XGameSaveUpdateImpl* u = (XGameSaveUpdateImpl*)update;
+    if (u->submitted) return E_INVALIDARG;
+    if (FindUpdateAction(u, blobName)) {
+        Log("xgamesave",
+            "XGameSaveSubmitBlobDelete(%s) -> E_INVALIDARG (already an "
+            "action for this blob in this update)",
+            blobName);
+        return E_INVALIDARG;
+    }
+    XGameSaveUpdateImpl::Action a = {};
+    a.isDelete = true;
+    strcpy_s(a.blobName, sizeof(a.blobName), blobName);
+    u->actions.push_back(a);
+    Log("xgamesave", "XGameSaveSubmitBlobDelete(%s) -> S_OK (staged)",
+        blobName);
+    return S_OK;
+}
+
+static HRESULT ApplyGameSaveUpdate(XGameSaveUpdateImpl* u) {
+    if (!u || u->submitted) return E_INVALIDARG;
+    for (auto& a : u->actions) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%s\\%s", u->container->path,
+                 a.blobName);
+        if (a.isDelete) {
+            if (!DeleteFileA(path) &&
+                GetLastError() != ERROR_FILE_NOT_FOUND) {
+                Log("xgamesave",
+                    "XGameSaveSubmitUpdate: delete %s failed (%lu)",
+                    a.blobName, GetLastError());
+                return E_FAIL;
+            }
+            Log("xgamesave", "XGameSaveSubmitUpdate: deleted blob %s",
+                a.blobName);
+        } else {
+            if (!WriteFileAtomic(path, a.data, a.size)) {
+                Log("xgamesave",
+                    "XGameSaveSubmitUpdate: write %s failed (%lu)",
+                    a.blobName, GetLastError());
+                return E_FAIL;
+            }
+            Log("xgamesave", "XGameSaveSubmitUpdate: wrote blob %s (%zu "
+                             "bytes)",
+                a.blobName, a.size);
+        }
+    }
+    u->submitted = true;
+    return S_OK;
+}
+
+extern "C" HRESULT HleXGameSaveSubmitUpdate(XGameSaveUpdateHandle update) {
+    if (!update) return E_INVALIDARG;
+    HRESULT hr = ApplyGameSaveUpdate((XGameSaveUpdateImpl*)update);
+    Log("xgamesave", "XGameSaveSubmitUpdate() -> 0x%08x", (unsigned)hr);
+    return hr;
+}
+
+extern "C" HRESULT HleXGameSaveSubmitUpdateAsync(XGameSaveUpdateHandle update,
+                                                 XAsyncBlock* async) {
+    if (!update || !async) return E_INVALIDARG;
+    HRESULT hr = ApplyGameSaveUpdate((XGameSaveUpdateImpl*)update);
+    CompleteAsync(async, hr);
+    Log("xgamesave", "XGameSaveSubmitUpdateAsync() -> 0x%08x (sync "
+                     "completion)",
+        (unsigned)hr);
+    return hr;
+}
+
+extern "C" HRESULT HleXGameSaveSubmitUpdateResult(XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
+    if (!AsyncIsComplete(async)) return E_PENDING;
+    HRESULT hr = (HRESULT)(intptr_t)async->internal[0];
+    Log("xgamesave", "XGameSaveSubmitUpdateResult() -> 0x%08x",
+        (unsigned)hr);
+    return hr;
+}
+
+extern "C" HRESULT HleXGameSaveCloseUpdate(XGameSaveUpdateHandle update) {
+    if (!update) return E_INVALIDARG;
+    XGameSaveUpdateImpl* u = (XGameSaveUpdateImpl*)update;
+    for (auto& a : u->actions)
+        if (a.data) HeapFree(GetProcessHeap(), 0, a.data);
+    HeapFree(GetProcessHeap(), 0, u);
+    Log("xgamesave", "XGameSaveCloseUpdate() -> S_OK");
+    return S_OK;
+}
+
+extern "C" HRESULT HleXGameSaveCloseContainer(
+    XGameSaveContainerHandle container) {
+    if (!container) return E_INVALIDARG;
+    HeapFree(GetProcessHeap(), 0, container);
+    Log("xgamesave", "XGameSaveCloseContainer() -> S_OK");
+    return S_OK;
+}
+
+extern "C" HRESULT HleXGameSaveReadBlobData(XGameSaveContainerHandle container,
+                                            const char* blobName,
+                                            size_t* bytesRead,
+                                            size_t bufferSize,
+                                            uint8_t* buffer) {
+    if (!container || !ValidBlobName(blobName) || !bytesRead)
+        return E_INVALIDARG;
+    XGameSaveContainerImpl* c = (XGameSaveContainerImpl*)container;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\%s", c->path, blobName);
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        Log("xgamesave", "XGameSaveReadBlobData(%s) -> file not found",
+            blobName);
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+    LARGE_INTEGER fsize = {};
+    if (!GetFileSizeEx(h, &fsize)) {
+        CloseHandle(h);
+        return E_FAIL;
+    }
+    *bytesRead = (size_t)fsize.QuadPart;
+    if (bufferSize < *bytesRead) {
+        CloseHandle(h);
+        Log("xgamesave",
+            "XGameSaveReadBlobData(%s) -> E_NOT_SUFFICIENT_BUFFER "
+            "(need %zu, have %zu)",
+            blobName, *bytesRead, bufferSize);
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
+    if (*bytesRead > 0) {
+        if (!buffer) {
+            CloseHandle(h);
+            return E_INVALIDARG;
+        }
+        DWORD read = 0;
+        if (!ReadFile(h, buffer, (DWORD)*bytesRead, &read, nullptr) ||
+            read != *bytesRead) {
+            CloseHandle(h);
+            return E_FAIL;
+        }
+    }
+    CloseHandle(h);
+    Log("xgamesave", "XGameSaveReadBlobData(%s) -> S_OK %zu bytes",
+        blobName, *bytesRead);
+    return S_OK;
+}
+
+// ---- XGameSaveFiles (phase 3) ----
+// File-style saves: the async call returns the provider folder; the
+// title uses plain Win32 FileIO under it. Root:
+// %LOCALAPPDATA%\ScarlettCompat\XGameSaveFiles\<SCID>\. No UI is shown
+// headless; no cloud sync (local only).
+
+extern "C" HRESULT HleXGameSaveFilesGetFolderWithUiAsync(
+    XUserHandle requestingUser, const char* configurationId,
+    XAsyncBlock* async) {
+    (void)requestingUser;  // accepted; the folder is per-SCID, not per-user
+    if (!async || !configurationId || !*configurationId)
+        return E_INVALIDARG;
+    char localAppData[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", localAppData,
+                                      sizeof(localAppData));
+    char root[MAX_PATH];
+    if (n > 0 && n < sizeof(localAppData)) {
+        snprintf(root, sizeof(root),
+                 "%s\\ScarlettCompat\\XGameSaveFiles\\%s", localAppData,
+                 configurationId);
+    } else {
+        snprintf(root, sizeof(root),
+                 ".\\ScarlettCompat\\XGameSaveFiles\\%s", configurationId);
+    }
+    if (!MakeDirs(root)) {
+        Log("xgamesavefiles",
+            "XGameSaveFilesGetFolderWithUiAsync() -> FAILED to create %s",
+            root);
+        return E_FAIL;
+    }
+    size_t len = strlen(root) + 1;
+    char* stored = (char*)HeapAlloc(GetProcessHeap(), 0, len);
+    if (!stored) return E_OUTOFMEMORY;
+    strcpy_s(stored, len, root);
+    async->internal[2] = stored;
+    async->internal[1] = (void*)len;
+    CompleteAsync(async, S_OK);
+    Log("xgamesavefiles",
+        "XGameSaveFilesGetFolderWithUiAsync(scid=%s) -> S_OK folder=%s",
+        configurationId, root);
+    return S_OK;
+}
+
+extern "C" HRESULT HleXGameSaveFilesGetFolderWithUiResult(
+    XAsyncBlock* async, size_t bufferSize, char* folder) {
+    if (!async || !folder) return E_INVALIDARG;
+    if (!AsyncIsComplete(async)) return E_PENDING;
+    HRESULT hr = (HRESULT)(intptr_t)async->internal[0];
+    if (FAILED(hr)) return hr;
+    const char* path = (const char*)async->internal[2];
+    if (!path) return E_FAIL;
+    size_t need = strlen(path) + 1;
+    if (bufferSize < need) {
+        Log("xgamesavefiles",
+            "XGameSaveFilesGetFolderWithUiResult() -> "
+            "E_NOT_SUFFICIENT_BUFFER (need %zu, have %zu)",
+            need, bufferSize);
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
+    strcpy_s(folder, bufferSize, path);
+    HeapFree(GetProcessHeap(), 0, (void*)path);
+    async->internal[2] = nullptr;
+    Log("xgamesavefiles", "XGameSaveFilesGetFolderWithUiResult() -> \"%s\"",
+        folder);
+    return S_OK;
+}
+
 // ---- XPackage (phase 2, milestone E) ----
 // Mount path = the directory holding the guest PE (set by the loader).
 
@@ -457,30 +822,124 @@ extern "C" BOOL HleXPackageIsPackagedProcess(void) {
     return TRUE;
 }
 
-extern "C" HRESULT HleXPackageGetCurrentProcessPackageIdentifier(void* identifier) {
-    (void)identifier;
+// ---- XPackage details (phase 3) ----
+// The layer presents a single synthetic package: the guest itself.
+// Identifier is synthetic (local-only, no store install); the TitleId
+// embedded in it is the GTA VI Scarlett TitleId from the package
+// file map, for traceability.
+
+static const char kPackageId[] = "ScarlettCompat-Guest-7952987A";
+static const char kPackageDisplayName[] = "ScarlettCompat Guest";
+static const char kPackageDescription[] =
+    "Synthetic package presented by the ScarlettCompat layer "
+    "(local-only, no store install)";
+static const char kPackagePublisher[] = "ScarlettCompat";
+static const char kPackageTitleId[] = "7952987A";
+
+struct XPackageMountImpl {
+    char identifier[XPACKAGE_IDENTIFIER_MAX_LENGTH];
+    wchar_t path[MAX_PATH];  // mount path = guest dir
+};
+
+extern "C" HRESULT HleXPackageGetCurrentProcessPackageIdentifier(
+    size_t bufferSize, char* buffer) {
+    if (!buffer) return E_INVALIDARG;
+    size_t need = strlen(kPackageId) + 1;
+    if (bufferSize < need) {
+        Log("xpackage",
+            "XPackageGetCurrentProcessPackageIdentifier() -> "
+            "E_NOT_SUFFICIENT_BUFFER (need %zu, have %zu)",
+            need, bufferSize);
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
+    strcpy_s(buffer, bufferSize, kPackageId);
     Log("xpackage",
-        "XPackageGetCurrentProcessPackageIdentifier() -> E_NOTIMPL");
-    return E_NOTIMPL;
+        "XPackageGetCurrentProcessPackageIdentifier() -> \"%s\"",
+        kPackageId);
+    return S_OK;
 }
 
-extern "C" HRESULT HleXPackageMountWithUiAsync(XAsyncBlock* async) {
-    (void)async;
-    Log("xpackage", "XPackageMountWithUiAsync() -> E_NOTIMPL (no UI)");
-    return E_NOTIMPL;
+extern "C" HRESULT HleXPackageEnumeratePackages(
+    XPackageKind kind, XPackageEnumerationScope scope, void* context,
+    XPackageEnumerationCallback* callback) {
+    (void)scope;  // one package: every scope returns the same one
+    if (!callback) return E_INVALIDARG;
+    if (kind == XPackageKind_Content) {
+        Log("xpackage",
+            "XPackageEnumeratePackages(Content) -> S_OK, 0 packages");
+        return S_OK;
+    }
+    XPackageDetails d = {};
+    d.packageIdentifier = kPackageId;
+    d.version.major = 1;
+    d.version.minor = 0;
+    d.version.build = 0;
+    d.version.revision = 0;
+    d.kind = XPackageKind_Game;
+    d.displayName = kPackageDisplayName;
+    d.description = kPackageDescription;
+    d.publisher = kPackagePublisher;
+    d.storeId = "";
+    d.installing = false;
+    d.index = 0;
+    d.count = 1;
+    d.ageRestricted = false;
+    d.titleID = kPackageTitleId;
+    bool cont = (*callback)(context, &d);
+    Log("xpackage",
+        "XPackageEnumeratePackages(Game) -> S_OK, 1 package \"%s\" "
+        "(continue=%d)",
+        kPackageId, (int)cont);
+    return S_OK;
 }
 
-extern "C" HRESULT HleXPackageMountWithUiResult(XAsyncBlock* async,
-                                                 void** mountHandle) {
-    (void)async;
-    (void)mountHandle;
-    Log("xpackage", "XPackageMountWithUiResult() -> E_NOTIMPL");
-    return E_NOTIMPL;
+extern "C" HRESULT HleXPackageMountWithUiAsync(
+    const char* packageIdentifier, XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
+    // No UI is shown headless. The only package that exists locally is
+    // the current one; NULL/empty identifier means the current package.
+    if (packageIdentifier && *packageIdentifier &&
+        strcmp(packageIdentifier, kPackageId) != 0) {
+        Log("xpackage",
+            "XPackageMountWithUiAsync(\"%s\") -> E_INVALIDARG (unknown "
+            "package)",
+            packageIdentifier);
+        return E_INVALIDARG;
+    }
+    XPackageMountImpl* m = (XPackageMountImpl*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*m));
+    if (!m) return E_OUTOFMEMORY;
+    strcpy_s(m->identifier, sizeof(m->identifier), kPackageId);
+    wcsncpy_s(m->path, sizeof(m->path) / sizeof(wchar_t), g_guestDir,
+              _TRUNCATE);
+    async->internal[2] = m;
+    async->internal[1] = (void*)sizeof(void*);
+    CompleteAsync(async, S_OK);
+    Log("xpackage",
+        "XPackageMountWithUiAsync() -> S_OK (mount=%p path=%ls)",
+        m, m->path);
+    return S_OK;
 }
 
-extern "C" HRESULT HleXPackageCloseMountHandle(void* mountHandle) {
-    (void)mountHandle;
-    Log("xpackage", "XPackageCloseMountHandle() -> S_OK");
+extern "C" HRESULT HleXPackageMountWithUiResult(
+    XAsyncBlock* async, XPackageMountHandle* mount) {
+    if (!async || !mount) return E_INVALIDARG;
+    if (!AsyncIsComplete(async)) return E_PENDING;
+    HRESULT hr = (HRESULT)(intptr_t)async->internal[0];
+    if (FAILED(hr)) {
+        Log("xpackage", "XPackageMountWithUiResult() -> 0x%08x",
+            (unsigned)hr);
+        return hr;
+    }
+    *mount = (XPackageMountHandle)async->internal[2];
+    Log("xpackage", "XPackageMountWithUiResult() -> S_OK mount=%p", *mount);
+    return S_OK;
+}
+
+extern "C" HRESULT HleXPackageCloseMountHandle(XPackageMountHandle mount) {
+    if (!mount) return E_INVALIDARG;
+    HeapFree(GetProcessHeap(), 0, mount);
+    Log("xpackage", "XPackageCloseMountHandle(%p) -> S_OK", mount);
     return S_OK;
 }
 
@@ -555,6 +1014,39 @@ static const Export kExports[] = {
     {"xgameruntime.dll", "XGameSaveCreateContainer", Status::kImplemented,
      (void*)HleXGameSaveCreateContainer,
      "IMPLEMENTED (phase 2). Container = subfolder of the provider root."},
+    // GameSave update flow (phase 3): staged blob writes/deletes.
+    {"xgameruntime.dll", "XGameSaveCreateUpdate", Status::kImplemented,
+     (void*)HleXGameSaveCreateUpdate,
+     "IMPLEMENTED (phase 3). Creates a staged update for a container."},
+    {"xgameruntime.dll", "XGameSaveSubmitBlobWrite", Status::kImplemented,
+     (void*)HleXGameSaveSubmitBlobWrite,
+     "IMPLEMENTED (phase 3). Stages a blob write (16 MB cap)."},
+    {"xgameruntime.dll", "XGameSaveSubmitBlobDelete", Status::kImplemented,
+     (void*)HleXGameSaveSubmitBlobDelete,
+     "IMPLEMENTED (phase 3). Stages a blob delete."},
+    {"xgameruntime.dll", "XGameSaveSubmitUpdate", Status::kImplemented,
+     (void*)HleXGameSaveSubmitUpdate,
+     "IMPLEMENTED (phase 3). Applies the staged update to disk."},
+    {"xgameruntime.dll", "XGameSaveSubmitUpdateAsync", Status::kImplemented,
+     (void*)HleXGameSaveSubmitUpdateAsync,
+     "IMPLEMENTED (phase 3). Applies inline, sync completion."},
+    {"xgameruntime.dll", "XGameSaveSubmitUpdateResult", Status::kImplemented,
+     (void*)HleXGameSaveSubmitUpdateResult, "IMPLEMENTED (phase 3)."},
+    {"xgameruntime.dll", "XGameSaveCloseUpdate", Status::kImplemented,
+     (void*)HleXGameSaveCloseUpdate, "IMPLEMENTED (phase 3)."},
+    {"xgameruntime.dll", "XGameSaveCloseContainer", Status::kImplemented,
+     (void*)HleXGameSaveCloseContainer, "IMPLEMENTED (phase 3)."},
+    {"xgameruntime.dll", "XGameSaveReadBlobData", Status::kImplemented,
+     (void*)HleXGameSaveReadBlobData,
+     "IMPLEMENTED (phase 3). Reads a blob back from the container."},
+    // GameSaveFiles (phase 3): file-style saves.
+    {"xgameruntime.dll", "XGameSaveFilesGetFolderWithUiAsync",
+     Status::kImplemented, (void*)HleXGameSaveFilesGetFolderWithUiAsync,
+     "IMPLEMENTED (phase 3). Returns the local provider folder; no UI "
+     "headless."},
+    {"xgameruntime.dll", "XGameSaveFilesGetFolderWithUiResult",
+     Status::kImplemented, (void*)HleXGameSaveFilesGetFolderWithUiResult,
+     "IMPLEMENTED (phase 3)."},
     // Package (phase 2, milestone E): mount path = guest dir.
     {"xgameruntime.dll", "XPackageGetMountPathSize", Status::kImplemented,
      (void*)HleXPackageGetMountPathSize, "IMPLEMENTED (phase 2)."},
@@ -565,14 +1057,20 @@ static const Export kExports[] = {
      (void*)HleXPackageIsPackagedProcess,
      "IMPLEMENTED (phase 2). Presents the guest as packaged."},
     {"xgameruntime.dll", "XPackageGetCurrentProcessPackageIdentifier",
-     Status::kStub, (void*)HleXPackageGetCurrentProcessPackageIdentifier,
-     "STUB. E_NOTIMPL (complex identifier struct)."},
-    {"xgameruntime.dll", "XPackageMountWithUiAsync", Status::kStub,
-     (void*)HleXPackageMountWithUiAsync, "STUB. E_NOTIMPL (no UI)."},
-    {"xgameruntime.dll", "XPackageMountWithUiResult", Status::kStub,
-     (void*)HleXPackageMountWithUiResult, "STUB. E_NOTIMPL."},
-    {"xgameruntime.dll", "XPackageCloseMountHandle", Status::kStub,
-     (void*)HleXPackageCloseMountHandle, "STUB. No-op S_OK."},
+     Status::kImplemented,
+     (void*)HleXPackageGetCurrentProcessPackageIdentifier,
+     "IMPLEMENTED (phase 3). Returns the synthetic package identifier. "
+     "Signature corrected to the real (bufferSize, char*) form."},
+    {"xgameruntime.dll", "XPackageEnumeratePackages", Status::kImplemented,
+     (void*)HleXPackageEnumeratePackages,
+     "IMPLEMENTED (phase 3). Enumerates the single synthetic package."},
+    {"xgameruntime.dll", "XPackageMountWithUiAsync", Status::kImplemented,
+     (void*)HleXPackageMountWithUiAsync,
+     "IMPLEMENTED (phase 3). Mounts the current package; no UI headless."},
+    {"xgameruntime.dll", "XPackageMountWithUiResult", Status::kImplemented,
+     (void*)HleXPackageMountWithUiResult, "IMPLEMENTED (phase 3)."},
+    {"xgameruntime.dll", "XPackageCloseMountHandle", Status::kImplemented,
+     (void*)HleXPackageCloseMountHandle, "IMPLEMENTED (phase 3)."},
 };
 
 static const char* kShimModules[] = {
@@ -637,6 +1135,33 @@ static const OrdinalExport kOrdinalExports[] = {
      "XPackageMountWithUiResult"},
     {"xgameruntime.dll", 21, (void*)HleXPackageCloseMountHandle,
      "XPackageCloseMountHandle"},
+    // Phase 3: GameSave update flow + GameSaveFiles + package details.
+    {"xgameruntime.dll", 22, (void*)HleXGameSaveCreateUpdate,
+     "XGameSaveCreateUpdate"},
+    {"xgameruntime.dll", 23, (void*)HleXGameSaveSubmitBlobWrite,
+     "XGameSaveSubmitBlobWrite"},
+    {"xgameruntime.dll", 24, (void*)HleXGameSaveSubmitBlobDelete,
+     "XGameSaveSubmitBlobDelete"},
+    {"xgameruntime.dll", 25, (void*)HleXGameSaveSubmitUpdate,
+     "XGameSaveSubmitUpdate"},
+    {"xgameruntime.dll", 26, (void*)HleXGameSaveSubmitUpdateAsync,
+     "XGameSaveSubmitUpdateAsync"},
+    {"xgameruntime.dll", 27, (void*)HleXGameSaveSubmitUpdateResult,
+     "XGameSaveSubmitUpdateResult"},
+    {"xgameruntime.dll", 28, (void*)HleXGameSaveCloseUpdate,
+     "XGameSaveCloseUpdate"},
+    {"xgameruntime.dll", 29, (void*)HleXGameSaveCloseContainer,
+     "XGameSaveCloseContainer"},
+    {"xgameruntime.dll", 30, (void*)HleXGameSaveReadBlobData,
+     "XGameSaveReadBlobData"},
+    {"xgameruntime.dll", 31,
+     (void*)HleXGameSaveFilesGetFolderWithUiAsync,
+     "XGameSaveFilesGetFolderWithUiAsync"},
+    {"xgameruntime.dll", 32,
+     (void*)HleXGameSaveFilesGetFolderWithUiResult,
+     "XGameSaveFilesGetFolderWithUiResult"},
+    {"xgameruntime.dll", 33, (void*)HleXPackageEnumeratePackages,
+     "XPackageEnumeratePackages"},
     {"xmem.dll", 1, (void*)HleXMemAlloc, "XMemAlloc"},
     {"xmem.dll", 2, (void*)HleXMemFree, "XMemFree"},
     {"d3d12_xs.dll", 1, (void*)HleD3D12XboxCreateDevice,

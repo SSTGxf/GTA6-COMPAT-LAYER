@@ -13,7 +13,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OUT%\lib" mkdir "%OUT%\lib"
 
 echo === 1. ScarlettCompat.dll (layer) ===
-cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib winmm.lib
 if errorlevel 1 exit /b 1
 
 echo === 2. Shim import libs (Xbox DLL names mapped to layer exports) ===
