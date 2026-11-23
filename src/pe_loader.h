@@ -16,7 +16,10 @@ struct LoadedPe {
     char xbldEdition[128] = {}; // e.g. "GXDK,October 2026 GXDK"
     char xbldBuild[64] = {};    // e.g. "GXDK,10.0.26100.9605"
     bool hasXbld = false;
-    bool hasTls = false;        // TLS directory present (not yet handled).
+    bool hasTls = false;        // TLS directory present.
+    void* tlsBlock = nullptr;   // Per-thread TLS block (this thread).
+    DWORD tlsIndex = 0;         // TlsAlloc index for this module.
+    bool tlsIndexValid = false;
     uint32_t importModules = 0;
     uint32_t importsResolved = 0;
     uint32_t importsFailed = 0;

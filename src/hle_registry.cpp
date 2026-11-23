@@ -41,6 +41,24 @@ extern "C" HRESULT ScNotImplementedStub() {
     return 0x80004001;  // E_NOTIMPL
 }
 
+// ---- layer-wide state ----
+
+// Device created by D3D12XboxCreateDevice (real desktop device, cached so
+// later steps — swapchain, pacing — can use it).
+static ID3D12Device* g_xsDevice = nullptr;
+
+// Frame pacing state (real, Sleep-based): the interval set by
+// SetFrameIntervalX (1 = 60 Hz) defines the period; ScheduleFrameEventX
+// stamps a frame; WaitFrameEventX sleeps until that frame's deadline.
+static UINT32 g_frameInterval = 1;
+static UINT64 g_lastFrameId = 0;
+static LARGE_INTEGER g_lastFrameQpc = {};
+static bool g_haveFrame = false;
+
+static double FramePeriodMs() {
+    return (double)g_frameInterval * (1000.0 / 60.0);
+}
+
 // ---- host implementations ----
 
 extern "C" HRESULT HleXGameRuntimeInitialize() {
@@ -63,16 +81,27 @@ extern "C" void HleXMemFree(void* p) {
 extern "C" HRESULT HleD3D12XboxCreateDevice(IUnknown* adapter,
                                             D3D_FEATURE_LEVEL minFL,
                                             REFIID riid, void** ppDevice) {
-    // ASSUMED D3D12CreateDevice-shaped signature (see xbox_shims.h).
-    // Real translation to desktop D3D12CreateDevice is the next step after
-    // the boot path is proven; this stub only proves the call reaches us.
-    Log("d3d12xs",
-        "D3D12XboxCreateDevice(adapter %p, minFL 0x%x) -> S_OK (STUB, "
-        "fake device; real D3D12 translation pending)",
-        adapter, (unsigned)minFL);
-    (void)riid;
-    if (ppDevice) *ppDevice = (void*)0xD3D12DE11CEULL;
-    return S_OK;
+    // REAL translation (phase 2): the assumed signature is
+    // D3D12CreateDevice-shaped, so this is a thin passthrough to the
+    // desktop device. The REAL Xbox signature takes a
+    // D3D12XBOX_CREATE_DEVICE_PARAMETERS struct (GDKX-gated) — that form
+    // must be confirmed against the exe's import table once it lands.
+    // The created device is cached so later steps (swapchain, pacing)
+    // can use it.
+    HRESULT hr = D3D12CreateDevice(adapter, minFL, riid, ppDevice);
+    if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
+        if (g_xsDevice) g_xsDevice->Release();
+        g_xsDevice = (ID3D12Device*)*ppDevice;
+        g_xsDevice->AddRef();
+        Log("d3d12xs",
+            "D3D12XboxCreateDevice -> REAL desktop device %p (minFL 0x%x)",
+            *ppDevice, (unsigned)minFL);
+    } else {
+        Log("d3d12xs",
+            "D3D12XboxCreateDevice FAILED hr=0x%08x (minFL 0x%x)",
+            (unsigned)hr, (unsigned)minFL);
+    }
+    return hr;
 }
 
 extern "C" HRESULT HleXAudio2Create(void** ppXAudio2, UINT32 flags,
@@ -96,20 +125,62 @@ extern "C" HRESULT HleDStorageGetFactory(void** ppFactory) {
 }
 
 extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags) {
-    Log("present", "SetFrameIntervalX(%u, 0x%x) -> S_OK (STUB, no pacing)",
-        interval, flags);
+    if (interval == 0) interval = 1;
+    g_frameInterval = interval;
+    Log("present",
+        "SetFrameIntervalX(%u, 0x%x) -> S_OK (real pacing: %.1f ms/frame)",
+        interval, flags, FramePeriodMs());
     return S_OK;
 }
 
 extern "C" HRESULT HleScheduleFrameEventX(UINT64 frameId) {
-    Log("present", "ScheduleFrameEventX(%llu) -> S_OK (STUB)",
+    g_lastFrameId = frameId;
+    QueryPerformanceCounter(&g_lastFrameQpc);
+    g_haveFrame = true;
+    Log("present", "ScheduleFrameEventX(%llu) -> S_OK", 
         (unsigned long long)frameId);
     return S_OK;
 }
 
 extern "C" HRESULT HleWaitFrameEventX(UINT64 frameId, DWORD timeoutMs) {
-    Log("present", "WaitFrameEventX(%llu, %lu ms) -> S_OK (STUB, no wait)",
-        (unsigned long long)frameId, timeoutMs);
+    if (!g_haveFrame || frameId != g_lastFrameId) {
+        Log("present",
+            "WaitFrameEventX(%llu) -> S_OK (no such frame scheduled)",
+            (unsigned long long)frameId);
+        return S_OK;
+    }
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsedMs = (double)(now.QuadPart - g_lastFrameQpc.QuadPart) *
+                       1000.0 / (double)freq.QuadPart;
+    double remainMs = FramePeriodMs() - elapsedMs;
+    if (remainMs > 0) {
+        double waitMs = remainMs < (double)timeoutMs ? remainMs
+                                                     : (double)timeoutMs;
+        // Waitable timer (100ns units) — precise to ~1 ms, unlike Sleep's
+        // ~15.6 ms granularity at default timer resolution.
+        HANDLE timer = CreateWaitableTimer(nullptr, TRUE, nullptr);
+        if (timer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)(waitMs * 10000.0);
+            if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                WaitForSingleObject(timer, (DWORD)(waitMs + 100) + 100);
+            CloseHandle(timer);
+        } else {
+            DWORD ms = (DWORD)(waitMs + 0.5);
+            if (ms > 0) Sleep(ms);
+        }
+        Log("present",
+            "WaitFrameEventX(%llu) waited ~%.1f ms (period %.1f ms, "
+            "timeout %lu ms)",
+            (unsigned long long)frameId, waitMs, FramePeriodMs(), timeoutMs);
+    } else {
+        Log("present",
+            "WaitFrameEventX(%llu) already past deadline (%.1f ms elapsed)",
+            (unsigned long long)frameId, elapsedMs);
+    }
     return S_OK;
 }
 
@@ -127,16 +198,20 @@ static const Export kExports[] = {
     {"xmem.dll", "XMemFree", Status::kImplemented, (void*)HleXMemFree,
      "Real: HeapFree."},
     // Graphics.
-    {"d3d12_xs.dll", "D3D12XboxCreateDevice", Status::kStub,
+    {"d3d12_xs.dll", "D3D12XboxCreateDevice", Status::kImplemented,
      (void*)HleD3D12XboxCreateDevice,
-     "STUB. Signature assumed D3D12CreateDevice-shaped; confirm vs exe. "
-     "Real translation to D3D12CreateDevice is the next step."},
-    {"d3d12_xs.dll", "SetFrameIntervalX", Status::kStub,
-     (void*)HleSetFrameIntervalX, "STUB. No real frame pacing yet."},
-    {"d3d12_xs.dll", "ScheduleFrameEventX", Status::kStub,
-     (void*)HleScheduleFrameEventX, "STUB."},
-    {"d3d12_xs.dll", "WaitFrameEventX", Status::kStub,
-     (void*)HleWaitFrameEventX, "STUB. Real pacing needed for stability."},
+     "IMPLEMENTED (phase 2). Real passthrough to desktop D3D12CreateDevice; "
+     "signature is D3D12CreateDevice-shaped (assumed) — the real Xbox form "
+     "takes D3D12XBOX_CREATE_DEVICE_PARAMETERS; confirm vs exe."},
+    {"d3d12_xs.dll", "SetFrameIntervalX", Status::kImplemented,
+     (void*)HleSetFrameIntervalX,
+     "IMPLEMENTED (phase 2). Real pacing: stores the interval."},
+    {"d3d12_xs.dll", "ScheduleFrameEventX", Status::kImplemented,
+     (void*)HleScheduleFrameEventX,
+     "IMPLEMENTED (phase 2). Real pacing: stamps the frame."},
+    {"d3d12_xs.dll", "WaitFrameEventX", Status::kImplemented,
+     (void*)HleWaitFrameEventX,
+     "IMPLEMENTED (phase 2). Real pacing: sleeps to the frame deadline."},
     // Audio.
     {"XAudio2_9.dll", "XAudio2Create", Status::kStub, (void*)HleXAudio2Create,
      "STUB. XMA2 decode is 0% everywhere; stub only."},
@@ -177,6 +252,35 @@ const Export* FindExport(const char* module, const char* name) {
     for (size_t i = 0; i < sizeof(kExports) / sizeof(kExports[0]); ++i) {
         if (CiEq(kExports[i].module, module) && CiEq(kExports[i].name, name))
             return &kExports[i];
+    }
+    return nullptr;
+}
+
+// Ordinal table (synthetic ordinals — see scarlett.h). One entry per
+// registered export, numbered in .def order per module.
+static const OrdinalExport kOrdinalExports[] = {
+    {"xgameruntime.dll", 1, (void*)HleXGameRuntimeInitialize,
+     "XGameRuntimeInitialize"},
+    {"xmem.dll", 1, (void*)HleXMemAlloc, "XMemAlloc"},
+    {"xmem.dll", 2, (void*)HleXMemFree, "XMemFree"},
+    {"d3d12_xs.dll", 1, (void*)HleD3D12XboxCreateDevice,
+     "D3D12XboxCreateDevice"},
+    {"d3d12_xs.dll", 2, (void*)HleSetFrameIntervalX, "SetFrameIntervalX"},
+    {"d3d12_xs.dll", 3, (void*)HleScheduleFrameEventX,
+     "ScheduleFrameEventX"},
+    {"d3d12_xs.dll", 4, (void*)HleWaitFrameEventX, "WaitFrameEventX"},
+    {"XAudio2_9.dll", 1, (void*)HleXAudio2Create, "XAudio2Create"},
+    {"gameinput.dll", 1, (void*)HleGameInputCreate, "GameInputCreate"},
+    {"dstorage_xs.dll", 1, (void*)HleDStorageGetFactory,
+     "DStorageGetFactory"},
+};
+
+const OrdinalExport* FindOrdinalExport(const char* module, uint16_t ordinal) {
+    for (size_t i = 0;
+         i < sizeof(kOrdinalExports) / sizeof(kOrdinalExports[0]); ++i) {
+        if (CiEq(kOrdinalExports[i].module, module) &&
+            kOrdinalExports[i].ordinal == ordinal)
+            return &kOrdinalExports[i];
     }
     return nullptr;
 }

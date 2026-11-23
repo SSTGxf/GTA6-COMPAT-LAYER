@@ -1,8 +1,8 @@
 # Status
 
 Per-function implementation status (Xenia-style tags). Updated 2026-11-22 —
-scaffolding day 1. The source of truth is `src/hle_registry.cpp`; this file
-is the human-readable mirror.
+phase 2, milestone A done. The source of truth is `src/hle_registry.cpp`;
+this file is the human-readable mirror.
 
 ## Loader
 
@@ -26,10 +26,10 @@ is the human-readable mirror.
 | `xgameruntime.dll` | `XGameRuntimeInitialize` | stub | First GDK call; returns S_OK |
 | `xmem.dll` | `XMemAlloc` | implemented | Real: process heap |
 | `xmem.dll` | `XMemFree` | implemented | Real: process heap |
-| `d3d12_xs.dll` | `D3D12XboxCreateDevice` | stub | Signature assumed D3D12CreateDevice-shaped; confirm vs exe. Real translation pending |
-| `d3d12_xs.dll` | `SetFrameIntervalX` | stub | No real frame pacing yet |
-| `d3d12_xs.dll` | `ScheduleFrameEventX` | stub | — |
-| `d3d12_xs.dll` | `WaitFrameEventX` | stub | Real pacing needed for stability |
+| `d3d12_xs.dll` | `D3D12XboxCreateDevice` | implemented | Real passthrough to desktop `D3D12CreateDevice` (phase 2). Signature is D3D12CreateDevice-shaped (assumed); real Xbox form takes `D3D12XBOX_CREATE_DEVICE_PARAMETERS` — confirm vs exe |
+| `d3d12_xs.dll` | `SetFrameIntervalX` | implemented | Real pacing (phase 2): stores the interval |
+| `d3d12_xs.dll` | `ScheduleFrameEventX` | implemented | Real pacing (phase 2): stamps the frame |
+| `d3d12_xs.dll` | `WaitFrameEventX` | implemented | Real pacing (phase 2): waitable-timer sleep to the frame deadline (~16.7 ms at interval 1) |
 | `XAudio2_9.dll` | `XAudio2Create` | stub | XMA2 decode 0% everywhere |
 | `gameinput.dll` | `GameInputCreate` | stub | — |
 | `dstorage_xs.dll` | `DStorageGetFactory` | stub | No queues/files yet |
@@ -48,8 +48,8 @@ de-tiling (`XBOX_TILEMODE_SCARLETT`), unified memory (`MEM_GRAPHICS`).
 
 | Check | Result | When |
 |---|---|---|
-| Synthetic guest boots through loader | **PASS** — 12/12 subsystems (loader, runtime, memory, gfx_xs, present, frame_evt, frame_wait, audio, input, storage, gfx_real); real desktop D3D12 device + queue + clear + fence OK on RX 5700 XT at FL 11_0; child exit 0; `scarlett_verify` verdict ALL PASS | 2026-11-22 ~21:55 EST |
-| First `d3d12_xs` frame on screen | not attempted (device call is still a stub; real translation pending) | — |
+| Synthetic guest boots through loader | **PASS** — 12/12 subsystems (loader + 11 guest incl. new `frame_xs`); real desktop D3D12 device + queue + clear + fence OK on RX 5700 XT at FL 11_0; child exit 0; `scarlett_verify` verdict ALL PASS | 2026-11-22 ~22:05 EST (phase 2, milestone A) |
+| First `d3d12_xs` frame on screen | **PASS (rendered + pixel-verified)** — 640x360 frame rendered via the shim device, center pixel (51,102,204,255) verified via readback. Swapchain Present is **environment-blocked** in this session: DXGI returns 0x887a0022 and a standalone probe program fails identically, so the present path is best-effort until the session is interactive | 2026-11-22 ~22:05 EST (phase 2, milestone A) |
 | Small real Game Core title boots | not attempted | — |
 | GTA VI exe import table | blocked — no exe | — |
 

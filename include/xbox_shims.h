@@ -22,9 +22,11 @@ HRESULT XGameRuntimeInitialize(void);
 void* XMemAlloc(SIZE_T size, DWORD allocationAttributes);
 void XMemFree(void* p);
 
-// D3D12XboxCreateDevice — ASSUMED D3D12CreateDevice-shaped signature.
-// Real form takes D3D12XBOX_CREATE_DEVICE_PARAMETERS (research brief §3).
-// The stub logs the call and returns S_OK with a fake device pointer.
+// D3D12XboxCreateDevice — D3D12CreateDevice-shaped signature (ASSUMED).
+// Real Xbox form takes D3D12XBOX_CREATE_DEVICE_PARAMETERS (GDKX-gated);
+// the layer translates the assumed form to a real desktop D3D12 device
+// (phase 2). Confirm the real form against the exe's import table once
+// it lands.
 HRESULT D3D12XboxCreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL minFeatureLevel,
                               REFIID riid, void** ppDevice);
 
@@ -39,9 +41,11 @@ HRESULT GameInputCreate(IGameInput** ppGameInput);
 // DirectStorage factory — ASSUMED. Xbox variant is dstorage_xs.
 HRESULT DStorageGetFactory(void** ppFactory);
 
-// Frame pacing — ASSUMED signatures. Real Xbox presentation uses
-// SetFrameIntervalX / ScheduleFrameEventX / WaitFrameEventX; exact
-// parameter shapes are TBD from the exe.
+// Frame pacing — real (phase 2): SetFrameIntervalX stores the present
+// interval (1 = 60 Hz), ScheduleFrameEventX stamps a frame, and
+// WaitFrameEventX sleeps until that frame's deadline (bounded by the
+// timeout). Signatures are ASSUMED; exact parameter shapes are TBD
+// from the exe.
 HRESULT SetFrameIntervalX(UINT32 interval, UINT32 flags);
 HRESULT ScheduleFrameEventX(UINT64 frameId);
 HRESULT WaitFrameEventX(UINT64 frameId, DWORD timeoutMs);

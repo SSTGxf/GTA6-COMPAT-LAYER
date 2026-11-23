@@ -13,27 +13,38 @@ if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OUT%\lib" mkdir "%OUT%\lib"
 
 echo === 1. ScarlettCompat.dll (layer) ===
-cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib
 if errorlevel 1 exit /b 1
 
 echo === 2. Shim import libs (Xbox DLL names mapped to layer exports) ===
 for %%D in (xgameruntime xmem d3d12_xs XAudio2_9 dstorage_xs gameinput) do (
   lib /nologo /DEF:"%ROOT%defs\%%D.def" /OUT:"%OUT%\lib\%%D.lib" || exit /b 1
 )
+REM Ordinal import libs (TEST ONLY — synthetic ordinals for the ordinal guest).
+for %%D in (xgameruntime_ord xmem_ord) do (
+  lib /nologo /DEF:"%ROOT%defs\%%D.def" /OUT:"%OUT%\lib\%%D.lib" || exit /b 1
+)
 
 echo === 3. Synthetic guest title (Xbox-style PE) ===
-cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_minimal.cpp" /Fe"%OUT%\guest_minimal.exe" /Fo%OUT%\ /Fd%OUT%\guest_minimal.pdb /link /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime.lib xmem.lib d3d12_xs.lib XAudio2_9.lib dstorage_xs.lib gameinput.lib d3d12.lib
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_minimal.cpp" /Fe"%OUT%\guest_minimal.exe" /Fo%OUT%\ /Fd%OUT%\guest_minimal.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime.lib xmem.lib d3d12_xs.lib XAudio2_9.lib dstorage_xs.lib gameinput.lib d3d12.lib dxgi.lib
+if errorlevel 1 exit /b 1
+if not exist "%OUT%\ordinal" mkdir "%OUT%\ordinal"
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_ordinal.cpp" /Fe"%OUT%\ordinal\guest_ordinal.exe" /Fo%OUT%\ /Fd%OUT%\guest_ordinal.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" xgameruntime_ord.lib xmem_ord.lib
 if errorlevel 1 exit /b 1
 
 echo === 4. Verification harness ===
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\verify.cpp" /Fe"%OUT%\scarlett_verify.exe" /Fo%OUT%\ /Fd%OUT%\scarlett_verify.pdb /link "%OUT%\ScarlettCompat.lib"
 if errorlevel 1 exit /b 1
 
-echo === 5. Verify: guest through the layer ===
+echo === 5. Verify: guests through the layer ===
 copy /Y "%OUT%\ScarlettCompat.dll" "%OUT%\ScarlettCompat.dll" >nul
 cd /d "%OUT%"
 "%OUT%\scarlett_verify.exe" "%OUT%\guest_minimal.exe" 60000
-set RC=%ERRORLEVEL%
+set RC1=%ERRORLEVEL%
+"%OUT%\scarlett_verify.exe" "%OUT%\ordinal\guest_ordinal.exe" 60000
+set RC2=%ERRORLEVEL%
 cd /d "%ROOT%"
-echo === verify exit code: %RC% ===
-exit /b %RC%
+if %RC1% neq 0 (echo guest_minimal FAILED & exit /b 1)
+if %RC2% neq 0 (echo guest_ordinal FAILED & exit /b 1)
+echo === verify exit code: 0 ===
+exit /b 0

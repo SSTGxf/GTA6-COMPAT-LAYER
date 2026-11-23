@@ -31,8 +31,21 @@ struct Export {
 // Logging: stderr + scarlett.log in the current directory.
 void Log(const char* subsystem, const char* fmt, ...);
 
+// Ordinal imports: some guests import Xbox exports by ordinal instead of
+// by name. The ordinals below are SYNTHETIC — assigned by this layer in
+// .def order for testing, because the real Xbox DLL ordinals are
+// GDKX/NDA-gated and must be confirmed from the exe's import table once
+// it lands. The loader resolves shim ordinal imports through this table.
+struct OrdinalExport {
+    const char* module;
+    uint16_t ordinal;
+    void* fn;
+    const char* name;  // For logging.
+};
+
 // HLE registry lookup (case-insensitive module + name).
 const Export* FindExport(const char* module, const char* name);
+const OrdinalExport* FindOrdinalExport(const char* module, uint16_t ordinal);
 size_t ExportCount();
 const Export* ExportAt(size_t i);
 bool IsShimModule(const char* module);
