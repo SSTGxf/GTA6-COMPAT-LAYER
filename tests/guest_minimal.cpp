@@ -1086,6 +1086,11 @@ static bool TestXsSurface(ID3D12Device* dev, char* detail, size_t n) {
 int main() {
     fopen_s(&g_report, "guest_report.txt", "w");
     printf("[guest] synthetic Xbox guest starting\n");
+    // TLS early read (phase 5 diagnostic): read the __declspec(thread)
+    // var immediately at entry, before any stage runs. If a later
+    // tls stage reads garbage while this one reads 42, the TLS block
+    // was corrupted DURING the guest's run (not at load time).
+    printf("[guest] tls_early init=%d (want 42)\n", g_tlsVar);
     // Keep .xbld: a volatile read forces the compiler to emit the section
     // (an unreferenced static const array is dropped at /O2); /OPT:NOREF
     // keeps it at link time. This exercises the loader's .xbld detection.

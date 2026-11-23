@@ -218,7 +218,7 @@ ALL PASS):**
   ESRAM window → render target → staging → readback, center red) →
   **DXGIXPresentArray** (real per-chain Present) → XGameSaveFiles →
   package mount → protections → TLS → TLS worker thread. Counts: 4
-  ERA entry points mapped 1:1, 9 adapted, 1 shared, 16 with no GDK
+  ERA entry points mapped 1:1, 10 adapted, 1 shared, 16 with no GDK
   equivalent (7 XG texture-tiling + 9 AcpHal audio-DSP, documented
   E_NOTIMPL). The mapping doc is grounded in the **real FH2 exe's
   import table** (648 imports, 14 modules, read read-only) — and a

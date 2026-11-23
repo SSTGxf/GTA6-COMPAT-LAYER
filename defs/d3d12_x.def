@@ -1,0 +1,8 @@
+; d3d12_x.def — ERA (Xbox One) D3D12 import lib (phase 5).
+; The layer translates this through the same real-device passthrough
+; as d3d12_xs!D3D12XboxCreateDevice; see docs/ERA-GDK-MAPPING.md.
+; Signature is ASSUMED (D3D12CreateDevice-shaped) — confirm vs a real
+; ERA exe.
+LIBRARY d3d12_x
+EXPORTS
+    D3D12XCreateDevice

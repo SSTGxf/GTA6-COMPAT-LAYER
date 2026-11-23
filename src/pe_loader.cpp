@@ -3,6 +3,7 @@
 // process and its imports are intercepted at the DLL boundary (ScarlettX /
 // WinDurango shim-DLL model). No CPU emulation, no JIT.
 #include "pe_loader.h"
+#include "era_to_gdk.h"  // ERA -> GDK translation (phase 5)
 #include "hle_registry.h"
 #include <cstring>
 #include <intrin.h>  // __readgsqword
@@ -328,6 +329,58 @@ void HookThreadCreation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
     }
 }
 
+// Hook the guest's RoGetActivationFactory import so ERA WinRT
+// activation routes through the layer (phase 5). Same IAT-hook
+// technique as HookThreadCreation: the FT entry is patched to
+// EraRoGetActivationFactory, which refuses Xbox-namespace classes
+// (no layer COM objects yet) and forwards everything else to the real
+// function. Only installed for ERA titles (see the call site). The
+// guest links combase.lib, so the descriptor says "combase.dll"; the
+// api-ms-win-core-com name is matched too, in case the linker recorded
+// the API-set name instead. Runs after import resolution (the FT holds
+// the real address) and before section protections (.rdata -> R).
+void HookWinRtActivation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
+                         void* base) {
+    const IMAGE_DATA_DIRECTORY& impDir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!impDir.VirtualAddress || !impDir.Size) return;
+    auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)RvaToFile(
+        file, nt, impDir.VirtualAddress, nullptr);
+    for (; desc && desc->Name; ++desc) {
+        const char* modName =
+            (const char*)RvaToFile(file, nt, desc->Name, nullptr);
+        if (!modName ||
+            (!CiEq(modName, "combase.dll") &&
+             !CiEq(modName, "api-ms-win-core-com-l1-1-0.dll")))
+            continue;
+        uint32_t oftRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                   : desc->FirstThunk;
+        auto* oft = (const IMAGE_THUNK_DATA64*)RvaToFile(file, nt, oftRva,
+                                                         nullptr);
+        auto* ft = (IMAGE_THUNK_DATA64*)((uint8_t*)base + desc->FirstThunk);
+        if (!oft || !ft) continue;
+        for (size_t k = 0; oft[k].u1.Ordinal != 0; ++k) {
+            if (oft[k].u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            auto* ibn = (const IMAGE_IMPORT_BY_NAME*)RvaToFile(
+                file, nt, (uint32_t)oft[k].u1.AddressOfData, nullptr);
+            if (!ibn) continue;
+            if (CiEq((const char*)ibn->Name, "RoGetActivationFactory")) {
+                EraSetRealRoGetActivationFactory(
+                    (RoGetActivationFactoryFn)ft[k].u1.Function);
+                ft[k].u1.Function =
+                    (uint64_t)(void*)EraRoGetActivationFactory;
+                Log("loader",
+                    "hooked combase!RoGetActivationFactory for ERA "
+                    "WinRT routing");
+                return;
+            }
+        }
+    }
+    Log("loader",
+        "WARNING: ERA title but no RoGetActivationFactory import found "
+        "(WinRT routing not installed)");
+}
+
 // Set up TLS for the calling thread: allocate a TLS slot + block, copy
 // the template, and run the .CRT$XLB callbacks (DLL_PROCESS_ATTACH).
 // The OS normally does this for a loaded module; a manually mapped PE
@@ -420,6 +473,30 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
                 continue;
             }
             Log("loader", "TLS callback %zu ran (PROCESS_ATTACH)", i);
+        }
+    }
+    // Hardening (phase 5): the guest's .CRT$XLB callback runs above and
+    // may replace or free the block it was given — two full-build runs
+    // showed a guest reading garbage for a __declspec(thread) initial
+    // value (callback=1, set works, init garbage) while isolated
+    // re-runs of the same binary pass, i.e. the block is clobbered
+    // after SetupTls, not mis-copied. Re-verify the block still holds
+    // the template; if the callback clobbered it, restore the template
+    // before the guest reads it. No-op in the common case. If the
+    // callback replaced the TEB slot pointer instead, log it (the
+    // foreign block is not ours to rewrite).
+    if (block && templateSize > 0) {
+        PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+        if (tlsArr[index] != block) {
+            Log("loader",
+                "WARNING: TLS slot %lu changed by callback (%p -> %p)",
+                index, block, tlsArr[index]);
+        } else if (memcmp(block, (void*)tls->StartAddressOfRawData,
+                          templateSize) != 0) {
+            Log("loader",
+                "WARNING: TLS block clobbered by callback, restoring "
+                "template");
+            memcpy(block, (void*)tls->StartAddressOfRawData, templateSize);
         }
     }
     Log("loader", "TLS: index %lu, template %zu bytes, block %p", index,
@@ -572,6 +649,13 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
             if (!modName) continue;
             out->importModules++;
             bool shim = IsShimModule(modName);
+            // ERA detection (phase 5): any ERA module import marks the
+            // title as ERA; its ERA imports route through the translation.
+            bool eraMod = EraIsEraModule(modName);
+            if (eraMod && !out->eraDetected) {
+                out->eraDetected = true;
+                Log("loader", "ERA title detected (module %s)", modName);
+            }
             HMODULE realMod = nullptr;
             if (!shim) {
                 realMod = LoadLibraryA(modName);
@@ -593,7 +677,9 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
                     // resolve via GetProcAddress(MAKEINTRESOURCE); shim
                     // modules resolve through the ordinal table
                     // (kOrdinalExports — synthetic ordinals in .def order
-                    // until the exe's import table confirms the real ones).
+                    // for GDK modules; REAL ordinals for ERA modules,
+                    // read from the FH2 exe's import table, dumpbin
+                    // 2026-11-23).
                     uint16_t ord =
                         (uint16_t)(oft[k].u1.Ordinal & 0xFFFF);
                     if (shim) {
@@ -624,11 +710,55 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
                             const Export* ex = FindExport(modName, fnName);
                             if (ex && ex->fn) {
                                 target = ex->fn;
-                                Log("loader", "shim  %s!%s -> %s",
-                                    modName, fnName,
-                                    ex->status == Status::kImplemented
-                                        ? "implemented"
-                                        : "stub");
+                                if (eraMod) {
+                                    Log("loader", "era   %s!%s -> %s",
+                                        modName, fnName,
+                                        ex->status == Status::kImplemented
+                                            ? "implemented"
+                                            : "stub");
+                                } else {
+                                    Log("loader", "shim  %s!%s -> %s",
+                                        modName, fnName,
+                                        ex->status == Status::kImplemented
+                                            ? "implemented"
+                                            : "stub");
+                                }
+                            } else if (eraMod &&
+                                       CiEq(modName, "kernelx.dll")) {
+                                // kernelx is the ERA kernel shim: its
+                                // non-Xbox imports are Win32 API names
+                                // (CreateFileW, HeapAlloc, VirtualAlloc,
+                                // ...) that the real kernelx.dll
+                                // forwards to kernel32.dll on console.
+                                // The real FH2 exe imports ~135 of
+                                // them by name — all kernel32 exports
+                                // (verified from its import table,
+                                // dumpbin 2026-11-23). Forward them to
+                                // the real kernel32.dll here instead of
+                                // stubbing them.
+                                static HMODULE hKernel32 = nullptr;
+                                if (!hKernel32)
+                                    hKernel32 =
+                                        GetModuleHandleA("kernel32.dll");
+                                if (hKernel32)
+                                    target = (void*)GetProcAddress(
+                                        hKernel32, fnName);
+                                if (target) {
+                                    Log("loader",
+                                        "era   kernelx!%s -> kernel32 "
+                                        "forward",
+                                        fnName);
+                                } else {
+                                    Log("loader",
+                                        "era   kernelx!%s -> no GDK "
+                                        "equivalent (E_NOTIMPL stub)",
+                                        fnName);
+                                }
+                            } else if (eraMod) {
+                                Log("loader",
+                                    "era   %s!%s -> no GDK equivalent "
+                                    "(E_NOTIMPL stub)",
+                                    modName, fnName);
                             } else {
                                 Log("loader", "shim MISSING %s!%s "
                                               "(no handler, E_NOTIMPL stub)",
@@ -651,12 +781,21 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     }
     Log("loader", "imports: %u modules, %u resolved, %u failed (E_NOTIMPL stub)",
         out->importModules, out->importsResolved, out->importsFailed);
+    if (out->eraDetected)
+        Log("loader",
+            "ERA title: ERA imports routed through the ERA -> GDK "
+            "translation");
 
     // Thread-creation hooks (phase 3): guest CreateThread /
     // CreateRemoteThread imports point at the layer wrappers so worker
     // threads get TLS. Must run after import resolution (FT holds the
     // real addresses) and before section protections (.rdata -> R).
     HookThreadCreation(buf, nt, base);
+
+    // WinRT activation hook (phase 5): only for ERA titles — routes
+    // Windows.Xbox.* class activation through the layer. Same window as
+    // the thread hooks (after imports, before protections).
+    if (out->eraDetected) HookWinRtActivation(buf, nt, base);
 
     // Final page protections: per-section (text XR, rodata R, data RW).
     // Applied AFTER relocations + imports, which write into the image.

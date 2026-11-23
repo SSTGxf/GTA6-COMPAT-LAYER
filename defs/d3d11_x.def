@@ -1,0 +1,28 @@
+; d3d11_x.def — ERA (Xbox One) D3D11.x import lib (phase 5).
+; The layer translates these to a real desktop D3D11 device; see
+; docs/ERA-GDK-MAPPING.md. D3D11XCreateDeviceX's 3-arg form
+; (params struct, device, context) is GROUNDED in WinDurango's public
+; d3d11.x.cpp (XDK-derived). D3DMapEsramMemory and DXGIXPresentArray
+; signatures are grounded in the same source.
+; Ordinals are WinDurango's d3d11_x.dll ordinals (dumpbin /exports
+; 2026-11-23): D3D11XCreateDeviceX @4, D3DMapEsramMemory @9,
+; DXGIXPresentArray @11. The FH2 exe's import table gives HINTS
+; (3, 8, 10) — a hint is an index into the sorted export-name table,
+; NOT an ordinal. The real console ordinals are unknown; WinDurango's
+; layout is the only available one. The exe imports by NAME, so the
+; ordinal rows never affect it — they only matter for a title that
+; imports by ordinal.
+; D3D11XCreateDevice / D3D11XCreateDeviceAndSwapChain have no known
+; real ordinal (the real FH2 exe does not import them) and export by
+; name only. D3DAllocateGraphicsMemory / D3DFreeGraphicsMemory are
+; supporting infrastructure (WinDurango ordinals 6 / 8, but the exe
+; does not import them) and also export by name only.
+LIBRARY d3d11_x
+EXPORTS
+    D3D11XCreateDevice
+    D3D11XCreateDeviceAndSwapChain
+    D3D11XCreateDeviceX @4
+    D3DMapEsramMemory @9
+    DXGIXPresentArray @11
+    D3DAllocateGraphicsMemory
+    D3DFreeGraphicsMemory
