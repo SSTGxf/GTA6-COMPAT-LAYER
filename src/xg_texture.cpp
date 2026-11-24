@@ -174,6 +174,64 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
     const uint32_t mode =
         linear ? kOwnTileMode : (d.layout & ~kLayoutConsoleBit);
     const bool is3D = d.dimension == 4;
+    // BOOT #96: the guest asked for a TEXTURE1D (dimension 2, 256x1, fmt 29,
+    // linear). A 1D texture has no swizzled layout - the guest allocates it
+    // packed (slot 25 sizes 256*4 as 4096) - so it is modelled as a packed
+    // image with one row per mip and no tiles. It is accepted only in the
+    // linear form; a tiled 1D descriptor has no evidence and stays rejected.
+    const bool is1D = d.dimension == 2;
+    if (is1D) {
+        if (!linear || d.height != 1) {
+            out->status = is1D && d.height != 1 ? SC_XG_BAD_DIMS
+                                                : SC_XG_UNSUPPORTED_LAYOUT;
+            return;
+        }
+        uint32_t bpe1 = ScXg_BytesPerTexel(d.format);
+        if (bpe1 == 0) {
+            out->status = SC_XG_UNSUPPORTED_FORMAT;
+            return;
+        }
+        if (d.width == 0 || d.width > (1ull << 31) || d.mips == 0 ||
+            d.mips > kMaxMips || d.depthOrArray == 0 ||
+            d.depthOrArray > kMaxSlices) {
+            out->status = SC_XG_BAD_DIMS;
+            return;
+        }
+        out->bpe = bpe1;
+        out->tileW = 0;
+        out->tileH = 0;
+        out->mipLevels = d.mips;
+        out->slices = d.depthOrArray;
+        out->baseAlign = 4096;
+        uint64_t off1 = 0, packed1 = 0;
+        uint32_t count1 = 0;
+        for (uint32_t m = 0; m < d.mips; ++m) {
+            uint32_t w = (uint32_t)(d.width >> m);
+            if (w == 0) w = 1;
+            uint64_t bytes = (uint64_t)w * bpe1;
+            for (uint32_t s = 0; s < d.depthOrArray; ++s) {
+                if (count1 >= SC_XG_MAX_SUBRESOURCES) {
+                    out->status = SC_XG_TOO_MANY_SUBRESOURCES;
+                    return;
+                }
+                if (off1 > UINT64_MAX - bytes || packed1 > UINT64_MAX - bytes) {
+                    out->status = SC_XG_OVERFLOW;
+                    return;
+                }
+                out->subOffset[count1] = off1;
+                out->subBytes[count1] = bytes;
+                ++count1;
+                off1 += bytes;
+                packed1 += bytes;
+            }
+        }
+        out->subCount = count1;
+        out->tileCount = 0;
+        out->totalBytes = off1;
+        out->packedBytes = packed1;
+        out->status = SC_XG_OK;
+        return;
+    }
     if (d.dimension != 3 && !is3D) {
         out->status = SC_XG_BAD_DIMS;
         return;
@@ -439,6 +497,19 @@ static HRESULT VtblCopy(void* self, void* dst, uint32_t dstRowPitch,
         packed = temp;
     }
 
+    if (lay.tileW == 0) {
+        // Packed destination (TEXTURE1D): rows are contiguous, so copy them
+        // straight through instead of tiling. dstRowPitch was accepted as 0
+        // above; the packed stride is the row pitch.
+        for (uint32_t y = 0; y < h; ++y)
+            memcpy(dstBase + (uint64_t)y * rowPitch,
+                   packed + (uint64_t)y * rowPitch, rowPitch);
+        if (temp) HeapFree(GetProcessHeap(), 0, temp);
+        Log("xgxs", "copy: packed %ux%u bpe %u into sub %u at %p -> S_OK",
+            w, h, lay.bpe, subresource, dstBase);
+        return S_OK;
+    }
+
     HRESULT hr = ScOpt_Tile2D(packed, w, h, lay.bpe, lay.tileW, lay.tileH,
                               dstBase);
     if (temp) HeapFree(GetProcessHeap(), 0, temp);
@@ -591,18 +662,22 @@ extern "C" HRESULT WINAPI XGSuggestSwizzleMode(const void* pDesc, uint32_t flags
             return E_INVALIDARG;
         }
         // 3D descriptors get the guest's own 3D mode (0x105), the same tag
-        // the game writes at 0x1403440F6; 2D keeps this layer's mode 1.
+        // the game writes at 0x1403440F6; 1D stays linear (0x0, packed -
+        // there is no swizzled 1D layout); 2D keeps this layer's mode 1.
         *pOutLayout = (desc.dimension == 4)
                           ? (kLayoutConsoleBit | kGuest3DTileMode)
-                          : (kLayoutConsoleBit | kOwnTileMode);
+                          : (desc.dimension == 2 ? 0u
+                                                 : (kLayoutConsoleBit | kOwnTileMode));
     }
+    const uint32_t suggested =
+        (desc.dimension == 4)
+            ? (kLayoutConsoleBit | kGuest3DTileMode)
+            : (desc.dimension == 2 ? 0u : (kLayoutConsoleBit | kOwnTileMode));
     Log("xgxs",
         "XGSuggestSwizzleMode(desc dim %u %llux%u bpe %u, flags %u) -> S_OK "
         "layout 0x%x (tile %ux%u, %llu bytes)",
         desc.dimension, (unsigned long long)desc.width, desc.height, lay.bpe,
-        flags,
-        (desc.dimension == 4) ? (kLayoutConsoleBit | kGuest3DTileMode)
-                              : (kLayoutConsoleBit | kOwnTileMode),
-        lay.tileW, lay.tileH, (unsigned long long)lay.baseAlign);
+        flags, suggested, lay.tileW, lay.tileH,
+        (unsigned long long)lay.baseAlign);
     return S_OK;
 }
