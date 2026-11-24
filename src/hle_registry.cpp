@@ -2036,15 +2036,43 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
                D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
                D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
                D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS));
-    D3D12_RESOURCE_STATES state = (initialState == (D3D12_RESOURCE_STATES)0xFFFFFFFF)
-        ? D3D12_RESOURCE_STATE_COMMON
-        : initialState;
+    // The guest's state argument is a D3D12_BARRIER_LAYOUT, not a
+    // D3D12_RESOURCE_STATES bitmask: the call site (0x14193e2d4) passes the
+    // SAME r14d to slot 127 as CreateCommittedResource3's InitialLayout
+    // (0x14193e197) and to this method as the initial state. Boot #87 sent 6
+    // (D3D12_BARRIER_LAYOUT_SHADER_RESOURCE); forwarded raw, the desktop read
+    // it as INDEX_BUFFER|RENDER_TARGET and rejected the texture with
+    // E_INVALIDARG. Map it with the same translator slot 127 uses. UNDEFINED
+    // (0xFFFFFFFF) falls through to COMMON, preserving the old behaviour.
+    D3D12_RESOURCE_STATES state =
+        BarrierLayoutToResourceState((D3D12_BARRIER_LAYOUT)initialState);
+    // D3D12 rejects a typeless clear format. The guest's depth resource is
+    // fmt 19 (R32_FLOAT_X8X24_TYPELESS) and its clear value carries the same
+    // typeless code; the typed twin 18 (D32_FLOAT_S8X24_UINT) has the same
+    // memory layout and is what the runtime accepts. Measured on this
+    // adapter: resource 19 + clear 19 = E_INVALIDARG, resource 19 + clear 18
+    // = S_OK (both at the mapped shader-resource state and at COMMON).
+    D3D12_CLEAR_VALUE clearCopy;
+    const D3D12_CLEAR_VALUE* useClear = pClear;
+    UINT clearFormatIn = pClear ? (UINT)pClear->Format : 0;
+    bool clearTranslated = false;
+    if (pClear && (UINT)desc.Format == 19 && (UINT)pClear->Format == 19) {
+        clearCopy = *pClear;
+        clearCopy.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        useClear = &clearCopy;
+        clearTranslated = true;
+    }
+    // Boot #88: the mapped-state create returned DXGI_ERROR_DEVICE_REMOVED
+    // without any earlier failure, so record whether the device was already
+    // gone before this call (reason before) and what it reports after.
+    HRESULT devReasonBefore = self->real->GetDeviceRemovedReason();
     HRESULT hr = self->real->CreateCommittedResource(
-        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, pClear, riid,
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, useClear, riid,
         ppvResource);
+    HRESULT devReasonAfter = self->real->GetDeviceRemovedReason();
     if (hr == E_NOINTERFACE && ppvResource) {
         hr = self->real->CreateCommittedResource(
-            &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, pClear,
+            &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, useClear,
             __uuidof(ID3D12Resource), ppvResource);
     }
     // Boot #56 instrumentation: dump the full desc (the boot #55 log
@@ -2054,8 +2082,8 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
     Log("xboxdev",
         "CreatePlacedResourceX va=0x%llx desc: dim=%u align=%llu "
         "w=%llu h=%u depth=%u mips=%u fmt=%u sample=%u/%u "
-        "layout=%u flags=0x%x state=0x%x ret=0x%llx thread=%lu -> "
-        "hr=0x%08x res=%p",
+        "layout=%u flags=0x%x state=0x%x->0x%x clearFmt=%u->%u "
+        "devReason=0x%08x/0x%08x ret=0x%llx thread=%lu -> hr=0x%08x res=%p",
         (unsigned long long)va,
         (unsigned)pDesc->Dimension,
         (unsigned long long)pDesc->Alignment,
@@ -2069,6 +2097,11 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
         (unsigned)pDesc->Layout,
         (unsigned)pDesc->Flags,
         (unsigned)initialState,
+        (unsigned)state,
+        clearFormatIn,
+        clearTranslated ? (UINT)clearCopy.Format : clearFormatIn,
+        (unsigned)devReasonBefore,
+        (unsigned)devReasonAfter,
         (unsigned long long)_ReturnAddress(),
         GetCurrentThreadId(),
         (unsigned)hr,
