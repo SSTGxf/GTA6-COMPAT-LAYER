@@ -3692,6 +3692,7 @@ struct ScDsQueue {
     int copied;
     int refused;
     int fileSource;
+    void* statusFile;  // completion object bound by slot 4 (ScDsFile*)
     // The guest's stream record advertises cap 4096 (ctx-probe: cap=4096),
     // and real DStorage auto-submits when the queue is half full. Boot #76
     // showed the guest enqueueing without an explicit Submit, so a 256 cap
@@ -3701,6 +3702,11 @@ struct ScDsQueue {
 
 static void* g_dsQueueVtable[64];
 extern "C" void DsqSubmit(void* self);  // forward: half-full auto-submit
+// Defined after ScDsFile: the completion object bound by queue slot 4.
+static void ScDsCompleteStatus(void* statusFile);
+static void ScDsResetStatus(void* statusFile);
+extern "C" HRESULT DsqEnqueueStatus(void* self, void* statusObj,
+                                    uint64_t index, uint64_t a3, uint64_t a4);
 static int g_dsDetailLogs = 0;   // detailed per-request lines, capped
 static int g_dsQueues = 0;
 
@@ -3745,6 +3751,7 @@ extern "C" void DsqEnqueueRequest(void* self, const void* req) {
             self, q->count);
         DsqSubmit(self);
     }
+    if (q->statusFile) ScDsResetStatus(q->statusFile);
     int i = q->count++;
     memcpy(q->req[i].w, req, sizeof(q->req[i].w));
     const uint64_t* w = q->req[i].w;
@@ -3877,6 +3884,8 @@ extern "C" void DsqSubmit(void* self) {
         memcpy((void*)dest, src, n);
         ++copied;
     }
+    // The pages are copied: the bound completion object may now report done.
+    if (q->statusFile) ScDsCompleteStatus(q->statusFile);
     q->submitted++;
     q->copied += copied;
     q->refused += refused;
@@ -3985,6 +3994,7 @@ struct DsQueueVtableInit {
         g_dsQueueVtable[1] = (void*)DsqAddRef;
         g_dsQueueVtable[2] = (void*)DsqRelease;
         g_dsQueueVtable[3] = (void*)DsqEnqueueRequest;   // measured 0x1428c9a0b
+        g_dsQueueVtable[4] = (void*)DsqEnqueueStatus;    // measured 0x1400E8940
         // Boot #81: slot 6 is called with no meaningful arguments (the values
         // are MSVC uninitialised-stack patterns) immediately after the pending
         // requests are enqueued and before the caller marks the stream done.
@@ -4026,6 +4036,14 @@ struct ScDsFile {
     void** vtable;
     volatile LONG ref;
     int open;
+    // Completion object state. Guest caller 0x1400E88F0 binds this object to
+    // the queue (slot 4), calls Submit (slot 6), then polls this object's
+    // slot 3 until it reports completion (0x1400E8978). statusDone is set by
+    // Submit after the pages are really copied and cleared when new work is
+    // enqueued, so the poll reflects work that happened.
+    volatile LONG statusBound;
+    volatile LONG statusDone;
+    volatile LONG statusIndex;
     char name[128];
 };
 
@@ -4055,6 +4073,48 @@ extern "C" ULONG DsfRelease(void* self) {
     return (ULONG)n;
 }
 
+static void ScDsCompleteStatus(void* statusFile) {
+    ScDsFile* f = (ScDsFile*)statusFile;
+    if (f->statusBound) InterlockedExchange(&f->statusDone, 1);
+}
+
+static void ScDsResetStatus(void* statusFile) {
+    ScDsFile* f = (ScDsFile*)statusFile;
+    if (f->statusBound) InterlockedExchange(&f->statusDone, 0);
+}
+
+// Guest caller 0x1400E88F0 calls queue slot 4 at 0x1400E8940 with the live
+// fiDeviceDirectStorage handle and 0, right after releasing the pending ids
+// and right before Submit (slot 6). The next function, 0x1400E8960, then
+// polls that same handle's slot 3 until it reports completion. Slot 4 is
+// therefore the completion-object binding: the file handle is the status
+// object, and Submit is what makes it report done.
+extern "C" HRESULT DsqEnqueueStatus(void* self, void* statusObj,
+                                    uint64_t index, uint64_t a3, uint64_t a4) {
+    (void)a3;
+    (void)a4;
+    ScDsQueue* q = (ScDsQueue*)self;
+    if (!statusObj || !ScRangeCommitted(statusObj, sizeof(void*)) ||
+        *(void**)statusObj != (void*)g_dsFileVtable) {
+        Log("dstorage",
+            "queue %p SLOT 4 EnqueueStatus refused: status object %p "
+            "(index=%llu) is not a live fiDeviceDirectStorage handle -> "
+            "E_NOTIMPL",
+            self, statusObj, (unsigned long long)index);
+        return E_NOTIMPL;
+    }
+    ScDsFile* f = (ScDsFile*)statusObj;
+    f->statusIndex = (LONG)index;
+    InterlockedExchange(&f->statusDone, 0);
+    InterlockedExchange(&f->statusBound, 1);
+    q->statusFile = statusObj;
+    Log("dstorage",
+        "queue %p SLOT 4 EnqueueStatus: bound %p (%s) as completion object "
+        "(index=%llu)",
+        self, statusObj, f->name, (unsigned long long)index);
+    return S_OK;
+}
+
 // Measured shape at 0x144f65847: (this, 0, 0) -> boolean.
 //
 // Boot #75 showed the guest polls this in a tight loop while it is FALSE
@@ -4065,7 +4125,10 @@ static LONG g_dsfPolls = 0;
 static LONG g_dsfPollLogs = 0;
 extern "C" BOOL DsfReady(void* self, uint64_t a1, uint64_t a2) {
     ScDsFile* f = (ScDsFile*)self;
-    const BOOL ok = f->open ? TRUE : FALSE;
+    // Bound as a completion object: report real completion, not readiness.
+    // Unbound (no slot-4 call seen), keep the backed-object answer.
+    const BOOL ok = f->statusBound ? (f->statusDone ? TRUE : FALSE)
+                                   : (f->open ? TRUE : FALSE);
     LONG n = InterlockedIncrement(&g_dsfPolls);
     // Boot #78 logged 134,961 of these in one run. Log the first 16 in detail
     // whether or not the object is ready, then one line every 65,536 polls.
