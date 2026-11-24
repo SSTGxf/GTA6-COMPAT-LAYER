@@ -3896,6 +3896,7 @@ extern "C" void DsqClose(void* self) {
 
 // Identity of the file objects this layer handed the guest (declared here
 // because the queue stubs below log their arguments before ScDsFile exists).
+static void* g_dsFileVtable[64];
 static void* g_dsFileList[64];
 static int g_dsFileListCount = 0;
 
@@ -3922,9 +3923,18 @@ static const char* ScModuleOffset(void* addr, char* out, size_t n) {
     return out;
 }
 
+// A pointer equal to a freed file object proves nothing: DsfRelease frees the
+// object and the guest can reuse that address (boot #80/#81 labelled slot 4's
+// argument this way, possibly from a recycled address). Only a live object is
+// reported, and only after the vtable word checks out.
 static const char* ScDsArgNote(const void* p) {
+    if (!p) return "";
+    if (ScRangeCommitted(p, sizeof(void*)) &&
+        *(void**)p == (void*)g_dsFileVtable) {
+        return "(fiDeviceDirectStorage-live)";
+    }
     for (int i = 0; i < g_dsFileListCount; ++i) {
-        if ((const void*)g_dsFileList[i] == p) return "(fiDeviceDirectStorage)";
+        if ((const void*)g_dsFileList[i] == p) return "(stale-file-ptr)";
     }
     return "";
 }
@@ -3975,6 +3985,11 @@ struct DsQueueVtableInit {
         g_dsQueueVtable[1] = (void*)DsqAddRef;
         g_dsQueueVtable[2] = (void*)DsqRelease;
         g_dsQueueVtable[3] = (void*)DsqEnqueueRequest;   // measured 0x1428c9a0b
+        // Boot #81: slot 6 is called with no meaningful arguments (the values
+        // are MSVC uninitialised-stack patterns) immediately after the pending
+        // requests are enqueued and before the caller marks the stream done.
+        // That is Submit; the guest never calls slot 8 in any boot so far.
+        g_dsQueueVtable[6] = (void*)DsqSubmit;           // measured 0x1400E8950
         g_dsQueueVtable[8] = (void*)DsqSubmit;           // measured 0x1428c9637
         g_dsQueueVtable[9] = (void*)DsqClose;
     }
@@ -4014,7 +4029,6 @@ struct ScDsFile {
     char name[128];
 };
 
-static void* g_dsFileVtable[64];
 static int g_dsFiles = 0;
 
 extern "C" HRESULT DsfQueryInterface(void* self, void* iid, void** out) {
@@ -4031,6 +4045,11 @@ extern "C" ULONG DsfRelease(void* self) {
     if (n == 0) {
         Log("dstorage", "file object %p (%s) destroyed (files=%d)", self,
             f->name, --g_dsFiles);
+        for (int i = 0; i < g_dsFileListCount; ++i) {
+            if (g_dsFileList[i] == self) {
+                g_dsFileList[i] = nullptr;  // never keep a freed pointer
+            }
+        }
         HeapFree(GetProcessHeap(), 0, f);
     }
     return (ULONG)n;
