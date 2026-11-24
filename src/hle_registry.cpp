@@ -35,6 +35,12 @@ namespace {
 static FILE* g_logFile = nullptr;
 static bool g_logInit = false;
 static ULONGLONG g_lastLogFlush = 0;
+// One boot must never be able to fill the disk (boot #78: a cumulative 4.4 GB
+// log plus a 4.4 GB dump left F: at 0 bytes and the minidump failed with
+// ERROR_DISK_FULL). The cap applies to the file only; stderr keeps going.
+static unsigned long long g_logFileBytes = 0;
+static bool g_logCapNoted = false;
+static const unsigned long long kLogFileCapBytes = 192ull << 20;
 
 static void EnsureLogInit() {
     if (g_logInit) return;
@@ -60,9 +66,15 @@ void WriteLogLine(const char* line) {
     EnsureLogInit();
     fputs(line, stderr);
     fputc('\n', stderr);
-    if (g_logFile) {
+    if (g_logFile && g_logFileBytes < kLogFileCapBytes) {
         fputs(line, g_logFile);
         fputc('\n', g_logFile);
+        g_logFileBytes += strlen(line) + 1;
+    } else if (g_logFile && !g_logCapNoted) {
+        g_logCapNoted = true;
+        fputs("[layer     ] log file cap reached; file logging stopped "
+              "(stderr continues)\n", stderr);
+        fflush(g_logFile);
     }
     ULONGLONG now = GetTickCount64();
     if (now - g_lastLogFlush >= 200) {
@@ -3882,24 +3894,74 @@ extern "C" void DsqClose(void* self) {
         ((ScDsQueue*)self)->count, ((ScDsQueue*)self)->submitted);
 }
 
-extern "C" HRESULT DsqUnsupported(void* self, uint64_t a1, uint64_t a2,
-                                  uint64_t a3, uint64_t a4) {
-    // The slot is not passed to the stub, so record the guest's return
-    // address: disassembling the call site names the vtable slot. Boot #77
-    // showed two of these immediately before a VCRUNTIME140 fault, and
-    // without the call site they cannot be identified.
+// Identity of the file objects this layer handed the guest (declared here
+// because the queue stubs below log their arguments before ScDsFile exists).
+static void* g_dsFileList[64];
+static int g_dsFileListCount = 0;
+
+// Boot #79 showed the queue's slot-4/slot-6 callers at 0x7FFC3AE8BE36 and
+// +0x60, which is not guest code (guest image is at 0x140000000). Resolve the
+// module and offset so the caller can be named instead of guessed.
+static const char* ScModuleOffset(void* addr, char* out, size_t n) {
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &mod) &&
+        mod) {
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(mod, path, MAX_PATH);
+        const wchar_t* leaf = wcsrchr(path, L'\\');
+        char narrow[96] = {};
+        WideCharToMultiByte(CP_UTF8, 0, leaf ? leaf + 1 : path, -1, narrow,
+                            sizeof(narrow), nullptr, nullptr);
+        _snprintf_s(out, n, _TRUNCATE, "%s+0x%llx", narrow,
+                    (unsigned long long)((uintptr_t)addr - (uintptr_t)mod));
+    } else {
+        _snprintf_s(out, n, _TRUNCATE, "unknown");
+    }
+    return out;
+}
+
+static const char* ScDsArgNote(const void* p) {
+    for (int i = 0; i < g_dsFileListCount; ++i) {
+        if ((const void*)g_dsFileList[i] == p) return "(fiDeviceDirectStorage)";
+    }
+    return "";
+}
+
+// One stub per slot, each passing its own index. Boot #78's arguments could
+// not be named because the shared stub never learned which vtable entry the
+// guest had called; the slot is what decides the method.
+extern "C" HRESULT DsqUnsupportedSlot(int slot, void* self, uint64_t a1,
+                                      uint64_t a2, uint64_t a3, uint64_t a4) {
+    char caller[128] = {};
+    ScModuleOffset(_ReturnAddress(), caller, sizeof(caller));
     Log("dstorage",
-        "queue %p unsupported method from %p (this=%p %llx %llx %llx %llx) "
-        "-> E_NOTIMPL",
-        self, _ReturnAddress(), self, (unsigned long long)a1,
-        (unsigned long long)a2, (unsigned long long)a3,
-        (unsigned long long)a4);
+        "queue %p SLOT %d from %s args=%llx%s %llx%s %llx%s %llx%s -> "
+        "E_NOTIMPL",
+        self, slot, caller, (unsigned long long)a1,
+        ScDsArgNote((const void*)a1), (unsigned long long)a2,
+        ScDsArgNote((const void*)a2), (unsigned long long)a3,
+        ScDsArgNote((const void*)a3), (unsigned long long)a4,
+        ScDsArgNote((const void*)a4));
     return E_NOTIMPL;
+}
+
+template <size_t N>
+static HRESULT DsqSlotThunk(void* self, uint64_t a1, uint64_t a2,
+                            uint64_t a3, uint64_t a4) {
+    return DsqUnsupportedSlot((int)N, self, a1, a2, a3, a4);
+}
+
+template <size_t... I>
+static void FillDsQueueSlots(std::index_sequence<I...>) {
+    int expand[] = {0, ((g_dsQueueVtable[I] = (void*)&DsqSlotThunk<I>), 0)...};
+    (void)expand;
 }
 
 struct DsQueueVtableInit {
     DsQueueVtableInit() {
-        for (int i = 0; i < 64; ++i) g_dsQueueVtable[i] = (void*)DsqUnsupported;
+        FillDsQueueSlots(std::make_index_sequence<64>{});
         g_dsQueueVtable[0] = (void*)DsqQueryInterface;
         g_dsQueueVtable[1] = (void*)DsqAddRef;
         g_dsQueueVtable[2] = (void*)DsqRelease;
@@ -3977,13 +4039,15 @@ extern "C" BOOL DsfReady(void* self, uint64_t a1, uint64_t a2) {
     ScDsFile* f = (ScDsFile*)self;
     const BOOL ok = f->open ? TRUE : FALSE;
     LONG n = InterlockedIncrement(&g_dsfPolls);
-    if (ok || InterlockedIncrement(&g_dsfPollLogs) <= 16) {
+    // Boot #78 logged 134,961 of these in one run. Log the first 16 in detail
+    // whether or not the object is ready, then one line every 65,536 polls.
+    if (InterlockedIncrement(&g_dsfPollLogs) <= 16) {
         Log("dstorage", "file %p (%s) slot3(a=%llx b=%llx) -> %d (poll %ld)",
             self, f->name, (unsigned long long)a1,
             (unsigned long long)a2, (int)ok, (long)n);
     } else if ((n & 0xffff) == 0) {
-        Log("dstorage", "file %p (%s): %ld polls, still refusing (no pack "
-            "mapping for this device)", self, f->name, (long)n);
+        Log("dstorage", "file %p (%s): %ld polls, returning %d", self,
+            f->name, (long)n, (int)ok);
     }
     return ok;
 }
@@ -4032,6 +4096,7 @@ extern "C" HRESULT StubStorageFactorySlot5(void* self, uint64_t flags,
     // measured slot-3 readiness poll can report true instead of spinning.
     f->open = 1;
     ++g_dsFiles;
+    if (g_dsFileListCount < 64) g_dsFileList[g_dsFileListCount++] = (void*)f;
     *out = f;
     Log("dstorage",
         "  opened file object %p (name=%s, open=%d, files=%d) -> S_OK; "

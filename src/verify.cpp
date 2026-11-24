@@ -57,9 +57,15 @@ static std::wstring JoinDir(const std::wstring& dir, const wchar_t* name) {
 static int ChildRun(const wchar_t* guestPath, DWORD timeoutMs) {
     (void)timeoutMs;
     std::wstring dir = ExeDir();
-    // Keep the loader report beside the harness, never in the game folder.
-    std::wstring logPath = JoinDir(dir, L"scarlett.log");
-    SetEnvironmentVariableW(L"SCARLETT_LOG_PATH", logPath.c_str());
+    // Keep the loader report beside the harness, never in the game folder,
+    // but honour an inherited SCARLETT_LOG_PATH so each boot can rotate the
+    // log instead of appending to one cumulative file (boot #78: 970 runs,
+    // 4.4 GB, filled F:).
+    wchar_t inheritedLog[2] = {};
+    if (GetEnvironmentVariableW(L"SCARLETT_LOG_PATH", inheritedLog, 2) == 0) {
+        std::wstring logPath = JoinDir(dir, L"scarlett.log");
+        SetEnvironmentVariableW(L"SCARLETT_LOG_PATH", logPath.c_str());
+    }
     std::wstring layerPath = JoinDir(dir, L"ScarlettCompat.dll");
     HMODULE layer = LoadLibraryW(layerPath.c_str());
     if (!layer) {
