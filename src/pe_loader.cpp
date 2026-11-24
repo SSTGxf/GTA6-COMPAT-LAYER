@@ -1777,6 +1777,16 @@ static LONG g_vehDumped = 0;
 // the entry runs.
 void* ScGuestBase() { return g_guestBaseForVeh; }
 
+// Calling thread's game TLS block via the /GA view (view[0]).
+// nullptr when no view is installed. The view pointer itself comes
+// from TlsGetValue (safe); the caller SEH-guards the [0] read.
+void* ScGuestGaViewBlock() {
+    if (g_gaSlot == TLS_OUT_OF_INDEXES) return nullptr;
+    void* view = TlsGetValue(g_gaSlot);
+    if (!view) return nullptr;
+    return ((void**)view)[0];
+}
+
 // Boot #13 diagnostic probe: reads the the title VFS mount-registry state
 // from the guest image at fixed RVAs (same convention as the existing
 // title-specific patches: pool vtable patch, F int3 NOP, Option A).
