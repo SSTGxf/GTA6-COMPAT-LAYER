@@ -105,6 +105,77 @@ stays out of the frame budget.
 
 No test tolerance, step limit or stage was changed.
 
+## Build 89 — the producer of [record+0x18] is our own stub COM object
+
+The streaming record constructor (`0x1428C9460`) ends with:
+
+```
+0x1428c95a6  add r9,0x18                 ; r9 = &record[+0x18]
+0x1428c95ad  mov rcx,[global 0x1478F5E78] ; cached interface object
+0x1428c95bc  mov qword ptr [rdx+0x18],1
+0x1428c95c4  mov rax,[rcx]
+0x1428c95c7  call qword ptr [rax+0x50]   ; slot 10
+0x1428c95ca  test eax,eax / jns ok / int3
+```
+
+The earlier call in the same constructor (`0x1428c9522`, `[r10+0x28]`, slot 5)
+stores its result at `+0x30`. So **slot 10 of the cached object is the
+operation that must populate `[record+0x18]`**, with the out pointer as its
+fifth argument — no other writer exists, which is why the DR0 watchpoint
+never trapped.
+
+What that object is, from the boot #71 dump:
+
+```
+global 0x1478F5E78 -> 0x000002ed7626c1e0
+[0x2ed7626c1e0]    -> vtable 0x00007ffbcf6a6db0   (inside ScarlettCompat.dll)
+vtable[0] = 0x7ffbcf66a150   QueryInterface
+vtable[1] = 0x7ffbcf66a140   AddRef
+vtable[2] = 0x7ffbcf66a160   Release
+vtable[3..11] = 0x7ffbcf6577c0  (the same function in every slot)
+```
+
+Three real entries and one repeated handler is `g_stubComVtable` in
+`src/hle_registry.cpp`: `MakeStubComObject()` hands the guest a fake COM
+object for interfaces the layer does not implement (`IGameInput`,
+`IDStorageFactory`), and **`StubComGeneric()` returns S_OK for every
+method**. So the constructor's request to create the submission backend
+into `+0x18` is answered with fake success and no write; the field stays
+null, the submit at `0x1428C9A08` dereferences it, and the guest dies.
+
+That is the "upload looked complete" divergence: the record was never
+meant to be submitted with a hypothetical backend — it was submitted with
+our stub's lie.
+
+### What was tried and what it showed
+
+A dedicated slot-10 handler was added to the texture computer's vtable
+(returning E_NOTIMPL with a log naming the out pointer). Boot #72 shows it
+is **not reached** on this path — no `computer slot 10` line appears and
+the fault is unchanged:
+
+```
+[xmem  ] mapped 6720/6720 pages, out[0]=0x2137b220000 out[last]=0x21395610000
+[loader] ctx-probe: ctx=0x20f0191b780 owner=0x1478f5e80 sub[+0x18]=0x0 arg8=2
+[loader] guest crashed (veh-breakpoint): exception 0xc0000005 at 00000001428C9A08
+```
+
+So the constructor's cached object is the *stub COM* object, not the
+texture computer, and the fix belongs in what `MakeStubComObject()` hands
+out for the interface the streamer asks for:
+
+* either the layer implements that interface for real (its slot 10 must
+  return a backend object whose slot 3 accepts the submit request and
+  whose slot 8 destroys it), or
+* `StubComGeneric` must stop returning S_OK for methods whose contract is
+  unknown, so the guest's own `jns`/`int3` at `0x1428c95ca` reports a named
+  failure instead of dereferencing a null that our fake success created.
+
+Neither was landed this pass: the first needs the interface identity
+(which of `IGameInput`/`IDStorageFactory` the streamer caches at
+`0x1478F5E78`, in the crashing boot), and the second changes every stub
+COM call site and must be measured across the boot before it is safe.
+
 ## Post-fix boot (green binaries)
 
 ```
