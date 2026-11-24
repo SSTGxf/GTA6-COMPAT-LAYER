@@ -10,6 +10,7 @@
 #include "fixed_timestep.h"  // Fixed-timestep physics decoupling
 #include "xbox_shims.h"
 #include "xg_texture.h"  // xg_xs texture computer (build 80, real object)
+#include "opt_dstorage.h"  // real pack reads for the DStorage queue (D1)
 #include <mmsystem.h>  // timeBeginPeriod (frame pacing, phase 3)
 #include <dxgi.h>  // IDXGIDevice / IDXGIAdapter (device QI forwarding)
 #include <string.h>
@@ -3679,10 +3680,15 @@ struct ScDsQueue {
     int copied;
     int refused;
     int fileSource;
-    ScDsRequest req[256];
+    // The guest's stream record advertises cap 4096 (ctx-probe: cap=4096),
+    // and real DStorage auto-submits when the queue is half full. Boot #76
+    // showed the guest enqueueing without an explicit Submit, so a 256 cap
+    // silently dropped pages and it faulted later.
+    ScDsRequest req[4096];
 };
 
 static void* g_dsQueueVtable[64];
+extern "C" void DsqSubmit(void* self);  // forward: half-full auto-submit
 static int g_dsDetailLogs = 0;   // detailed per-request lines, capped
 static int g_dsQueues = 0;
 
@@ -3721,11 +3727,11 @@ extern "C" void DsqEnqueueRequest(void* self, const void* req) {
         Log("dstorage", "queue %p EnqueueRequest(NULL) ignored", self);
         return;
     }
-    if (q->count >= 256) {
-        q->refused++;
-        Log("dstorage", "queue %p EnqueueRequest refused: queue full (%d)",
+    if (q->count >= 2048) {
+        // Half-full automatic submission, matching DStorage semantics.
+        Log("dstorage", "queue %p half-full (%d) -> automatic Submit",
             self, q->count);
-        return;
+        DsqSubmit(self);
     }
     int i = q->count++;
     memcpy(q->req[i].w, req, sizeof(q->req[i].w));
@@ -3752,6 +3758,18 @@ extern "C" void DsqEnqueueRequest(void* self, const void* req) {
     }
 }
 
+// Measured mapping (boot #74 + offline check): the stream the guest enqueues
+// for hash 0xACA58068328F107A reads zlib pages from shaders.rpf. Request 0
+// asks for 0x4594 bytes at 0x1057d7c0 and that exact span has a 0x78da
+// header and inflates to 65536 bytes, which is the request's destSize. The
+// other ten RPFs were tested at the same offset and none inflates.
+static const char* kDsMeasuredPack = "D:\\game\\game\\shaders.rpf";
+static const uint64_t kDsMeasuredHash = 0xACA58068328F107Aull;
+static const char* ScDsPackPath() {
+    const char* env = getenv("SCARLETT_DS_PACK");
+    return (env && *env) ? env : kDsMeasuredPack;
+}
+
 extern "C" void DsqSubmit(void* self) {
     ScDsQueue* q = (ScDsQueue*)self;
     int copied = 0, refused = 0, fileSource = 0;
@@ -3766,11 +3784,71 @@ extern "C" void DsqSubmit(void* self) {
         const bool memorySource = (options & 0x400000ull) != 0;
         if (!memorySource) {
             ++fileSource;
-            Log("dstorage",
-                "Submit[%d] refused: file-sourced request (options=0x%016llx "
-                "dest=%p destSize=%u source=%p srcSize=%u) -> E_NOTIMPL, "
-                "IDStorageFileX is not implemented",
-                i, (unsigned long long)options, dest, destSize, src, srcSize);
+            // File-sourced: +0x20 hash, +0x28 file offset, +0x30 compressed
+            // size. Serve it for real when the hash is the measured one and
+            // the destination is validated; otherwise refuse by name.
+            const uint64_t hash = w[4];
+            const uint64_t fileOffset = w[5];
+            const uint32_t compSize = (uint32_t)w[6];
+            if (hash != kDsMeasuredHash) {
+                Log("dstorage",
+                    "Submit[%d] refused: unresolvable source hash "
+                    "0x%016llx (options=0x%016llx dest=%p destSize=%u "
+                    "offset=0x%llx compSize=%u) -> E_NOTIMPL",
+                    i, (unsigned long long)hash, (unsigned long long)options,
+                    dest, destSize, (unsigned long long)fileOffset, compSize);
+                continue;
+            }
+            if (compSize == 0 || destSize == 0 ||
+                !ScRangeCommitted(dest, destSize)) {
+                Log("dstorage",
+                    "Submit[%d] refused: unvalidated destination (hash "
+                    "0x%016llx dest=%p destSize=%u offset=0x%llx "
+                    "compSize=%u)",
+                    i, (unsigned long long)hash, dest, destSize,
+                    (unsigned long long)fileOffset, compSize);
+                continue;
+            }
+            static bool dsInit = false;
+            if (!dsInit) {
+                ScOptDsPath dsPath = SC_OPT_DS_PATH_OVERLAPPED;
+                ScOpt_DStorageInit(&dsPath);
+                dsInit = true;
+            }
+            uint8_t* comp = nullptr;
+            uint32_t got = 0;
+            if (ScOpt_DStorageReadFile(ScDsPackPath(), fileOffset, compSize,
+                                       &comp, &got) != S_OK ||
+                !comp || got != compSize) {
+                Log("dstorage",
+                    "Submit[%d] refused: pack read failed (path=%s offset=0x%llx "
+                    "compSize=%u got=%u) -> E_FAIL",
+                    i, ScDsPackPath(), (unsigned long long)fileOffset,
+                    compSize, got);
+                free(comp);
+                continue;
+            }
+            uint8_t* outBuf = (uint8_t*)malloc(destSize);
+            size_t outLen = 0;
+            HRESULT hr = outBuf ? ScOpt_DStorageDecompress(
+                                      SC_OPT_DS_DECOMP_ZLIB, comp, compSize,
+                                      outBuf, destSize, &outLen)
+                                : E_OUTOFMEMORY;
+            free(comp);
+            if (hr != S_OK || !outBuf || outLen < destSize) {
+                Log("dstorage",
+                    "Submit[%d] refused: inflate failed (hash 0x%016llx "
+                    "offset=0x%llx compSize=%u destSize=%u outLen=%u hr=0x%08x)"
+                    " -> %s (zlib only; BCPack stays E_NOTIMPL)",
+                    i, (unsigned long long)hash,
+                    (unsigned long long)fileOffset, compSize, destSize, outLen,
+                    (unsigned)hr, hr == S_OK ? "short output" : "E_NOTIMPL");
+                free(outBuf);
+                continue;
+            }
+            memcpy((void*)dest, outBuf, destSize);
+            free(outBuf);
+            ++copied;
             continue;
         }
         if (srcSize == 0 || destSize == 0 ||
@@ -3944,15 +4022,16 @@ extern "C" HRESULT StubStorageFactorySlot5(void* self, uint64_t flags,
     if (name) {
         strncpy_s(f->name, sizeof(f->name), name, _TRUNCATE);
     }
-    // The device name is not a filesystem path, so the handle is real but
-    // its backing store is not resolvable yet: reads are refused by name.
-    f->open = 0;
+    // The device is backed by the measured pack (shaders.rpf, see
+    // kDsMeasuredPack): ready for the queue's file-sourced pages, so the
+    // measured slot-3 readiness poll can report true instead of spinning.
+    f->open = 1;
     ++g_dsFiles;
     *out = f;
     Log("dstorage",
         "  opened file object %p (name=%s, open=%d, files=%d) -> S_OK; "
-        "no pack-file mapping for this device yet",
-        (void*)f, f->name, f->open, g_dsFiles);
+        "backed by %s",
+        (void*)f, f->name, f->open, g_dsFiles, ScDsPackPath());
     return S_OK;
 }
 
