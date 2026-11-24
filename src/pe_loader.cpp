@@ -20,6 +20,10 @@ namespace sc {
 
 namespace {
 
+// Diagnostic-only replacement for one zero-filled game TLS initializer.
+// The address is fingerprinted in ApplyScarlettVtablePatch before use.
+static void CALLBACK ScarlettNoopThreadInit(PVOID, DWORD, PVOID) {}
+
 // Case-insensitive ASCII compare.
 bool CiEq(const char* a, const char* b) {
     if (!a || !b) return false;
@@ -232,6 +236,108 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
             "scarlett F int3 patch: fingerprint mismatch, skipped "
             "(byte 0x%02x, want 0xcc)",
             fInt3[0]);
+    }
+    // Diagnostic probe from the local real-exe dump: its dynamic TLS
+    // initializer table slot 5 points at RVA 0x28c8ea0, where the image
+    // contains 32 zero bytes and no runtime-function entry. Executing those
+    // bytes attempts to write into .text and raises 0xc0000005. Redirect only
+    // this exact image/table/pointer fingerprint to a no-op in the mapped
+    // image, to reveal the next boot gate. This intentionally skips one
+    // initializer and is not a semantic fix; the game file is never changed.
+    const uint32_t kTlsInitTableSlot5Rva = 0x6791990;
+    const uint32_t kTlsInitTargetRva = 0x28c8ea0;
+    char tlsProbeEnv[2] = {};
+    DWORD tlsProbeEnvLen = GetEnvironmentVariableA(
+        "SCARLETT_DIAG_SKIP_TLS_INIT5", tlsProbeEnv,
+        (DWORD)sizeof(tlsProbeEnv));
+    const bool tlsProbeEnabled =
+        tlsProbeEnvLen == 1 && tlsProbeEnv[0] == '1';
+    if (imageSize == 0x0b06d000 && !tlsProbeEnabled) {
+        Log("loader",
+            "diagnostic TLS initializer[5] probe disabled; set "
+            "SCARLETT_DIAG_SKIP_TLS_INIT5=1 to enable");
+    }
+    if (imageSize == 0x0b06d000 && tlsProbeEnabled &&
+        (SIZE_T)kTlsInitTableSlot5Rva + sizeof(uint64_t) <= imageSize &&
+        (SIZE_T)kTlsInitTargetRva + 0x20 <= imageSize) {
+        uint64_t* entry = (uint64_t*)(img + kTlsInitTableSlot5Rva);
+        const uint8_t* target = img + kTlsInitTargetRva;
+        bool targetIsZero = true;
+        for (size_t i = 0; i < 0x20; ++i) {
+            if (target[i] != 0) {
+                targetIsZero = false;
+                break;
+            }
+        }
+        const uint64_t expectedTarget = (uint64_t)img + kTlsInitTargetRva;
+        if (*entry == expectedTarget && targetIsZero) {
+            const uint64_t replacement =
+                reinterpret_cast<uint64_t>(&ScarlettNoopThreadInit);
+            *entry = replacement;
+            Log("loader",
+                "diagnostic TLS initializer[5]: 0x%llx -> no-op 0x%llx "
+                "(zero-filled RVA 0x28c8ea0)",
+                (unsigned long long)expectedTarget,
+                (unsigned long long)replacement);
+        } else {
+            Log("loader",
+                "diagnostic TLS initializer[5]: fingerprint mismatch "
+                "(entry 0x%llx, zero-target %u), skipped",
+                (unsigned long long)*entry, targetIsZero ? 1u : 0u);
+        }
+    }
+    // A second opt-in probe for the next real-exe dump: initializer-table
+    // slot 12 points at a TLS accessor thunk whose relative jump lands at
+    // zero-filled RVA 0x4e72fd0 (no .pdata function entry). Let the caller
+    // bypass it only when both the thunk bytes and target match this build.
+    const uint32_t kTlsInitTableSlot12Rva = 0x67919c8;
+    const uint32_t kTlsInitThunkRva = 0x20cf840;
+    const uint32_t kTlsInitThunkTargetRva = 0x4e72fd0;
+    char tlsProbe12Env[2] = {};
+    DWORD tlsProbe12EnvLen = GetEnvironmentVariableA(
+        "SCARLETT_DIAG_SKIP_TLS_INIT12", tlsProbe12Env,
+        (DWORD)sizeof(tlsProbe12Env));
+    const bool tlsProbe12Enabled =
+        tlsProbe12EnvLen == 1 && tlsProbe12Env[0] == '1';
+    if (imageSize == 0x0b06d000 && tlsProbe12Enabled &&
+        (SIZE_T)kTlsInitTableSlot12Rva + sizeof(uint64_t) <= imageSize &&
+        (SIZE_T)kTlsInitThunkRva + 24 <= imageSize &&
+        (SIZE_T)kTlsInitThunkTargetRva + 0x20 <= imageSize) {
+        static const uint8_t kExpectedThunk[24] = {
+            0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0x00, 0x00,
+            0x00, 0x48, 0x8b, 0x00, 0x48, 0x8d, 0x88, 0x48,
+            0x11, 0x00, 0x00, 0xe9, 0x78, 0x37, 0xda, 0x02};
+        uint64_t* entry = (uint64_t*)(img + kTlsInitTableSlot12Rva);
+        const uint64_t expectedThunk = (uint64_t)img + kTlsInitThunkRva;
+        const uint8_t* thunk = img + kTlsInitThunkRva;
+        const uint8_t* target = img + kTlsInitThunkTargetRva;
+        bool targetIsZero = true;
+        for (size_t i = 0; i < 0x20; ++i) {
+            if (target[i] != 0) {
+                targetIsZero = false;
+                break;
+            }
+        }
+        if (*entry == expectedThunk &&
+            memcmp(thunk, kExpectedThunk, sizeof(kExpectedThunk)) == 0 &&
+            targetIsZero) {
+            const uint64_t replacement =
+                reinterpret_cast<uint64_t>(&ScarlettNoopThreadInit);
+            *entry = replacement;
+            Log("loader",
+                "diagnostic TLS initializer[12]: 0x%llx -> no-op 0x%llx "
+                "(thunk RVA 0x20cf840 -> zero-filled RVA 0x4e72fd0)",
+                (unsigned long long)expectedThunk,
+                (unsigned long long)replacement);
+        } else {
+            Log("loader",
+                "diagnostic TLS initializer[12] fingerprint mismatch "
+                "(entry 0x%llx, thunk-match %u, zero-target %u), skipped",
+                (unsigned long long)*entry,
+                memcmp(thunk, kExpectedThunk, sizeof(kExpectedThunk)) == 0
+                    ? 1u : 0u,
+                targetIsZero ? 1u : 0u);
+        }
     }
     // Boot #6 / H1 Option A (see the local boot #6 diagnosis):
     // grow the pool at construction so slot 0 returns a real block.

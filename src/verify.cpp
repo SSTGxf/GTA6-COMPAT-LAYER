@@ -57,11 +57,9 @@ static std::wstring JoinDir(const std::wstring& dir, const wchar_t* name) {
 static int ChildRun(const wchar_t* guestPath, DWORD timeoutMs) {
     (void)timeoutMs;
     std::wstring dir = ExeDir();
-    // load_report.txt goes next to the guest (where the parent reads it),
-    // not next to the harness exe — guests may live in a subdirectory.
-    std::wstring guestDir = guestPath;
-    size_t p = guestDir.find_last_of(L"\\/");
-    if (p != std::wstring::npos) guestDir = guestDir.substr(0, p);
+    // Keep the loader report beside the harness, never in the game folder.
+    std::wstring logPath = JoinDir(dir, L"scarlett.log");
+    SetEnvironmentVariableW(L"SCARLETT_LOG_PATH", logPath.c_str());
     std::wstring layerPath = JoinDir(dir, L"ScarlettCompat.dll");
     HMODULE layer = LoadLibraryW(layerPath.c_str());
     if (!layer) {
@@ -85,12 +83,12 @@ static int ChildRun(const wchar_t* guestPath, DWORD timeoutMs) {
     bool ok = scLoad(guestPath, peBuf.data(), err, sizeof(err));
     if (!ok) {
         report = "loader=FAIL\nloader_detail=" + std::string(err) + "\n";
-        WriteFileStr(JoinDir(guestDir, L"load_report.txt"), report);
+        WriteFileStr(JoinDir(dir, L"load_report.txt"), report);
         printf("[verify] LOAD FAIL: %s\n", err);
         return 0xE0000002;
     }
     report = "loader=PASS\n";
-    WriteFileStr(JoinDir(guestDir, L"load_report.txt"), report);
+    WriteFileStr(JoinDir(dir, L"load_report.txt"), report);
     printf("[verify] LOAD PASS\n");
 
     // Run the guest. Its entry point is a normal EXE entry: on return it
@@ -112,6 +110,7 @@ static int ParentRun(const wchar_t* guestPath, DWORD timeoutMs) {
         GetModuleFileNameW(nullptr, buf, MAX_PATH);
         exePath = buf;
     }
+    std::wstring harnessDir = ExeDir();
     // Guest dir becomes the child cwd, so guest_report.txt lands next to
     // the guest.
     std::wstring guestDir = guestPath;
@@ -140,7 +139,8 @@ static int ParentRun(const wchar_t* guestPath, DWORD timeoutMs) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    std::string loadRep = ReadFileStr(JoinDir(guestDir, L"load_report.txt"));
+    std::string loadRep =
+        ReadFileStr(JoinDir(harnessDir, L"load_report.txt"));
     std::string guestRep =
         ReadFileStr(JoinDir(guestDir, L"guest_report.txt"));
 
@@ -368,7 +368,7 @@ static int ParentRun(const wchar_t* guestPath, DWORD timeoutMs) {
     out += loadRep;
     out += guestRep;
     out += std::string("verdict=") + (allPass ? "ALL PASS\n" : "FAIL\n");
-    WriteFileStr(JoinDir(guestDir, L"scarlett_verify_report.txt"), out);
+    WriteFileStr(JoinDir(harnessDir, L"scarlett_verify_report.txt"), out);
     return allPass ? 0 : 1;
 }
 
