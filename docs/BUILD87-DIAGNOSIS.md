@@ -363,6 +363,13 @@ Still true and not claimed otherwise: the guest stops at its own `int3` at
 `0x1428c95ce` rather than faulting on the null it was told was valid, and
 the streaming path does not complete.
 
+**Open decision (not answered here):** either accept the guest-asserted stop
+at `0x1428c95ce` as the permanent behaviour of the refusal, or authorise a
+real DStorage queue behind `IDStorageFactory` slot 10 (slot 3 accepting the
+submit request, slot 8 releasing it). Choosing the latter is a product
+decision about faking a backend the layer does not implement, so it stays
+with the owner of this work.
+
 ## Commit contents and the `src/xg_texture.cpp` tracked-ness question
 
 `src/xg_texture.cpp` participates in the build (`build.bat` line 25 passes
