@@ -20,6 +20,10 @@ namespace sc {
 
 namespace {
 
+// Diagnostic-only replacement for one zero-filled game TLS initializer.
+// The address is fingerprinted in ApplyScarlettVtablePatch before use.
+static void CALLBACK ScarlettNoopThreadInit(PVOID, DWORD, PVOID) {}
+
 // Case-insensitive ASCII compare.
 bool CiEq(const char* a, const char* b) {
     if (!a || !b) return false;
@@ -232,6 +236,44 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
             "scarlett F int3 patch: fingerprint mismatch, skipped "
             "(byte 0x%02x, want 0xcc)",
             fInt3[0]);
+    }
+    // Diagnostic probe from the local real-exe dump: its dynamic TLS
+    // initializer table slot 5 points at RVA 0x28c8ea0, where the image
+    // contains 32 zero bytes and no runtime-function entry. Executing those
+    // bytes attempts to write into .text and raises 0xc0000005. Redirect only
+    // this exact image/table/pointer fingerprint to a no-op in the mapped
+    // image, to reveal the next boot gate. This intentionally skips one
+    // initializer and is not a semantic fix; the game file is never changed.
+    const uint32_t kTlsInitTableSlot5Rva = 0x6791990;
+    const uint32_t kTlsInitTargetRva = 0x28c8ea0;
+    if (imageSize == 0x0b06d000 &&
+        (SIZE_T)kTlsInitTableSlot5Rva + sizeof(uint64_t) <= imageSize &&
+        (SIZE_T)kTlsInitTargetRva + 0x20 <= imageSize) {
+        uint64_t* entry = (uint64_t*)(img + kTlsInitTableSlot5Rva);
+        const uint8_t* target = img + kTlsInitTargetRva;
+        bool targetIsZero = true;
+        for (size_t i = 0; i < 0x20; ++i) {
+            if (target[i] != 0) {
+                targetIsZero = false;
+                break;
+            }
+        }
+        const uint64_t expectedTarget = (uint64_t)img + kTlsInitTargetRva;
+        if (*entry == expectedTarget && targetIsZero) {
+            const uint64_t replacement =
+                reinterpret_cast<uint64_t>(&ScarlettNoopThreadInit);
+            *entry = replacement;
+            Log("loader",
+                "diagnostic TLS initializer[5]: 0x%llx -> no-op 0x%llx "
+                "(zero-filled RVA 0x28c8ea0)",
+                (unsigned long long)expectedTarget,
+                (unsigned long long)replacement);
+        } else {
+            Log("loader",
+                "diagnostic TLS initializer[5]: fingerprint mismatch "
+                "(entry 0x%llx, zero-target %u), skipped",
+                (unsigned long long)*entry, targetIsZero ? 1u : 0u);
+        }
     }
     // Boot #6 / H1 Option A (see the local boot #6 diagnosis):
     // grow the pool at construction so slot 0 returns a real block.
