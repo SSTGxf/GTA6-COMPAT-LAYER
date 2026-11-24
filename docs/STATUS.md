@@ -1,36 +1,27 @@
 # Status
 
-Per-function implementation status (Xenia-style tags). Updated 2026-11-23 —
-REAL-EXE INTEGRATION done (see docs/REAL-EXE-INTEGRATION.md): the real
-`game_scarlett_master.exe` import table read (**587 imports, 68 modules** —
-an earlier 597 count was wrong; the RE report's PE parse is authoritative);
-true `D3D12XboxCreateDevice` 4-arg signature proven by call-site
-disassembly; 97 missing registry entries added (13 real implementations
-+ 84 stubs); 8 new shim modules; GameInput ordinal 1 CONFIRMED real
-(the exe imports by name otherwise, so the synthetic ordinal tables
-stay test-only). **Real exe BOOTED twice (2026-11-23 ~10:43 + ~10:52 EST):
-loader PASS, 587/587 imports, D3D12ConfigureVirtualMemoryX S_OK, 7
-XMemVirtualAlloc arenas all OK — then the game crashed in its own early
-init (EXCEPTION_BREAKPOINT at offset 0x22106e0, a vtable call into int3
-padding, before any D3D12XboxCreateDevice call).** Two regressions the
-real exe exposed and fixed: (1) the ERA `d3d12_x!D3D12XCreateDevice`
-shared the GDK function — split into a separate D3D12CreateDevice-shaped
-passthrough (the shared form crashed era_gfx12, 0xC0000005); (2) AcpHal.dll
-is NOT an ERA signal (shared Xbox One/Series X audio HAL) — removed from
-`kEraModules`, so the GDK title is no longer mis-detected as ERA.
-Verify: all 10 runs ALL PASS, verify exit 0 (build 7). WinRT CoreApplication shim PROVEN (guest_winrt 9/9
-PASS, build BUILD_EXIT=0, all 10 verify runs ALL PASS; proven end to
-end by an Xbox One title boot past `CoreApplication::Run` into the
-title's view Initialize — see docs/WINRT-SHIM.md); optimizations
-items 1–9 done + verified (guest_opt 13/13 stages PASS, build 8
-BUILD_EXIT=0); RT mode selector done (software-rt guest 7/7 under off
-/ software / hardware-fallback); VirtualAlloc flag-translation fix
-done (era_virtualalloc PASS, proven by an Xbox One title boot);
-fixed-timestep physics decoupling done (guest_physics 7/7 stages PASS:
-physics at fixed 60 Hz while rendering at 30 and 120 FPS); phase 5
-done (ERA→GDK translation: era proof guest 20/20 stages PASS
-including ESRAM + DXGIXPresentArray). The source of truth is
-`src/hle_registry.cpp`; this file is the human-readable mirror.
+## Current state — 2026-11-24 ~16:42 EST (GitHub head `26c12f5`, boots through #82)
+
+**Progress: ~40% proven toward first menu, 45% when D1 closes (slot 6 is Submit and the overrun cause is proven — only the hash gate remains).** (Seth: "not near but from 35% to about 45%.")
+
+**Where the game gets to now:** the real `game_scarlett_master.exe` boots through init — COM wrapper works, 17 real DStorage queues created (boot #74), real streaming requests measured and served from `shaders.rpf` (boot 77: copied=4096 refused=0). **Slot 6 is Submit** (commit `26c12f5`, boot #82): the queue now submits at the guest's own cadence (batches of 474 and 1628, not only the 2048 auto-submit) — the behavioural confirmation. **Overrun cause PROVEN** (boot #82): the faulting stack resolved the memcpy caller and the crash registers gave the exact copy — size 0x409 to 0x27394690f20, only 0xE0 bytes from the uncommitted page at 0x27394691000. **Slot 4 still unnamed** — its argument is a genuinely live file object, so it is NOT a guest status array; its operation is TBD. **Boot #82 still running** (F: ~2.95 GB free — its dump will need archiving to D: once it finishes). **No frame presented yet** (boot #78's own segment: 0 presents). No PSO creation, no shaders translated, BCPack still E_NOTIMPL, mesh-as-compute still a CPU-only prototype.
+
+**D1 (real DStorage read) — nearly closed, commit `26c12f5` 2026-11-24 ~16:38 EST:**
+- Slot 6 = Submit (PROVEN, boot #82): bound to Submit, the queue submits at the guest's cadence (batches of 474 and 1628). DsfRelease fix in the same commit: freed file-object entries are now cleared, and an argument is only called a file object when its vtable word matches (the diagnostic had kept a freed pointer, so a recycled address could be mislabelled as live).
+- Overrun cause PROVEN (boot #82): size 0x409 to 0x27394690f20, 0xE0 from the uncommitted page at 0x27394691000.
+- Slot map captured (boots #79–#81): ONLY queue slots 4 and 6 are ever refused, five times each per boot, indices 1/2d/34/36/211. Guest call sites: 0x1400E8943 (slot 4, `call [rax+0x20]`) and 0x1400E8950 (slot 6, `call [rax+0x30]`); caller function 0x1400E88F0.
+- **Status-array premise DISPROVED:** 0x27afac23de0 is NOT a guest status array — it is the `fiDeviceDirectStorage` handle our own OpenFile returned (boot #81's log labels it). Slot 4 is NOT `EnqueueStatus(queue, statusArray, index)`; boot #82 confirms slot 4's argument is genuinely live. EnqueueStatus was correctly NOT implemented on the false premise.
+- Hash resolved exactly: `ACA58068328F107A` → `shaders.rpf` (0x1889f9f0 = 411,695,600 byte-for-byte; plus zlib 0x78da → 65536 for 4096 consecutive offsets).
+- Log rotation fixed: `src/verify.cpp:62` unconditionally overwrote `SCARLETT_LOG_PATH` (why 970 runs piled into one 4.4 GB file); now only sets a default when none is inherited. Per-boot logs (`scarlett_boot80.log`, `scarlett_boot81.log`), file logging capped at 192 MiB, poll-line cap in.
+- Gates: build.bat 0, era 21/21, ft 7/7, verify 0, probes 3/1/3. F: 8.2 GB free after boot #81's archive; ~2.95 GB free while boot #82 runs; boot #80/#81 dumps complete and archived on D:.
+
+**Next:** (1) name slot 4 from code (0x1400E88F0 disassembly) and implement it; (2) the hash gate in Submit (currently ANY hash reads shaders.rpf).
+
+**Plan:** Step 0 reclaim F:, Step 1 D1, Step 2 PSO slots 86/16, Step 3 shaders → first triangle, Step 4 BCPack, Step 5 mesh-as-compute, Step 6 first frame → menu. Presentation contract: black screen unless the title itself is loading, 720p windowed 1280x720, never fullscreen.
+
+**Boot journey (summary):** #1–#5 loader + early-init crashes → #6–#12 TLS + DStorage factory fixes → #13–#28 pack filesystem → #29–#41 device/queues/allocators/lists, frame pacing → #48 descriptor-heap assert → #50–#54 slot 127 + 2 MB arena check → #55–#59 arena dispatcher (Model A, kind 0x808000) → #60 slot 74 RegisterPagePoolX + texture computer → #61–#63 slot 25 sizing + [ctx+0x18] null → #64–#72 watchpoint (field never written) → #73–#74 DStorage queues (17) + hash→shaders.rpf → #75–#78 spin + overrun → #79–#81 slot map (4/6) + rotation + status-array disproof → #82 slot 6 = Submit + overrun cause proven (0x409, 0xE0 from page).
+
+The per-function tables below are the implementation mirror (source of truth: `src/hle_registry.cpp`). Rows dated 2026-11-23 and earlier are history; the current state is the section above.
 
 ## Loader
 
@@ -63,9 +54,9 @@ including ESRAM + DXGIXPresentArray). The source of truth is
 | `xmem.dll` | `XMemAllocatePhysicalPages` / `XMemFreePhysicalPages` | stub | Real-exe: S_OK; no desktop physical-page pool |
 | `xmem.dll` | `XMemMapPhysicalPages` / `XMemMapPhysicalPagesScatter` | implemented | Real-exe: ordinary committed memory returned as the mapped VA (guarded size 64 KB–256 MB; signature ASSUMED, GDKX-gated) |
 | `xmem.dll` | `XMemTransferMemory` | implemented | Real-exe: `memcpy(dst, src, size)` |
-| `XCRDAPI.dll` | `DStorageGetFactory` | stub | Real-exe: the exe uses XCRDAPI.dll (not dstorage_xs.dll) for this; same dummy-factory stub |
+| `XCRDAPI.dll` | `DStorageGetFactory` | implemented | Real factory object; slot 10 CreateQueue returns real queue objects (17 created in boot #74); slot 5 OpenFile returns a real refcounted file object ("fiDeviceDirectStorage"); slot 3 poll returns FALSE (no data delivered yet — the completion contract is the current blocker). Slot 10 was E_NOTIMPL before build 90. |
 | `chad.dll` | `XDspActivate` / `XDspConnectWithMaximumStreamLimit` / `XDspDeactivate` / `XDspDisconnect` / `XDspSubmitCommand` | stub | Real-exe: S_OK stubs (Xbox audio DSP; signatures GDKX-gated) |
-| `xg_xs.dll` | `XGCreateTextureComputer` / `XGSuggestSwizzleMode` | stub | Real-exe: S_OK stubs (Scarlett texture tiling — the real `xg_xs`, not ERA `xg_x`; signatures GDKX-gated) |
+| `xg_xs.dll` | `XGCreateTextureComputer` / `XGSuggestSwizzleMode` | implemented | Real object (src/xg_texture.cpp): vtable + refcount + descriptor copy + per-subresource layout; slot 8 ran a real linear→tiled copy in boot #62; XGSuggestSwizzleMode returns a descriptor-consistent mode. In-tile texel order is the project's Morton model, unverified vs GDK tables. |
 | `XboxBvhBuilder.dll` | Ctor / dtor / `BuildRaytracingAccelerationStructureBatched2X` / `CopyRaytracingAccelerationStructure` / `GetRaytracingAccelerationStructurePrebuildInfo` / `RehydrateRaytracingAccelerationStructureBatched2X` / `Set64BitMortonCodes` | stub | Real-exe: C++ methods (mangled names; return types read off the mangling: void except Rehydrate = HRESULT → S_OK). No RT at boot |
 | `amd_fidelityfx_loader_xbox.dll` | `ffxCreateContext` / `ffxDestroyContext` / `ffxDispatch` / `ffxQuery` | stub | Real-exe: return 0 (`FFX_OK`); FSR loader |
 | `libHttpClient.GDK.dll` | 38 `HC*` / `HCHttpCall*` functions | stub | Real-exe: S_OK stubs (HTTP client; the game does no HTTP at boot) |
@@ -109,7 +100,7 @@ including ESRAM + DXGIXPresentArray). The source of truth is
 | `dstorage_xs.dll` | `DStorageGetFactory` | stub | Ordinal 1 (synthetic) |
 | `XAudio2_9.dll` | `XAudio2Create` | stub | XMA2 decode 0% everywhere |
 | `gameinput.dll` | `GameInputCreate` | stub | — |
-| `dstorage_xs.dll` | `DStorageGetFactory` | stub | No queues/files yet |
+| `dstorage_xs.dll` | `DStorageGetFactory` | implemented | Real queues now (17 in boot #74); Submit reads from shaders.rpf and inflates (boot 77: copied=4096 refused=0). Queue slots 4 and 6 are the only ones still refused — see Current state. |
 
 ## Areas tracked but not yet in the registry
 
@@ -138,6 +129,7 @@ exactness is unverified until real Xbox tiled data lands).
 
 | Check | Result | When |
 |---|---|---|
+| **Real title boot — current (boots #6–#81)** | **Game boots through init; current wall is the DStorage completion contract + a guest memcpy overrun** — COM wrapper works (device, queues, fences, allocators, lists, 30 Hz pacing); slot 127 Model A dispatch proven; slot 74 RegisterPagePoolX (64K pages, 6.5 GB region); slot 25 layout-aware sizing; real XG texture computer (slot 8 copy, boot #62); 17 real DStorage queues (boot #74); hash ACA58068328F107A → shaders.rpf exact; slot map (boots #79–#81): only queue slots 4 and 6 refused. Boots #76–#81 crash identically at `VCRUNTIME140.dll+0x123bf` (guest memcpy write overrun, page boundary; boot #81 params[1]=0x27394691000). No frame presented yet. Gates green: build.bat 0, era 21/21, ft 7/7, verify 0, probes 3/1/3. Boot #80/#81 dumps complete and archived on D:; F: 8.2 GB free. | 2026-11-24 ~16:30 EST (boots #79–#81) |
 | Synthetic guest boots through loader | **PASS** — 12/12 subsystems (loader + 11 guest incl. new `frame_xs`); real desktop D3D12 device + queue + clear + fence OK on RX 5700 XT at FL 11_0; child exit 0; `scarlett_verify` verdict ALL PASS | 2026-11-22 ~22:05 EST (phase 2, milestone A) |
 | Ordinal imports resolve | **PASS** — `guest_ordinal` (imports `XGameRuntimeInitialize` #1, `XMemAlloc` #1, `XMemFree` #2 by ordinal): loader logs `ordinal xgameruntime.dll:#1 -> XGameRuntimeInitialize` etc., 57 imports resolved 0 failed, child exit 0, verdict ALL PASS. Ordinals are **synthetic** (layer-assigned, .def order); real Xbox ordinals must be confirmed from the exe. Harness fix: `load_report.txt` is now written next to the guest, not next to the harness exe | 2026-11-22 ~22:40 EST (phase 2, milestone B) |
 | Per-section page protections | **PASS** — loader logs `protect .text -> 0x20`, `.rdata -> 0x02`, `.data -> 0x04`, `.pdata/.xbld/.reloc -> 0x02`; guest VirtualQuery confirms `text=0x20 rdata=0x2 data=0x4`; both guests still ALL PASS (imports/relocations write before protections are applied) | 2026-11-22 ~22:50 EST (phase 2, milestone C) |
@@ -162,16 +154,8 @@ exactness is unverified until real Xbox tiled data lands).
 | **Real Xbox Series X title boot** (`D:\game\game\game_scarlett_master.exe`) | **LOADER PASS, title crashed in its own early init** — boot #1 (10:43 EST) + boot #2 (10:52 EST, after the AcpHal ERA fix) are identical: loader PASS, 68 modules, **587/587 imports resolved, 0 failed**; `.xbld` GXDK April 2026 Update 5; TLS index 8, 2 callbacks; `D3D12ConfigureVirtualMemoryX` → S_OK; 7 `XMemVirtualAlloc` arenas all OK. Then "guest crashed in entry: exception 0xc0000005", child exit 0x80000003, minidump EXCEPTION_BREAKPOINT at game offset 0x22106e0 — an `int3` padding byte right after the vtable-jump thunk (a virtual-method call into padding). **Boot #3 (11:24 EST, exe moved into the full game-data folder) crashed identically — the missing-game-data hypothesis is DEAD; the crash is during static/global init, before main, before any file I/O.** Diagnosis (local boot-diagnosis notes, boot #3): virtual call to vtable slot 6 of a global memory-pool singleton (vtable 0x1465f5420, object 0x1471be660); slot 6 = 0x1422106e0 (`cc c3`, deliberate unimplemented-method trap); slot 0 returns NULL (capacity [object+0x1240] never written, 0 in BSS) and flag [object+0x18] is unconditionally 1. **Boot #4 (11:44 EST): loader-side vtable patch applied (`ApplyScarlettVtablePatch` in `src/pe_loader.cpp` — slot 6 → base stub 0x140004810, fingerprint-gated, build 8 all 10 verify runs ALL PASS, era 21/21) and the fault MOVED to a new address: EXCEPTION_BREAKPOINT at 0x142219650 — an `int3` inside F itself (0x2219620, right after the slot-6 call). F is a noreturn path by design, so slot 6 returning is fatal inside F; the boot #3 claim that "the caller ignores slot 6's return" was wrong about F. Next: neutralize F's `int3` (1-byte patch, RVA 0x2219650, `0xcc` → `0x90`) and/or seed the allocator so slot 0 finds a block (H1). Full write-up in the local boot-diagnosis notes (boot #4). **Boot #5 (11:59 EST): F int3 NOP applied (`ApplyScarlettVtablePatch` — `0xcc` → `0x90` at RVA `0x2219650`, fingerprint-gated, build 9 all 10 verify runs ALL PASS, era 21/21) and the fault MOVED again, changing kind: `guest crashed in entry: exception 0xc0000005` (access violation, not a breakpoint), child exit TIMEOUT, verdict FAIL. F now unlocks and returns, the guard returns NULL, and the caller `0x1cf0d60` feeds the first NULL block to `memset` (`VCRUNTIME140.dll!memset`) with no NULL check — the proven mechanism for the crash. Slot 0 must return a real block; next work is H1 (find the registration path that writes `[object+0x1240]` / the free list). Caveat: boot #5 produced NO minidump, so the exact fault address is unproven. Full write-up in the local boot-diagnosis notes (boot #5). **No `D3D12XboxCreateDevice` call in any boot — the title dies before device creation, so the Xbox IID mapping is still unproven against the real exe.** Logs `F:\ScarlettCompat\boot1.log`–`boot5.log`, dumps in the local boot-diagnosis notes (boots #1/#3/#4; no boot #5 dump) | 2026-11-23 ~11:59 EST (real-exe boot #5) |
 | Real title exe import table | **DONE — 587 imports, 68 modules, 586 by name + 1 ordinal (GameInput.dll #1)**; true `D3D12XboxCreateDevice` = 4-arg GDK form (params struct, Version 0x20004); requested IID {5405C344-...} is NOT desktop IID_ID3D12Device — layer retries with desktop IID on E_NOINTERFACE | 2026-11-23 ~09:23 CST (RE) / ~10:43 EST (boot #1) |
 
-## Blocked on the exe
+## Blocked on the exe — what is still open (2026-11-24)
 
-Exact import list; GDK/GDKX version; boot call order + first fatal
-dependency; shader inventory used at boot; `MEM_GRAPHICS` usage pattern;
-storage access pattern (DirectStorage queues, BCPack/GDeflate); threading
-model; runtime integrity checks (XCI / package-hash validation).
+Resolved since this section was written: boot call order + first fatal dependency (mapped through boot #81); storage access pattern (DirectStorage queues real, hash→RPF resolved, Submit inflates from shaders.rpf); COM wrapper for real titles (works — device, queues, fences, allocators, lists); the allocator guard / F int3 wall (cleared in boots #3–#5).
 
-Note: the blockers above are for the **real Xbox Series X title exe**, which HAS
-landed and booted 4 times (loader PASS every time; the title dies in static
-init — current wall is the allocator guard / F int3, see the real-title boot
-row above). Remaining exe-dependent work: seed the allocator so slot 0
-finds a block (H1) and/or neutralize F's int3; shader lifting; DirectStorage
-queues; de-tiling; unified memory; COM wrapper for real titles.
+Still open: name queue slots 4 and 6 from code (disassemble 0x1400E88F0) and implement them; prove the VCRUNTIME140 memcpy overrun's cause (walk boot #81's dump); shader inventory used at boot + shader lifting (DXIL route, PSO-time capture not started); `MEM_GRAPHICS` usage pattern; BCPack decode (B1 spec written, not implemented); exact Xbox tiled-texture bit layout (Morton model unverified vs GDK tables); mesh-as-compute (CPU-only prototype); threading model details; runtime integrity checks (XCI / package-hash validation); GDK/GDKX version pinning.

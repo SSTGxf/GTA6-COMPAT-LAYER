@@ -196,7 +196,38 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-23 (WinRT CoreApplication shim built — proof guest RC8; optimizations items 1–9 verified 13/13; RT mode selector; VirtualAlloc flag-translation fix — proven by an Xbox One title boot; fixed-timestep 7/7; phase 5 complete: ERA→GDK translation + ESRAM)
+## Status — 2026-11-24 (boots through #82, GitHub head `26c12f5`)
+
+**Progress: ~40% proven toward first menu, 45% when D1 closes (slot 6 is Submit and the overrun cause is proven — only the hash gate remains).** (Seth: "not near but from 35% to about 45%.")
+
+| Milestone | Status | Evidence |
+|---|---|---|
+| Loader: real exe, 587/587 imports | ✅ | Boots #1–#2, loader PASS, 0 failed |
+| TLS: approach (B) patch+view | ✅ | Boot #8, 53,246 sites patched |
+| DStorage factory (2-arg) | ✅ | Boot #12 |
+| Pack filesystem init | ✅ | Boots #13–#28 |
+| COM wrapper: device, queues, fences | ✅ | Boot #30, 5 queues S_OK |
+| Frame pacing (30 Hz) | ✅ | Boots #35–#38 |
+| Slot 127: CreateCommittedResource3 (Model A) | ✅ | Boots #57–#59, drain check passed |
+| Slot 74: RegisterPagePoolX (64K pages) | ✅ | Boot #60, 6.5 GB region |
+| Slot 25: layout-aware sizing | ✅ | Boot #62, layout 257 → 65536/65536 |
+| XG texture computer (slot 8 real copy) | ✅ | Boot #62, linear→tiled copy |
+| DStorage: 17 real queues | ✅ | Boot #74 |
+| Hash → shaders.rpf (exact) | ✅ | 0x1889f9f0 = 411,695,600 + zlib proof |
+| Submit inflates from shaders.rpf | ✅ | Boot 77: copied=4096 refused=0 |
+| Slot map: only slots 4 and 6 refused | ✅ | Boots #79–#81, 5× each |
+| Slot 6 = Submit (named + implemented) | ✅ | Boot #82, guest-cadence batches 474/1628 |
+| Guest memcpy overrun cause proven | ✅ | Boot #82, copy 0x409, 0xE0 from uncommitted page |
+| Log rotation + caps | ✅ | Boots #80–#81, per-boot logs |
+| Slot 4 named + implemented | ❌ | Not a status array — live file object, operation TBD |
+| Hash gate in Submit | ❌ | After slots 4/6 + overrun |
+| PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
+| Shader capture / translation | ❌ | Not started |
+| First frame / menu on screen | ❌ | 0 presents (boot #78 segment) |
+| BCPack decode | ❌ | B1 spec written, not implemented |
+| Mesh-as-compute | ❌ | CPU-only prototype |
+
+Full per-function status: `docs/STATUS.md` (current state at the top, boots through #82).
 
 **What works now (verified on the build machine, all eight harness guests
 ALL PASS):**
