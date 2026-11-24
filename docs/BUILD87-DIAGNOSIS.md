@@ -275,11 +275,20 @@ $ git check-ignore -v src/xg_texture.cpp  -> (no output, rc=1: not ignored)
 $ ls src | wc -l  -> 21      $ git ls-files src | wc -l -> 20
 ```
 
+The same check found one more build input in the same state:
+`include/xg_texture.h` (18 headers, 17 tracked) is `#include`d by both
+`src/xg_texture.cpp` and `src/hle_registry.cpp`, so it participates in the
+build too.
+
 So the green binaries were not reproducible from the commit: one compiled
-source existed only on disk. It is now committed as it stood — the dead
-slot-10 experiment is not in it (`grep -c 'VtblCreateSubmitBackend'` → 0)
-and its content hash equals the file the green build used. Commit
-`934017b` adds it, source only.
+source and one header it needs existed only on disk. Both are now
+committed as they stood — the dead slot-10 experiment is not in the
+source (`grep -c 'VtblCreateSubmitBackend'` → 0) and its content hash
+equals the file the green build used. Commit `934017b` adds the source;
+the header follows in the note commit, source only. Every untracked file
+left in the tree is a boot script (`build_ga*.bat`), a doc, or a dump —
+none is invoked by `build.bat`, and `defs/` (14/14) and all other
+includes are tracked.
 
 **The two trees had also drifted.** Comparing them for this check found
 `F:\ScarlettCompat` carrying source differences that were never committed
