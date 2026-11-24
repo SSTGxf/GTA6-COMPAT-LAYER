@@ -59,8 +59,18 @@ const uint32_t kMaxSlices = 16;
 const uint32_t kSlotCopy = 8;
 const uint32_t kVtableSlots = 16;
 const uint64_t kTileBytes = 65536;
-// The single tile mode this layer implements, written as 0x100|mode.
+// Tile modes are written as 0x100|mode.
+//   mode 1: this layer's established 64 KiB 2D tile (the table below).
+//   mode 5: the guest's own tag for dimension 4 (TEXTURE3D). At 0x1403440F6
+//           it does `cmp r14d,4 / jne / cmp [rdi+0x2c],0 / jne /
+//           mov dword [rdi+0x2c],0x105`, and the allocation path it feeds at
+//           0x14034414D requires Alignment == 0x1000 before using the
+//           result directly. So a 4 KiB tile is what the guest itself
+//           expects for this mode; the geometry keeps the mode-1 aspect
+//           ratios at a quarter of each dimension (4 bpp -> 32x32).
+const uint64_t kTileBytesMode5 = 4096;
 const uint32_t kOwnTileMode = 1;
+const uint32_t kGuest3DTileMode = 5;
 const uint32_t kLayoutConsoleBit = 0x100;
 
 struct Layout {
@@ -107,15 +117,31 @@ static bool Readable(const void* p, uint64_t n) { return ProbedSpan(p, n, false)
 
 // ---- layout --------------------------------------------------------------
 
-static bool TileGeometry(uint32_t bpe, uint32_t* tileW, uint32_t* tileH) {
-    switch (bpe) {
-    case 1: *tileW = 256; *tileH = 256; return true;
-    case 2: *tileW = 256; *tileH = 128; return true;
-    case 4: *tileW = 128; *tileH = 128; return true;
-    case 8: *tileW = 128; *tileH = 64; return true;
-    case 16: *tileW = 64; *tileH = 64; return true;
-    default: return false;
+static bool TileGeometry(uint32_t bpe, uint32_t mode, uint32_t* tileW,
+                         uint32_t* tileH, uint64_t* tileBytes) {
+    if (mode == kOwnTileMode) {
+        *tileBytes = kTileBytes;
+        switch (bpe) {
+        case 1: *tileW = 256; *tileH = 256; return true;
+        case 2: *tileW = 256; *tileH = 128; return true;
+        case 4: *tileW = 128; *tileH = 128; return true;
+        case 8: *tileW = 128; *tileH = 64; return true;
+        case 16: *tileW = 64; *tileH = 64; return true;
+        default: return false;
+        }
     }
+    if (mode == kGuest3DTileMode) {
+        *tileBytes = kTileBytesMode5;
+        switch (bpe) {
+        case 1: *tileW = 64; *tileH = 64; return true;   // 4096 texels x 1
+        case 2: *tileW = 64; *tileH = 32; return true;   // 2048 x 2
+        case 4: *tileW = 32; *tileH = 32; return true;   // 1024 x 4
+        case 8: *tileW = 32; *tileH = 16; return true;   // 512 x 8
+        case 16: *tileW = 16; *tileH = 16; return true;  // 256 x 16
+        default: return false;
+        }
+    }
+    return false;
 }
 
 static uint32_t CeilDiv(uint32_t a, uint32_t b) { return b ? (a + b - 1) / b : 0; }
@@ -123,9 +149,10 @@ static uint32_t CeilDiv(uint32_t a, uint32_t b) { return b ? (a + b - 1) / b : 0
 static bool ValidLayout(uint32_t layout) {
     if (layout == 0) return true;                    // linear
     if ((layout & kLayoutConsoleBit) == 0) return false;
-    // Only the mode this layer implements is modelled; any other mode is a
+    // Only the modes this layer models are accepted; any other mode is a
     // clean rejection rather than an invented size.
-    return (layout & ~kLayoutConsoleBit) == kOwnTileMode;
+    const uint32_t mode = layout & ~kLayoutConsoleBit;
+    return mode == kOwnTileMode || mode == kGuest3DTileMode;
 }
 
 // Build the layout for a descriptor. Fills *out completely in every case.
@@ -137,8 +164,32 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
         out->status = SC_XG_UNSUPPORTED_LAYOUT;
         return;
     }
-    if (d.dimension != 3) {  // 2 = buffer, 4 = texture3D (not modelled here)
+    // 3 = TEXTURE2D, 4 = TEXTURE3D. The guest tags 3D textures with mode 5
+    // (see TileGeometry), so only that pairing is modelled here; anything
+    // else is a clean rejection.
+    // layout 0 is linear: the layer sizes it with its established 64 KiB
+    // model (that is how XGSuggestSwizzleMode picks a tile mode), so it is
+    // exempt from the mode/dimension pairing checks below.
+    const bool linear = d.layout == 0;
+    const uint32_t mode =
+        linear ? kOwnTileMode : (d.layout & ~kLayoutConsoleBit);
+    const bool is3D = d.dimension == 4;
+    if (d.dimension != 3 && !is3D) {
         out->status = SC_XG_BAD_DIMS;
+        return;
+    }
+    if (!linear && is3D && mode != kGuest3DTileMode) {
+        out->status = SC_XG_UNSUPPORTED_LAYOUT;
+        return;
+    }
+    if (!linear && !is3D && mode != kOwnTileMode) {
+        out->status = SC_XG_UNSUPPORTED_LAYOUT;
+        return;
+    }
+    if (!linear && is3D && d.depthOrArray != 1) {
+        // 3D swizzling across more than one slice is not something this
+        // layer has evidence for; refuse instead of tiling slices wrongly.
+        out->status = SC_XG_UNSUPPORTED_LAYOUT;
         return;
     }
     if (d.width == 0 || d.width > (1ull << 31) || d.height == 0 ||
@@ -150,7 +201,8 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
 
     uint32_t bpe = ScXg_BytesPerTexel(d.format);
     uint32_t tileW = 0, tileH = 0;
-    if (bpe == 0 || !TileGeometry(bpe, &tileW, &tileH)) {
+    uint64_t tileBytes = 0;
+    if (bpe == 0 || !TileGeometry(bpe, mode, &tileW, &tileH, &tileBytes)) {
         out->status = SC_XG_UNSUPPORTED_FORMAT;
         return;
     }
@@ -160,7 +212,7 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
     out->tileH = tileH;
     out->mipLevels = d.mips;
     out->slices = d.depthOrArray;
-    out->baseAlign = kTileBytes;
+    out->baseAlign = tileBytes;
 
     uint64_t offset = 0, packed = 0, tiles = 0;
     uint32_t count = 0;
@@ -172,7 +224,7 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
         uint64_t rowPitch = (uint64_t)w * bpe;
         uint64_t slicePitch = rowPitch * h;
         uint64_t slabTiles = (uint64_t)CeilDiv(w, tileW) * CeilDiv(h, tileH);
-        uint64_t slab = slabTiles * kTileBytes;
+        uint64_t slab = slabTiles * tileBytes;
         if (slab == 0 || slabTiles > (1ull << 32)) {
             out->status = SC_XG_OVERFLOW;
             return;
@@ -538,11 +590,19 @@ extern "C" HRESULT WINAPI XGSuggestSwizzleMode(const void* pDesc, uint32_t flags
                 pOutLayout);
             return E_INVALIDARG;
         }
-        *pOutLayout = kLayoutConsoleBit | kOwnTileMode;
+        // 3D descriptors get the guest's own 3D mode (0x105), the same tag
+        // the game writes at 0x1403440F6; 2D keeps this layer's mode 1.
+        *pOutLayout = (desc.dimension == 4)
+                          ? (kLayoutConsoleBit | kGuest3DTileMode)
+                          : (kLayoutConsoleBit | kOwnTileMode);
     }
     Log("xgxs",
-        "XGSuggestSwizzleMode(desc %llux%u bpe %u, flags %u) -> S_OK layout 0x%x (this layer's 64 KiB model, tile %ux%u)",
-        (unsigned long long)desc.width, desc.height, lay.bpe, flags,
-        kLayoutConsoleBit | kOwnTileMode, lay.tileW, lay.tileH);
+        "XGSuggestSwizzleMode(desc dim %u %llux%u bpe %u, flags %u) -> S_OK "
+        "layout 0x%x (tile %ux%u, %llu bytes)",
+        desc.dimension, (unsigned long long)desc.width, desc.height, lay.bpe,
+        flags,
+        (desc.dimension == 4) ? (kLayoutConsoleBit | kGuest3DTileMode)
+                              : (kLayoutConsoleBit | kOwnTileMode),
+        lay.tileW, lay.tileH, (unsigned long long)lay.baseAlign);
     return S_OK;
 }
