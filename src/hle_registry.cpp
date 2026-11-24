@@ -9,10 +9,12 @@
 #include "software_rt.h"  // Software ray tracing backend
 #include "fixed_timestep.h"  // Fixed-timestep physics decoupling
 #include "xbox_shims.h"
+#include "xg_texture.h"  // xg_xs texture computer (build 80, real object)
 #include <mmsystem.h>  // timeBeginPeriod (frame pacing, phase 3)
 #include <dxgi.h>  // IDXGIDevice / IDXGIAdapter (device QI forwarding)
 #include <string.h>
 #include <vector>
+#include <utility>   // std::index_sequence (per-slot unimplemented stubs, build 82)
 #include <intrin.h>  // _ReturnAddress (COM wrapper unimplemented-slot log)
 
 namespace sc {
@@ -453,6 +455,9 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
 //            IID_ID3D12CommandQueue, out)
 //     73     CreateCommandList (16-byte desc, first word = type,
 //            allocator, pso, riid = console list IID, out)
+//     74     RegisterPagePoolX (va, pages, out-index) — page-pool
+//            registration lifecycle, no dedupe (boot #60, GPT #10)
+//     75     UnregisterPagePoolX (index) — invalidates it (boot #60)
 //     133    CreatePlacedResourceX (va, desc, state, clear, riid, out)
 //   The table is 192 slots (longer than the title's highest slot — a
 // shorter table leaves a null pointer, not E_NOTIMPL). Slots not yet
@@ -562,21 +567,36 @@ static ULONG WINAPI XboxDevice_Release(XboxDeviceWrapper* self) {
     return (ULONG)rc;
 }
 
-// Generic stub for Xbox device slots not yet implemented. Logs the
-// caller's return address so the game call site (and the slot, from
-// the `call [rax+N]` offset at that site) can be identified. Returns
-// E_NOTIMPL. NOTE: this is only correct for HRESULT-returning
-// methods; a pointer/struct-returning method that hits this stub will
-// get a bogus value — but the log line names the site, so the slot
-// can then be implemented properly.
-static HRESULT WINAPI XboxDevice_Unimplemented(XboxDeviceWrapper* self) {
+// Build 82: per-slot stub for Xbox device slots not yet implemented.
+// Before this, every unimplemented slot shared one function that could
+// only log the caller, so identifying the method meant disassembling the
+// call site by hand — and an indirect call through a saved vtable pointer
+// left even that ambiguous. Each slot now has its own instantiation, so
+// the log names the slot and its vtable byte offset outright, together
+// with the register arguments. That is what makes "which missing slot is
+// supposed to produce this object" answerable from a boot log.
+//
+// NOTE: still only correct for HRESULT-returning methods; a pointer or
+// struct-returning method that lands here gets E_NOTIMPL as its "pointer".
+// The log line is what makes the slot identifiable, then implementable.
+template <int Slot>
+static HRESULT WINAPI XboxDevice_SlotUnimplemented(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
     (void)self;
-    void* retAddr = _ReturnAddress();
-    Log("xboxdev",
-        "UNIMPLEMENTED Xbox device slot called from game %p -> "
-        "E_NOTIMPL (identify the slot from the call site, then "
-        "implement it)",
-        retAddr);
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    // First few calls in full (that is where a missing output object shows
+    // up), then a periodic reminder so a hot slot cannot drown the log.
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "UNIMPLEMENTED slot %d (vtable +0x%x) from game %p args=%llx %llx "
+            "%llx %llx %llx %llx (call #%ld) -> E_NOTIMPL",
+            Slot, Slot * 8, _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n);
+    }
     return E_NOTIMPL;
 }
 
@@ -687,35 +707,69 @@ static void WINAPI XboxDevice_CreateUnorderedAccessView(
 // E_NOTIMPL stub never fills the struct, so the game int3s on stack
 // garbage (boot #49). Forwards to the real device and copies the
 // result into the game's return buffer.
+// Build 81: status text for the one structured slot-25 record.
+static const char* ScXgStatusText(uint32_t status) {
+    switch (status) {
+    case SC_XG_OK: return "SUCCESS";
+    case SC_XG_BAD_DESC: return "bad-descriptor";
+    case SC_XG_BAD_DIMS: return "invalid-dims";
+    case SC_XG_UNSUPPORTED_LAYOUT: return "unsupported-mode";
+    case SC_XG_UNSUPPORTED_FORMAT: return "unsupported-format";
+    case SC_XG_OVERFLOW: return "overflow";
+    case SC_XG_TOO_MANY_SUBRESOURCES: return "too-many-subresources";
+    default: return "unknown";
+    }
+}
+
+// One structured record per slot-25 call (build 81).
+static void LogAllocInfo(const D3D12_RESOURCE_DESC* d, UINT sanitizedFlags,
+                         const ScXgLayoutInfo* lay, const char* path,
+                         const D3D12_RESOURCE_ALLOCATION_INFO* res) {
+    char subs[192];
+    subs[0] = 0;
+    if (lay && lay->subCount) {
+        int n = 0;
+        UINT shown = lay->subCount < 8 ? lay->subCount : 8;
+        for (UINT i = 0; i < shown; ++i) {
+            int w = snprintf(subs + n, sizeof subs - (size_t)n, "%s%llu+%llu",
+                             i ? "," : "",
+                             (unsigned long long)lay->subOffset[i],
+                             (unsigned long long)lay->subBytes[i]);
+            if (w <= 0 || (size_t)(n + w) >= sizeof subs) break;
+            n += w;
+        }
+        if (lay->subCount > shown && (size_t)n + 8 < sizeof subs)
+            snprintf(subs + n, sizeof subs - (size_t)n, ",...(%u)",
+                     lay->subCount - shown);
+    }
+    if (!d) {
+        Log("xboxdev", "alloc-info: desc=NULL path=%s size=%llu align=%llu status=bad-descriptor",
+            path, (unsigned long long)(res ? res->SizeInBytes : 0),
+            (unsigned long long)(res ? res->Alignment : 0));
+        return;
+    }
+    Log("xboxdev",
+        "alloc-info: layout=%u dim=%u %llux%u depth=%u mips=%u fmt=%u "
+        "flags=0x%x sanitized=0x%x bpe=%u tile=%ux%u tiles=%u subs=[%s] "
+        "packed=%llu size=%llu align=%llu path=%s status=%s",
+        (unsigned)d->Layout, (unsigned)d->Dimension,
+        (unsigned long long)d->Width, (unsigned)d->Height,
+        (unsigned)d->DepthOrArraySize, (unsigned)d->MipLevels,
+        (unsigned)d->Format, (unsigned)d->Flags, sanitizedFlags,
+        lay ? lay->bpe : 0, lay ? lay->tileW : 0, lay ? lay->tileH : 0,
+        lay ? lay->tileCount : 0, subs,
+        lay ? (unsigned long long)lay->packedBytes : 0ull,
+        (unsigned long long)(res ? res->SizeInBytes : 0),
+        (unsigned long long)(res ? res->Alignment : 0), path,
+        lay ? ScXgStatusText(lay->status) : "not-computed");
+}
+
 static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI
 XboxDevice_GetResourceAllocationInfo(
     D3D12_RESOURCE_ALLOCATION_INFO* retBuf, XboxDeviceWrapper* self,
     UINT visibleMask, UINT numResourceDescs,
     const D3D12_RESOURCE_DESC* pResourceDescs) {
     if (!retBuf || !self || !self->real) return retBuf;
-    // Diagnostic (boot #50): the desktop method returns
-    // SizeInBytes=UINT64_MAX for the game's desc, so the game int3s.
-    // Dump the desc fields (desktop layout) to see which field the
-    // desktop method rejects — the Xbox desc layout may differ.
-    if (pResourceDescs) {
-        Log("xboxdev",
-            "GetResourceAllocationInfo desc: dim=%u align=%llu "
-            "w=%llu h=%u depth=%u mips=%u fmt=%u sample=%u/%u "
-            "layout=%u flags=0x%x",
-            (unsigned)pResourceDescs->Dimension,
-            (unsigned long long)pResourceDescs->Alignment,
-            (unsigned long long)pResourceDescs->Width,
-            (unsigned)pResourceDescs->Height,
-            (unsigned)pResourceDescs->DepthOrArraySize,
-            (unsigned)pResourceDescs->MipLevels,
-            (unsigned)pResourceDescs->Format,
-            (unsigned)pResourceDescs->SampleDesc.Count,
-            (unsigned)pResourceDescs->SampleDesc.Quality,
-            (unsigned)pResourceDescs->Layout,
-            (unsigned)pResourceDescs->Flags);
-    } else {
-        Log("xboxdev", "GetResourceAllocationInfo desc: NULL");
-    }
     // Boot #51: the game's desc is a 3840x2160 R8G8B8A8 render target
     // (dim=3, fmt=28) but Flags=0x300005 carries Xbox-specific bits
     // (0x300000) the desktop method rejects — it returns
@@ -728,25 +782,55 @@ XboxDevice_GetResourceAllocationInfo(
     // 3840x2160x1 shape once the flags are valid).
     D3D12_RESOURCE_DESC cleanDesc;
     const D3D12_RESOURCE_DESC* useDesc = pResourceDescs;
+    UINT sanitizedFlags = pResourceDescs ? (UINT)pResourceDescs->Flags : 0;
     if (pResourceDescs) {
         cleanDesc = *pResourceDescs;
         cleanDesc.Flags = (D3D12_RESOURCE_FLAGS)(
             (UINT)cleanDesc.Flags & 0x7F);
         useDesc = &cleanDesc;
-        Log("xboxdev",
-            "GetResourceAllocationInfo: sanitized flags 0x%x -> 0x%x",
-            (unsigned)pResourceDescs->Flags, (unsigned)cleanDesc.Flags);
+        sanitizedFlags = (UINT)cleanDesc.Flags;
     }
+
+    // ---- build 81: console-layout dispatch ----------------------------
+    // layout 0 (linear) keeps the existing forward to the desktop device
+    // untouched. A console layout (0x100|mode) is sized by the SAME layout
+    // engine the texture computer's copy uses (ScXg_ComputeLayout), so a
+    // tiled allocation can never be sized by different arithmetic than the
+    // one that writes it. Anything the engine cannot model fails cleanly:
+    // UINT64_MAX + a logged reason, never the linear size standing in for a
+    // tiled one.
+    if (pResourceDescs && (UINT)pResourceDescs->Layout != 0) {
+        ScXgLayoutInfo lay;
+        HRESULT hr = E_INVALIDARG;
+        if (numResourceDescs != 1) {
+            memset(&lay, 0, sizeof lay);
+            lay.status = SC_XG_BAD_DESC;  // one desc at a time; refuse cleanly
+            Log("xboxdev",
+                "alloc-info: console layout %u with numDescs=%u (only 1 supported) -> fail cleanly",
+                (unsigned)pResourceDescs->Layout, numResourceDescs);
+        } else {
+            hr = ScXg_ComputeLayout(pResourceDescs, &lay);
+        }
+        if (numResourceDescs == 1 && SUCCEEDED(hr)) {
+            retBuf->SizeInBytes = lay.totalBytes;
+            retBuf->Alignment = lay.baseAlign;
+            LogAllocInfo(pResourceDescs, sanitizedFlags, &lay, "tiled", retBuf);
+            return retBuf;
+        }
+        retBuf->SizeInBytes = UINT64_MAX;
+        retBuf->Alignment = 0;
+        LogAllocInfo(pResourceDescs, sanitizedFlags, &lay, "tiled-rejected",
+                     retBuf);
+        Log("xboxdev",
+            "alloc-info: layout %u cannot be sized by this layer (%s) -> UINT64_MAX (no linear substitute)",
+            (unsigned)pResourceDescs->Layout, ScXgStatusText(lay.status));
+        return retBuf;
+    }
+
     *retBuf = self->real->GetResourceAllocationInfo(
         visibleMask, numResourceDescs, useDesc);
-    Log("xboxdev",
-        "GetResourceAllocationInfo mask=%u num=%u -> size=%llu "
-        "align=%llu ret=0x%llx thread=%lu",
-        visibleMask, numResourceDescs,
-        (unsigned long long)retBuf->SizeInBytes,
-        (unsigned long long)retBuf->Alignment,
-        (unsigned long long)_ReturnAddress(),
-        GetCurrentThreadId());
+    LogAllocInfo(pResourceDescs, sanitizedFlags, nullptr, "linear-forward",
+                 retBuf);
     return retBuf;
 }
 
@@ -923,7 +1007,14 @@ static const uint64_t kArenaListHeadRva = 0x6843770;      // table A bucket 128 
 static const uint64_t kArenaBaseGlobalRva = 0x75E6FF0;    // G (arena base)
 static const uint64_t kArenaSizeGlobalRva = 0x75E7A08;    // Gsize (last kind stored by callback)
 static const uint64_t kPoolDispatchSize = 33423360ULL;    // raw allocation-info size (510 x 64 KiB)
-static const uint64_t kPoolDispatchKind = 0x8000ULL;      // kind 0x8000 -> bucket 128, bump path
+// Boot #59 (GPT #9): kind 0x808000 — bucket 128 in bits 16-23
+// (the dispatcher's bextr 0x810 extracts (kind>>16)&0xFF) AND the
+// bump flag 0x8000 in bits 14-15 (the callback tests
+// (kind&0xC000)==0x8000). Boot #58's 0x8000 walked bucket 0.
+static const uint64_t kPoolDispatchKind = 0x808000ULL;
+static const uint64_t kPoolDispatchBucket = (kPoolDispatchKind >> 16) & 0xFF;  // 128
+static const uint64_t kPoolTableARva = 0x6843370;         // table A base (head = table A + bucket*8)
+static const uint64_t kPoolDispatchLockRva = 0x6843788;   // dispatcher lock (shared; released before callback)
 static const uint64_t kPoolArenaCapacity = 0x4000000ULL;  // 64 MiB (observed [rsp+0x78])
 
 struct PoolArenaState {
@@ -932,6 +1023,8 @@ struct PoolArenaState {
     uint64_t cursor = 0;      // arena struct [0] (current alloc pointer)
     uint64_t capacity = 0;    // arena struct [8]
     uint64_t arenaStruct = 0; // &arena struct (registration node [8])
+    uint64_t nodeObj = 0;     // arena node's obj field (node [0x10]) — GPT #9 filter capture
+    uint64_t listHeadAddr = 0;// address the walk started from (base + kArenaListHeadRva)
     bool registered = false;  // arena callback node found in list A
     bool ok = false;          // every read succeeded
 };
@@ -958,7 +1051,8 @@ static bool ReadGuestQword(uint8_t* base, uint64_t rva, uint64_t* out) {
 static bool ReadPoolArenaState(uint8_t* base, PoolArenaState* st) {
     if (!base || !st) return false;
     st->g = 0; st->gsize = 0; st->cursor = 0; st->capacity = 0;
-    st->arenaStruct = 0; st->registered = false; st->ok = false;
+    st->arenaStruct = 0; st->nodeObj = 0; st->registered = false; st->ok = false;
+    st->listHeadAddr = (uint64_t)base + kArenaListHeadRva;
     __try {
         st->g = *(uint64_t*)(base + kArenaBaseGlobalRva);
         st->gsize = *(uint64_t*)(base + kArenaSizeGlobalRva);
@@ -966,10 +1060,12 @@ static bool ReadPoolArenaState(uint8_t* base, PoolArenaState* st) {
         for (int i = 0; i < 8 && node; ++i) {
             uint64_t cb = *(uint64_t*)((uint8_t*)node + 0x0);
             uint64_t nstruct = *(uint64_t*)((uint8_t*)node + 0x8);
+            uint64_t nobj = *(uint64_t*)((uint8_t*)node + 0x10);
             void* next = *(void**)((uint8_t*)node + 0x18);
             if (cb == (uint64_t)(base + kArenaCallbackRva)) {
                 st->registered = true;
                 st->arenaStruct = nstruct;
+                st->nodeObj = nobj;
                 st->cursor = *(uint64_t*)(nstruct + 0x0);
                 st->capacity = *(uint64_t*)(nstruct + 0x8);
                 break;
@@ -981,6 +1077,44 @@ static bool ReadPoolArenaState(uint8_t* base, PoolArenaState* st) {
         st->ok = false;
     }
     return st->ok;
+}
+
+// GPT #9 obj-filter capture: the dispatcher's TLS helper returns
+// the per-thread context at TLS-block + 0x410, and the dispatcher
+// copies a node only if node.obj == -1 or == that context. WHICH
+// block the helper reads is ambiguous after the /GA patch: its
+// `mov r64, gs:[58h]` was rewritten to read TlsSlots[gaSlot] (the
+// /GA view, view[0] = game block), but an unpatched access reads
+// the real TLS array[0] (another module's block — the game block
+// is array[10] there, __tls_index slot). Read all three
+// candidates and log them next to the node obj — whichever matches
+// the node obj is the one the dispatcher compares against. Each
+// read is separately SEH-guarded; a failed read leaves 0. Call
+// before the dispatch (pre) and again after it (post): a value
+// that changes between the two means the helper lazily
+// re-initialized the cached context between registration and
+// dispatch. Must run on the game thread (slot 127 does).
+static void ReadGameTlsContexts(uint64_t* outArray0, uint64_t* outArray10,
+                                uint64_t* outGaView) {
+    if (outArray0) *outArray0 = 0;
+    if (outArray10) *outArray10 = 0;
+    if (outGaView) *outGaView = 0;
+    __try {
+        uint64_t* tlsArray = (uint64_t*)__readgsqword(0x58);
+        if (tlsArray) {
+            if (outArray0 && tlsArray[0])
+                *outArray0 = *(uint64_t*)((uint8_t*)(uintptr_t)tlsArray[0] + 0x410);
+            if (outArray10 && tlsArray[10])
+                *outArray10 = *(uint64_t*)((uint8_t*)(uintptr_t)tlsArray[10] + 0x410);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    __try {
+        void* block = ScGuestGaViewBlock();
+        if (block && outGaView)
+            *outGaView = *(uint64_t*)((uint8_t*)block + 0x410);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
 }
 
 // Per-thread reentrancy guard (GPT #8 safeguard A): a TLS depth
@@ -1022,6 +1156,23 @@ struct PoolDispatchSnap {
     int tlsDepthBefore = 0;
     bool dispatched = false;  // the dispatcher was actually called
     bool verified = false;    // state transitions matched expectation
+    // GPT #9 instrumentation (boot #59).
+    uint64_t bucket = 0;            // computed BEXTR bucket (kind>>16)&0xFF
+    uint64_t tableHeadAddr = 0;     // base + kArenaListHeadRva (== table A + 128*8)
+    uint64_t tableAAddr = 0;        // base + kPoolTableARva (proves the head math)
+    uint64_t nodeObj = 0;           // arena node obj (pre-read)
+    uint64_t tlsCtxArray0Pre = 0;   // TLS-ctx candidates at dispatch entry
+    uint64_t tlsCtxArray10Pre = 0;
+    uint64_t tlsCtxGaViewPre = 0;
+    uint64_t tlsCtxArray0Post = 0;  // ... again after dispatch (re-init check)
+    uint64_t tlsCtxArray10Post = 0;
+    uint64_t tlsCtxGaViewPost = 0;
+    uint64_t expectedOldCursor = 0; // callback's expected return (old cursor)
+    uint64_t lockBefore = 0;        // dispatcher lock qword before/after
+    uint64_t lockAfter = 0;
+    bool lockOkBefore = false;
+    bool lockOkAfter = false;
+    int failCase = 0;  // 1=ok 2=callback filtered out 3=inner alloc failed 4=chain did not run
 };
 
 static LONG g_poolDispatchCalls = 0;  // slot-127 dispatch attempts
@@ -1093,6 +1244,15 @@ static bool DispatchPoolForResource(PoolDispatchSnap* snap) {
             (unsigned long long)snap->pre.cursor);
         return false;
     }
+    // GPT #9 instrumentation, captured once the gates pass and the
+    // dispatch is actually about to run: the computed bucket, the
+    // table-head proof (head must equal table A + 128*8), and the
+    // arena node obj the dispatcher will compare against its TLS
+    // context.
+    snap->bucket = kPoolDispatchBucket;
+    snap->tableHeadAddr = (uint64_t)base + kArenaListHeadRva;
+    snap->tableAAddr = (uint64_t)base + kPoolTableARva;
+    snap->nodeObj = snap->pre.nodeObj;
     // Load the dispatcher pointer from the .data slot at runtime
     // (GPT #8: call through the runtime-selected function pointer).
     // Gate on it equalling the dispatcher-1 thunk — if the slot
@@ -1113,6 +1273,13 @@ static bool DispatchPoolForResource(PoolDispatchSnap* snap) {
             (void*)disp, (void*)expected);
         return false;
     }
+    // TLS-context candidates + dispatcher lock, as close to the
+    // call as possible (pre values; the post values are read
+    // immediately after the call returns).
+    ReadGameTlsContexts(&snap->tlsCtxArray0Pre, &snap->tlsCtxArray10Pre,
+                        &snap->tlsCtxGaViewPre);
+    snap->lockOkBefore =
+        ReadGuestQword(base, kPoolDispatchLockRva, &snap->lockBefore);
     // All gates pass. Set the reentrancy guard, invoke the
     // dispatcher synchronously on this (game) thread, reset the
     // guard in __finally so a fault inside the chain cannot leave
@@ -1133,6 +1300,13 @@ static bool DispatchPoolForResource(PoolDispatchSnap* snap) {
     snap->xmemAfter = g_xmemAllocDefaultCalls;
     snap->xmemLastSize = g_xmemAllocDefaultLastSize;
     snap->xmemLastBase = (void*)g_xmemAllocDefaultLastBase;
+    // GPT #9: TLS-context candidates + dispatcher lock, immediately
+    // after the call returns (compare with the pre values for a
+    // lazy re-initialization; the lock must be free again).
+    ReadGameTlsContexts(&snap->tlsCtxArray0Post, &snap->tlsCtxArray10Post,
+                        &snap->tlsCtxGaViewPost);
+    snap->lockOkAfter =
+        ReadGuestQword(base, kPoolDispatchLockRva, &snap->lockAfter);
     // Post-read + verification (state, not return value alone).
     ReadPoolArenaState(base, &snap->post);
     uint64_t postConsumed = 0;
@@ -1153,6 +1327,28 @@ static bool DispatchPoolForResource(PoolDispatchSnap* snap) {
         snap->post.gsize == kPoolDispatchKind &&
         snap->post.capacity == kPoolArenaCapacity &&
         postConsumed == expectConsumed;
+    // The callback returns the OLD cursor: the arena base on the
+    // first call (pre.g == 0, so the base is only known post-call),
+    // the pre-call cursor on later calls. The dispatcher propagates
+    // that return untouched, so dispatcherRet must equal it.
+    snap->expectedOldCursor =
+        (snap->pre.g == 0) ? snap->post.g : snap->pre.cursor;
+    // GPT #9 failure classification (only meaningful when
+    // !verified): 1 = callback ran + allocation succeeded
+    // (== verified); 2 = callback filtered out (the dispatcher
+    // invoked the default node, so xmem got the raw request size);
+    // 3 = callback ran but the inner allocation failed (xmem got
+    // the capacity-sized request, yet the state never moved);
+    // 4 = the dispatcher did not execute the expected handler
+    // chain (no xmem call, or an unexpected pattern). On call 1
+    // the bump path needs no inner alloc, so delta 0 there with
+    // no state movement is also case 4.
+    LONG xmemDelta = snap->xmemAfter - snap->xmemBefore;
+    if (snap->verified) snap->failCase = 1;
+    else if (xmemDelta == 0) snap->failCase = 4;
+    else if (snap->xmemLastSize == kPoolDispatchSize) snap->failCase = 2;
+    else if (snap->xmemLastSize == kPoolArenaCapacity) snap->failCase = 3;
+    else snap->failCase = 4;
     // The callback ran iff the state moved exactly as its bump path
     // moves it (G/Gsize/cursor are written ONLY by the callback —
     // boot #55 provenance). Reported as an inference, not a hook
@@ -1166,12 +1362,18 @@ static bool DispatchPoolForResource(PoolDispatchSnap* snap) {
         "xmem_last_size=%llu xmem_last_base=%p G_before=%llx "
         "G_after=%llx Gsize_before=%llx Gsize_after=%llx "
         "cursor_before=%llx cursor_after=%llx capacity=%llx "
-        "remaining=%llu tls_depth=%d verified=%d",
+        "remaining=%llu tls_depth=%d verified=%d "
+        "bucket=%llu table_head=%p tableA=%p head_ok=%d "
+        "node_obj=%llx tlsCtx_pre=[arr0=%llx arr10=%llx "
+        "gaView=%llx] tlsCtx_post=[arr0=%llx arr10=%llx "
+        "gaView=%llx] tls_reinit=%d expected_old_cursor=%llx "
+        "ret_match=%d lock_before=%llx lock_after=%llx "
+        "lock_free_after=%d failCase=%d",
         snap->callIndex, (void*)snap->dispatcherPtr,
         (unsigned long long)kPoolDispatchSize,
         (unsigned long long)kPoolDispatchKind,
         (unsigned long long)snap->dispatcherRet, callbackRan,
-        (long)(snap->xmemAfter - snap->xmemBefore),
+        (long)xmemDelta,
         (unsigned long long)snap->xmemLastSize, snap->xmemLastBase,
         (unsigned long long)snap->pre.g,
         (unsigned long long)snap->post.g,
@@ -1181,7 +1383,26 @@ static bool DispatchPoolForResource(PoolDispatchSnap* snap) {
         (unsigned long long)snap->post.cursor,
         (unsigned long long)snap->post.capacity,
         (unsigned long long)postRemaining, snap->tlsDepthBefore,
-        snap->verified ? 1 : 0);
+        snap->verified ? 1 : 0,
+        (unsigned long long)snap->bucket,
+        (void*)snap->tableHeadAddr, (void*)snap->tableAAddr,
+        (snap->tableHeadAddr == snap->tableAAddr + 128 * 8) ? 1 : 0,
+        (unsigned long long)snap->nodeObj,
+        (unsigned long long)snap->tlsCtxArray0Pre,
+        (unsigned long long)snap->tlsCtxArray10Pre,
+        (unsigned long long)snap->tlsCtxGaViewPre,
+        (unsigned long long)snap->tlsCtxArray0Post,
+        (unsigned long long)snap->tlsCtxArray10Post,
+        (unsigned long long)snap->tlsCtxGaViewPost,
+        (snap->tlsCtxArray0Pre != snap->tlsCtxArray0Post ||
+         snap->tlsCtxArray10Pre != snap->tlsCtxArray10Post ||
+         snap->tlsCtxGaViewPre != snap->tlsCtxGaViewPost) ? 1 : 0,
+        (unsigned long long)snap->expectedOldCursor,
+        (snap->dispatcherRet == snap->expectedOldCursor) ? 1 : 0,
+        (unsigned long long)snap->lockBefore,
+        (unsigned long long)snap->lockAfter,
+        (snap->lockOkAfter && snap->lockAfter == 0) ? 1 : 0,
+        snap->failCase);
     return snap->verified;
 }
 
@@ -1396,7 +1617,10 @@ static HRESULT WINAPI XboxDevice_CreateCommittedResource3(
         if (snap.dispatched && !ok) {
             Log("xboxdev",
                 "Slot127 CCR3: pool dispatch FAILED verification "
-                "(see slot127 snapshot) — failing creation cleanly");
+                "(failCase=%d: 1=ok 2=callback filtered out "
+                "3=inner alloc failed 4=chain did not run; see "
+                "slot127 snapshot) — failing creation cleanly",
+                snap.failCase);
             native->Release();
             native = nullptr;
             *ppvResource = nullptr;
@@ -1784,12 +2008,299 @@ static HRESULT WINAPI XboxDevice_WaitFrameEventX(
     return S_OK;
 }
 
+// ---- Xbox device slots 74/75: page-pool registration (boot #60) ----
+// GPT consultation #10 approved spec (chat c/6b052480). RegisterPagePoolX
+// records a (va, pages) registration and returns a layer-assigned pool
+// index; UnregisterPagePoolX invalidates it. This is a REGISTRATION
+// lifecycle, not an unconditional S_OK stub: the index is a pool
+// identifier that later page-mapping calls (CopyPageMappingsX /
+// CopyPageMappingsBatchX) will consume, so the layer must translate it
+// consistently in every later API that takes a pool index.
+//   NO dedupe (GPT #10): a repeated (va, pages) pair may be a second
+// registration with its own lifetime — each successful registration
+// gets a NEW unique index; duplicate ranges are logged but kept as
+// separate registrations. Dedupe only after observing the game's
+// registration/unregistration behaviour or finding evidence the native
+// API requires it.
+//   Slot 75's ABI is XCL's reference table (device_x.rs, read-only):
+// (this, index:u64) -> HRESULT. The game has not called it yet, so the
+// handler logs the raw arg and validates it against the table — a
+// wrong-guess ABI will show up in the log, not silently corrupt state.
+//   The pool memory itself is already allocated by the game (VirtualAlloc
+// + XMemVirtualAlloc + XMemMapPhysicalPages through the layer's shims) —
+// the layer only records the registration.
+struct ScPagePoolReg {
+    void* va;       // registration base, as passed
+    UINT32 pages;   // page count, as passed
+    UINT64 bytes;   // registration extent in bytes (pages x unit)
+    bool unit64K;   // true = 64 KiB pages, false = 4 KiB pages
+    bool active;    // false after unregister
+};
+static const UINT32 kMaxPagePools = 1024;
+static ScPagePoolReg g_pagePools[kMaxPagePools];
+static UINT32 g_pagePoolIssued = 0;  // indices issued so far (stable, never reused)
+static UINT32 g_pagePoolActive = 0;  // currently active registrations
+static volatile LONG g_pagePoolCalls74 = 0;  // RegisterPagePoolX calls
+static volatile LONG g_pagePoolCalls75 = 0;  // UnregisterPagePoolX calls
+static SRWLOCK g_pagePoolLock = SRWLOCK_INIT;
+
+static bool PagePoolRangesOverlap(void* va1, UINT64 bytes1, void* va2,
+                                  UINT64 bytes2) {
+    uintptr_t a1 = (uintptr_t)va1, e1 = a1 + (uintptr_t)bytes1;
+    uintptr_t a2 = (uintptr_t)va2, e2 = a2 + (uintptr_t)bytes2;
+    return a1 < e2 && a2 < e1;
+}
+
+// Returns true if [va, va+bytes) lies within a single VirtualAlloc
+// allocation (same AllocationBase across every sub-region). Fills the
+// first region's state/protect/type/size for the log. A range crossing
+// into another allocation is not the reservation the game registered.
+static bool PagePoolRangeInOneAlloc(void* va, UINT64 bytes,
+                                    void** allocBase, DWORD* state,
+                                    DWORD* protect, DWORD* type,
+                                    UINT64* firstRegionBytes) {
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(va, &mbi, sizeof(mbi)) == 0) return false;
+    *allocBase = mbi.AllocationBase;
+    *state = mbi.State;
+    *protect = mbi.Protect;
+    *type = mbi.Type;
+    *firstRegionBytes = (UINT64)mbi.RegionSize;
+    uintptr_t vaEnd = (uintptr_t)va + (uintptr_t)bytes;
+    if (vaEnd < (uintptr_t)va) return false;  // wraps
+    uintptr_t cur = (uintptr_t)va;
+    while (cur < vaEnd) {
+        MEMORY_BASIC_INFORMATION m2 = {};
+        if (VirtualQuery((void*)cur, &m2, sizeof(m2)) == 0 ||
+            m2.AllocationBase != mbi.AllocationBase)
+            return false;
+        cur = (uintptr_t)m2.BaseAddress + (uintptr_t)m2.RegionSize;
+    }
+    return true;
+}
+
+static HRESULT WINAPI XboxDevice_RegisterPagePoolX(XboxDeviceWrapper* self,
+                                                   void* va, UINT32 pages,
+                                                   UINT32* outPoolIndex) {
+    (void)self;
+    LONG callNo = InterlockedIncrement(&g_pagePoolCalls74);
+    Log("xboxdev",
+        "Slot74 RegisterPagePoolX call#%ld va=%p pages=%u out=%p "
+        "thread=%lu ret=0x%llx",
+        callNo, va, (unsigned)pages, (void*)outPoolIndex,
+        (unsigned long)GetCurrentThreadId(),
+        (unsigned long long)_ReturnAddress());
+    // Validation (GPT #10): fail cleanly, never silently round.
+    if (!va || pages == 0) {
+        Log("xboxdev",
+            "Slot74 RegisterPagePoolX call#%ld -> E_INVALIDARG "
+            "(va=%p pages=%u)",
+            callNo, va, (unsigned)pages);
+        return E_INVALIDARG;
+    }
+    if (((uintptr_t)va & 0xFFFF) != 0) {
+        Log("xboxdev",
+            "Slot74 RegisterPagePoolX call#%ld -> E_INVALIDARG "
+            "(va %p not 64K-aligned)",
+            callNo, va);
+        return E_INVALIDARG;
+    }
+    // Page-unit resolution (boot #60, Freebuff forensics): the layer's
+    // XMem pages are 4K (x4096) while page pools are 64K-granular, and
+    // the game passes a bare count — the unit is NOT in the signature.
+    // Resolve it from the memory evidence instead of assuming: try
+    // 64K first (the GDK page-pool granularity); if that range does
+    // not fit inside one allocation, try 4K. The resolved unit is
+    // logged and stored in the pool record (bytes, not just the raw
+    // count) — a wrong-unit assumption here would fail a legitimate
+    // registration.
+    MEMORY_BASIC_INFORMATION probe = {};
+    if (VirtualQuery(va, &probe, sizeof(probe)) == 0) {
+        Log("xboxdev",
+            "Slot74 RegisterPagePoolX call#%ld -> E_INVALIDARG "
+            "(VirtualQuery(%p) failed err=%lu)",
+            callNo, va, GetLastError());
+        return E_INVALIDARG;
+    }
+    UINT64 bytes64K = (UINT64)pages * 65536ULL;
+    UINT64 bytes4K = (UINT64)pages * 4096ULL;
+    void* allocBase = nullptr;
+    DWORD firstState = 0, firstProtect = 0, firstType = 0;
+    UINT64 firstRegionBytes = 0;
+    UINT64 bytes = 0;
+    bool unit64K = true;
+    if (PagePoolRangeInOneAlloc(va, bytes64K, &allocBase, &firstState,
+                                &firstProtect, &firstType,
+                                &firstRegionBytes)) {
+        bytes = bytes64K;
+        unit64K = true;
+    } else if (PagePoolRangeInOneAlloc(va, bytes4K, &allocBase, &firstState,
+                                       &firstProtect, &firstType,
+                                       &firstRegionBytes)) {
+        bytes = bytes4K;
+        unit64K = false;
+    } else {
+        Log("xboxdev",
+            "Slot74 RegisterPagePoolX call#%ld -> E_INVALIDARG "
+            "(va %p pages=%u fits neither 64K-unit (%llu bytes) nor "
+            "4K-unit (%llu bytes) in one allocation)",
+            callNo, va, (unsigned)pages,
+            (unsigned long long)bytes64K,
+            (unsigned long long)bytes4K);
+        return E_INVALIDARG;
+    }
+    // Memory-state capture (GPT #10): the first region's
+    // state/protect/type are logged as the measurement; the state
+    // itself is NOT a pass/fail gate (a reserved range is not the same
+    // as committed backing pages — record it, don't assume).
+    Log("xboxdev",
+        "Slot74 RegisterPagePoolX call#%ld mem: allocBase=%p "
+        "firstRegionBytes=%llu state=0x%x protect=0x%x type=0x%x "
+        "bytes=%llu unit=%s rangeInOneAlloc=1",
+        callNo, allocBase, (unsigned long long)firstRegionBytes,
+        (unsigned)firstState, (unsigned)firstProtect,
+        (unsigned)firstType, (unsigned long long)bytes,
+        unit64K ? "64K" : "4K");
+    // Overlap measurements (GPT #10) — data only, never a failure by
+    // themselves: (a) the >=100 MB placeholder reservation recorded by
+    // HleVirtualAlloc (the game's 185 MB descriptor backing store);
+    // (b) the last XMemAllocDefault block (the 64 MB arena backing in
+    // boot #59). The three regions must be distinct — compare actual
+    // base/end addresses, not just sizes.
+    bool overlapDescReserve = false;
+    if (g_measReserveBase && g_measReserveSize > 0) {
+        overlapDescReserve = PagePoolRangesOverlap(
+            va, bytes, g_measReserveBase, (UINT64)g_measReserveSize);
+    }
+    bool overlapArena = false;
+    void* arenaBase = (void*)g_xmemAllocDefaultLastBase;
+    SIZE_T arenaSize = (SIZE_T)g_xmemAllocDefaultLastSize;
+    if (arenaBase && arenaSize > 0) {
+        overlapArena = PagePoolRangesOverlap(va, bytes, arenaBase,
+                                            (UINT64)arenaSize);
+    }
+    Log("xboxdev",
+        "Slot74 RegisterPagePoolX call#%ld overlap: descReserve "
+        "(base=%p size=%llu) overlap=%d; arenaLast "
+        "(base=%p size=%llu) overlap=%d",
+        callNo, g_measReserveBase,
+        (unsigned long long)g_measReserveSize, overlapDescReserve ? 1 : 0,
+        arenaBase, (unsigned long long)arenaSize,
+        overlapArena ? 1 : 0);
+    // Issue a NEW stable index (no dedupe). Duplicate ranges are
+    // collected under the lock and logged after it.
+    UINT32 dupIdx[4];
+    UINT32 dupCount = 0;
+    UINT32 dupTotal = 0;
+    AcquireSRWLockExclusive(&g_pagePoolLock);
+    for (UINT32 i = 0; i < g_pagePoolIssued; ++i) {
+        if (!g_pagePools[i].active) continue;
+        if (PagePoolRangesOverlap(va, bytes, g_pagePools[i].va,
+                                  g_pagePools[i].bytes)) {
+            if (dupCount < 4) dupIdx[dupCount] = i;
+            ++dupCount;
+            ++dupTotal;
+        }
+    }
+    if (g_pagePoolIssued >= kMaxPagePools) {
+        ReleaseSRWLockExclusive(&g_pagePoolLock);
+        Log("xboxdev",
+            "Slot74 RegisterPagePoolX call#%ld -> E_FAIL (pool table "
+            "full, issued=%u)",
+            callNo, g_pagePoolIssued);
+        return E_FAIL;
+    }
+    UINT32 idx = g_pagePoolIssued++;
+    g_pagePools[idx].va = va;
+    g_pagePools[idx].pages = pages;
+    g_pagePools[idx].bytes = bytes;
+    g_pagePools[idx].unit64K = unit64K;
+    g_pagePools[idx].active = true;
+    ++g_pagePoolActive;
+    UINT32 active = g_pagePoolActive;
+    ReleaseSRWLockExclusive(&g_pagePoolLock);
+    if (dupTotal > 0) {
+        Log("xboxdev",
+            "Slot74 RegisterPagePoolX call#%ld dup: range overlaps %u "
+            "existing registration(s) (first=%u%s) — kept as separate "
+            "registration, no dedupe",
+            callNo, dupTotal, dupCount > 0 ? dupIdx[0] : 0,
+            dupTotal > 1 ? ",..." : "");
+    }
+    if (outPoolIndex) *outPoolIndex = idx;
+    Log("xboxdev",
+        "Slot74 RegisterPagePoolX call#%ld -> S_OK index=%u active=%u "
+        "(out=%p)",
+        callNo, idx, active, (void*)outPoolIndex);
+    return S_OK;
+}
+
+static HRESULT WINAPI XboxDevice_UnregisterPagePoolX(
+    XboxDeviceWrapper* self, UINT64 index) {
+    (void)self;
+    LONG callNo = InterlockedIncrement(&g_pagePoolCalls75);
+    Log("xboxdev",
+        "Slot75 UnregisterPagePoolX call#%ld index=%llu (as ptr %p) "
+        "thread=%lu ret=0x%llx",
+        callNo, (unsigned long long)index, (void*)(uintptr_t)index,
+        (unsigned long)GetCurrentThreadId(),
+        (unsigned long long)_ReturnAddress());
+    if (index >= kMaxPagePools) {
+        Log("xboxdev",
+            "Slot75 UnregisterPagePoolX call#%ld -> E_FAIL "
+            "(index %llu out of range, issued=%u)",
+            callNo, (unsigned long long)index, g_pagePoolIssued);
+        return E_FAIL;
+    }
+    AcquireSRWLockExclusive(&g_pagePoolLock);
+    bool ok = false;
+    void* va = nullptr;
+    UINT32 pages = 0;
+    UINT64 bytes = 0;
+    if (index < g_pagePoolIssued && g_pagePools[(UINT32)index].active) {
+        va = g_pagePools[(UINT32)index].va;
+        pages = g_pagePools[(UINT32)index].pages;
+        bytes = g_pagePools[(UINT32)index].bytes;
+        g_pagePools[(UINT32)index].active = false;
+        --g_pagePoolActive;
+        ok = true;
+    }
+    UINT32 active = g_pagePoolActive;
+    UINT32 issued = g_pagePoolIssued;
+    ReleaseSRWLockExclusive(&g_pagePoolLock);
+    if (!ok) {
+        Log("xboxdev",
+            "Slot75 UnregisterPagePoolX call#%ld -> E_FAIL "
+            "(index %llu unknown or already unregistered, issued=%u "
+            "active=%u)",
+            callNo, (unsigned long long)index, issued, active);
+        return E_FAIL;
+    }
+    Log("xboxdev",
+        "Slot75 UnregisterPagePoolX call#%ld -> S_OK unregistered "
+        "index=%llu va=%p pages=%u bytes=%llu active=%u",
+        callNo, (unsigned long long)index, va, (unsigned)pages,
+        (unsigned long long)bytes, active);
+    return S_OK;
+}
+
+// Fill the vtable's unimplemented entries with per-slot logging stubs.
+// One pack expansion instantiates all 192 (no recursion depth to worry
+// about), and every entry is a real function — never null.
+template <std::size_t... I>
+static void FillUnimplementedDeviceSlots(std::index_sequence<I...>,
+                                         void** vt) {
+    void* stubs[] = {(void*)&XboxDevice_SlotUnimplemented<(int)I>...,
+                     nullptr};
+    for (std::size_t i = 0; i < sizeof...(I); ++i) vt[i] = stubs[i];
+}
+
 // Build the 192-slot Xbox device vtable once. Unimplemented slots get
 // the logging stub; known slots get their handlers.
 static void InitXboxDeviceVtable() {
     if (g_xboxDeviceVtableInit) return;
-    for (int i = 0; i < 192; ++i)
-        g_xboxDeviceVtable[i] = (void*)XboxDevice_Unimplemented;
+    FillUnimplementedDeviceSlots(std::make_index_sequence<192>{},
+                                 g_xboxDeviceVtable);
     g_xboxDeviceVtable[0] = (void*)XboxDevice_QueryInterface;
     g_xboxDeviceVtable[1] = (void*)XboxDevice_AddRef;
     g_xboxDeviceVtable[2] = (void*)XboxDevice_Release;
@@ -1805,6 +2316,8 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[36] = (void*)XboxDevice_CreateFence;
     g_xboxDeviceVtable[48] = (void*)XboxDevice_CreateCommandQueue;
     g_xboxDeviceVtable[73] = (void*)XboxDevice_CreateCommandList;
+    g_xboxDeviceVtable[74] = (void*)XboxDevice_RegisterPagePoolX;
+    g_xboxDeviceVtable[75] = (void*)XboxDevice_UnregisterPagePoolX;
     g_xboxDeviceVtable[78] = (void*)XboxDevice_SetFrameIntervalX;
     g_xboxDeviceVtable[79] = (void*)XboxDevice_ScheduleFrameEventX;
     g_xboxDeviceVtable[80] = (void*)XboxDevice_WaitFrameEventX;
@@ -3026,9 +3539,12 @@ SC_DEFINE_SOK_STUB("chad", XDspDeactivate)
 SC_DEFINE_SOK_STUB("chad", XDspDisconnect)
 SC_DEFINE_SOK_STUB("chad", XDspSubmitCommand)
 
-// xg_xs.dll — S_OK stubs (audio DSP / texture computer / FSR loader / audio APU).
-SC_DEFINE_SOK_STUB("xgxs", XGCreateTextureComputer)
-SC_DEFINE_SOK_STUB("xgxs", XGSuggestSwizzleMode)
+// xg_xs.dll — NOT stubs as of build 80: src/xg_texture.cpp implements the
+// texture address computer (object + vtable + slot-8 validated copy) and
+// the swizzle-mode suggestion. Boot #60 crashed on the old S_OK stub: the
+// exe ignored the HRESULT and called slot 8 through a null object at
+// 0x1416F71FB. A stub that returns S_OK with a null out-param is exactly
+// the unsafe-out-param case the build-80 audit (docs/XG-AUDIT.md) lists.
 
 // amd_fidelityfx_loader_xbox.dll — S_OK stubs (audio DSP / texture computer / FSR loader / audio APU).
 SC_DEFINE_SOK_STUB("ffx", ffxCreateContext)
@@ -4603,10 +5119,15 @@ static const Export kExports[] = {
      (void*)XDspSubmitCommand, "STUB (real-exe import, 2026-11-23)."},
 
     // xg_xs.dll — S_OK stubs.
-    {"xg_xs.dll", "XGCreateTextureComputer", Status::kStub,
-     (void*)XGCreateTextureComputer, "STUB (real-exe import, 2026-11-23)."},
-    {"xg_xs.dll", "XGSuggestSwizzleMode", Status::kStub,
-     (void*)XGSuggestSwizzleMode, "STUB (real-exe import, 2026-11-23)."},
+    {"xg_xs.dll", "XGCreateTextureComputer", Status::kSketchy,
+     (void*)XGCreateTextureComputer,
+     "Build 80: real object (measured 56-byte desc, per-subresource layout, "
+     "full vtable, slot-8 copy). Texel order inside a 64KB tile is the "
+     "project's Morton model - unverified against GDK tables."},
+    {"xg_xs.dll", "XGSuggestSwizzleMode", Status::kSketchy,
+     (void*)XGSuggestSwizzleMode,
+     "Build 80: derived from the same table the copy implements; unsupported "
+     "descriptors fail instead of inventing a mode."},
 
     // amd_fidelityfx_loader_xbox.dll — S_OK stubs.
     {"amd_fidelityfx_loader_xbox.dll", "ffxCreateContext", Status::kStub,

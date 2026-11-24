@@ -1777,6 +1777,16 @@ static LONG g_vehDumped = 0;
 // the entry runs.
 void* ScGuestBase() { return g_guestBaseForVeh; }
 
+// Calling thread's game TLS block via the /GA view (view[0]).
+// nullptr when no view is installed. The view pointer itself comes
+// from TlsGetValue (safe); the caller SEH-guards the [0] read.
+void* ScGuestGaViewBlock() {
+    if (g_gaSlot == TLS_OUT_OF_INDEXES) return nullptr;
+    void* view = TlsGetValue(g_gaSlot);
+    if (!view) return nullptr;
+    return ((void**)view)[0];
+}
+
 // Boot #13 diagnostic probe: reads the the title VFS mount-registry state
 // from the guest image at fixed RVAs (same convention as the existing
 // title-specific patches: pool vtable patch, F int3 NOP, Option A).
@@ -2214,6 +2224,70 @@ static void LogBoot57Arena() {
     }
 }
 
+// Build 83: streaming-context entry snapshot.
+//
+// Boot #63 (#62 chain) faults at 0x1428C9A08 -- `mov rax,[rcx]` with
+// rcx = [rsi+0x18] -- inside the game's streaming submit function
+// 0x1428C9960, whose first act is `mov rsi, rcx`, so the faulting rsi
+// still holds the streaming context in the exception context record.
+// That context is a guest "sdms" record (magic 0x6d736473 at +0x00)
+// built by the game constructor at 0x1428C9460 and published to the
+// image global 0x79F6D70. This probe names the exact record and dumps
+// every field the submit path reads, at fault time, without executing
+// or modifying guest code.
+static void LogStreamContextProbe(EXCEPTION_POINTERS* ep) {
+    uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+    if (!base || !ep || !ep->ExceptionRecord || !ep->ContextRecord)
+        return;
+    uint64_t ctx = (uint64_t)ep->ContextRecord->Rsi;
+    uint64_t sub = (uint64_t)ep->ContextRecord->Rcx;
+    uint64_t magic = 0, reg = 0;
+    __try {
+        reg = *(uint64_t*)(base + 0x79F6D70);
+        magic = ctx ? *(uint64_t*)ctx : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "ctx-probe: ctx=0x%llx <unreadable>",
+            (unsigned long long)ctx);
+        return;
+    }
+    Log("loader",
+        "ctx-probe: fault=%p rsi(ctx)=0x%llx rcx(sub-object)=0x%llx "
+        "magic=0x%llx registered=0x%llx",
+        ep->ExceptionRecord->ExceptionAddress, (unsigned long long)ctx,
+        (unsigned long long)sub, (unsigned long long)magic,
+        (unsigned long long)reg);
+    if (magic != 0x6D736473ull)
+        return;
+    __try {
+        uint32_t v08 = *(uint32_t*)(ctx + 0x08);
+        uint32_t v0c = *(uint32_t*)(ctx + 0x0C);
+        uint64_t v10 = *(uint64_t*)(ctx + 0x10);
+        uint64_t v18 = *(uint64_t*)(ctx + 0x18);
+        uint64_t v20 = *(uint64_t*)(ctx + 0x20);
+        uint64_t v28 = *(uint64_t*)(ctx + 0x28);
+        uint64_t v30 = *(uint64_t*)(ctx + 0x30);
+        uint64_t v38 = *(uint64_t*)(ctx + 0x38);
+        uint32_t v64 = *(uint32_t*)(ctx + 0x64);
+        uint32_t v68 = *(uint32_t*)(ctx + 0x68);
+        Log("loader",
+            "ctx-probe: ctx=0x%llx owner=0x%llx sub[+0x18]=0x%llx "
+            "arg8=%u argc=%u aux[+0x20]=0x%llx aux[+0x28]=0x%llx "
+            "out[+0x30]=0x%llx arr[+0x38]=0x%llx used=%u cap=%u",
+            (unsigned long long)ctx, (unsigned long long)v10,
+            (unsigned long long)v18, v08, v0c, (unsigned long long)v20,
+            (unsigned long long)v28, (unsigned long long)v30,
+            (unsigned long long)v38, v64, v68);
+        // A null sub-object here is the 0xC0000005 read of 0x0 at
+        // 0x1428C9A08: the record exists, is registered, and its
+        // backend field was never populated.
+        Log("loader", "ctx-probe: fault-kind=%s",
+            v18 ? "sub-object-present" : "sub-object-null");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "ctx-probe: ctx=0x%llx fields=<unreadable>",
+            (unsigned long long)ctx);
+    }
+}
+
 static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     // Boot #25: the fault moved from the pack assert (0x80000003) to an
     // access violation (0xc0000005, NULL-deref in the sibling pack fn).
@@ -2255,6 +2329,7 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     LogMountProbe();
     LogBoot55Probe(ep);
     LogBoot57Arena();
+    LogStreamContextProbe(ep);
     WriteCrashDump(ep, "veh-breakpoint");
     return EXCEPTION_CONTINUE_SEARCH;
 }
