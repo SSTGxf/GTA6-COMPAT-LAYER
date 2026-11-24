@@ -20,8 +20,7 @@ harness (stages report as `opt_*`).
 An optimization is reasonable here when it is:
 
 1. **Implementable and measurable on this card with synthetic
-   workloads, without the exe.** The GTA exe has not landed yet
-   (drops 12:00 PM EST Nov 23). Nothing here needs real game data.
+   workloads, without the exe.** Nothing here needs real game data.
 2. **A real cost in the layer's own path**, not a guess about the
    game's behaviour. The cost is measured in the harness, before
    and after, on the 5700 XT.
@@ -89,7 +88,7 @@ averages, hit count. Same for one root signature.
 title touches must be de-tiled into a linear layout the desktop
 GPU can sample. De-tiling the same texture every frame is pure
 wasted CPU work; doing it once and caching it is the win. But the
-cache itself costs VRAM, and GTA has gigabytes of textures — an
+cache itself costs VRAM, and a large title has gigabytes of textures — an
 unbounded cache would eat the card. So the cache is built with
 memory management, not just the de-tiling (see below).
 
@@ -222,7 +221,7 @@ LRU eviction order as expected or not, streaming hit rate,
 
 ### 3. Mesh-shader fallback for RDNA1 (`src/opt_mesh_fallback.cpp`)
 
-**Source location / cost.** GTA VI has 9,282 mesh shaders. Mesh
+**Source location / cost.** The reference title has 9,282 mesh shaders. Mesh
 shaders (amplification + mesh) need FL 12_2; the 5700 XT is FL
 12_1 and has no mesh-shader hardware. A title's mesh-shader draw
 would fail outright on this card. The fallback replaces the mesh
@@ -288,7 +287,7 @@ guarantees the compute output is visible before readback.
 
 **Measurement.** Reported: serial average ms, async average ms,
 and the verdict (async faster / slower / within noise) *on this
-card, for this workload*. No claim is made about GTA's actual
+card, for this workload*. No claim is made about a real title's actual
 async mix — that needs the real title's workload.
 
 ### 5. Descriptor heap management (`src/opt_desc_heap.cpp`)
@@ -566,7 +565,7 @@ raw device, exactly as it would without this work.
 ## Performance honesty
 
 Every number in the verification section is a measurement of a
-*synthetic* workload on the RX 5700 XT, not a claim about GTA VI.
+*synthetic* workload on the RX 5700 XT, not a claim about any specific title.
 A cache hit avoids a driver compile; it does not make the game
 faster by a quoted percentage. Async compute may be slower on
 RDNA1 — if the measurement says so, the doc reports slower.
@@ -601,7 +600,7 @@ stable win, not the recording time on a tiny sequence).
 (minimal, ordinal, proof, era 21/21, software-rt 7/7 under all
 three RT modes, physics 7/7). Every number below is from the
 harness log `F:\ScarlettOpt\build_opt.log` (build 8), synthetic
-workloads only — not a claim about GTA VI.
+workloads only — not a claim about any specific title.
 
 - **1. PSO + root-signature cache:** raw 10x
   `CreateGraphicsPipelineState` 2.072 ms; cached 10x

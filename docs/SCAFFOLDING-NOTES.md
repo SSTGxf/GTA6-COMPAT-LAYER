@@ -1,55 +1,30 @@
-# GTA 6 Series X compat layer — scaffolding notes (2026-11-22)
+# ScarlettCompat — scaffolding notes (2026-11-22)
 
-**Repo:** `SSTGxf/GTA6-COMPAT-LAYER` (public, main). Work folder on the PC:
+**Repo:** `SSTGxf/ScarlettCompat` (public, main). Work folder on the PC:
 `F:\ScarlettCompat`. **Do NOT push from the PC** (no git there) — the parent
 agent pulls the tree and pushes. No game code in the repo; no exe fetching
 or reconstruction; read-only on `D:\game\game`.
 
 **Deadline:** 15 hours to verify a good stable layer (~12:46 EST Nov 23).
 Realistic bar (research brief): loader + shimmed boot path for a synthetic
-guest title and a first `d3d12_xs` frame — NOT GTA 6 playable.
+guest title and a first `d3d12_xs` frame — NOT a playable title.
 
-## 1. File map — `D:\game\game` (measured, read-only)
+## 1. Package inventory — removed
 
-GTA VI Xbox Series X build v1.0.2.1, TitleId `7952987A`, ~131 GB
-(130,897,922,118 bytes, 41 files + `data\` + `pack\`). **No exe.**
-
-- Identity: `RockstarGamesInc.28872443D20A7`, Publisher
-  `CN=3164F9C2-2C28-4832-BBE3-A642A4EF0054`, MSAAppId `000000004060F900`,
-  StoreId `9NL3WWNZLZZN`, protocol `ms-xbl-7952987a`.
-- Exe name (from manifest + `MicrosoftGame.Config` + layout chunk 1001):
-  `game_scarlett_master.exe`, AppId `GTAO`, EntryPoint
-  `GamingProxyApp.Application.EntryPoint`, TargetDeviceFamily Scarlett,
-  GameOS dep 10.0.18362.0, 2048 MB persistent local storage, SMT on,
-  Lockhart/Anaconda memory `Advanced`.
-- Biggest RPFs: `levels.rpf` 76.2 GB, `audio.rpf` 28.5 GB, `movies.rpf`
-  8.8 GB, `navmeshes.rpf` 6.7 GB, `packs.rpf` 4.8 GB, `anim.rpf` 4.4 GB,
-  `data.rpf` 481 MB, `shaders.rpf` 411 MB, `textures.rpf` 192 MB,
-  `common.rpf` 6.6 MB, `script.rpf` 4.4 MB, `appdata0.rpf` 8,880 B
-  (magic `9FPR` = RPF v9).
-- `gameos.xvd` 348 MB — Game OS image, first bytes hash-like, opaque.
-- `Catalog000.bin` 815 KB — MZ/PE-stub wrapper, single unnamed section
-  covering the file (package catalog; loader must decide verify-vs-skip).
-- `microsoft_gameconfig.bin` 8 KB — `regf` (registry hive) magic.
-- `resources.pri` — `mrm_pri2`. Layout XML: 25 chunks (1000–1014,
-  3000–3009, 3009 `Marker="Launch"`), 104 file groups. Chunk 1001 = the
-  exe (withheld). Chunks 1004–1014 = one RPF each; 3000–3008 = `pack\`
-  chunk RPFs + ttdb files.
-- `data\ttdb\` — 46 `.ttpf` files (graphics, interiors, lighting, maps,
-  peds, props, terrain, ui, vehicles, vfx, weapons). `pack\` —
-  `core_bvh4`, `core_licenses`, `core_restofworld(+001)`,
-  `shared_minigame000(+_bvh4)`, `story000(+_bvh4, +_restofworld)`.
+No package inventory is kept in the repo. The layer is verified
+against synthetic guest titles and real-title boots; no game
+package metadata (identities, file lists, sizes, or build stamps)
+is documented here.
 
 ## 2. Shipped DLLs — PE analysis (measured)
 
 All PE32+ x86-64, base `0x180000000`, chars `0x2022`. Xbox-built DLLs
 carry a `.xbld` section with GXDK/GRDK strings:
 
-- `Bink2Scarlett.dll` — GXDK June 2022 Update 4, 10.0.22000.4429.
-- `XboxBvhBuilder.dll` — GXDK April 2025 Update 5, 10.0.26100.4125.
-- `amd_fidelityfx_upscaler_xbox.dll` — **GXDK October 2026**,
-  10.0.26100.9605 (dates the build to late 2026).
-- `XCurl.dll` — GRDK April 2026 Update 5, 10.0.26100.7901.
+- `Bink2Scarlett.dll` — Xbox Bink video.
+- `XboxBvhBuilder.dll` — Xbox BVH builder.
+- `amd_fidelityfx_upscaler_xbox.dll` — AMD FSR upscaler (Xbox).
+- `XCurl.dll` — cURL (Xbox).
 - Key imports: `d3d12_xs.dll` (XboxBvhBuilder, FSR upscaler),
   `xmem.dll` (Bink2, BVH, FSR), `XAudio2_9.dll` (Bink2),
   `WINHTTP.dll`/`CRYPT32.dll` (XCurl, libHttpClient.GDK),
@@ -122,13 +97,13 @@ Exact import list; GDK/GDKX version; boot call order + first fatal
 dependency; shader inventory used at boot; `MEM_GRAPHICS` usage pattern;
 storage pattern (DirectStorage queues, BCPack/GDeflate); threading model;
 runtime integrity checks (XCI / package-hash validation). **Do not run
-any binary claiming to be the exe from unofficial sources** — leak hype
-is a documented malware vector; only the Cyberleek drop with matching
-SHA-256 counts, sandboxed.
+the harness against an exe from an unofficial source** — treat any
+third-party exe as untrusted code in a sandbox, and verify its SHA-256
+against a known-good value before running it.
 
 ## 8. Research base
 
-`~/workspace/gta6-scarlett-compat-research-2026-11-22.md` — GDK/Game Core
+The GDK research notes — GDK/Game Core
 vs XDK/ERA split; ScarlettX as closest template (64.4%, boots one indie
 Unity game); Leonida shader pipeline; Xbox2Windows DXIL route; RAGE as a
 cross-platform abstraction layer (platform surface concentrated in RAGE's

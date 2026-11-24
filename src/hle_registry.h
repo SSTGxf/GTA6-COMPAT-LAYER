@@ -19,6 +19,14 @@
 
 namespace sc {
 
+// Set by the loader (LoadXboxPe) when the loaded image is a real Xbox
+// title (.xbld present AND a large image — the synthetic guests are
+// also .xbld-built, so size is the discriminator). The Xbox COM wrapper
+// only applies to real Xbox titles — synthetic guests use the desktop
+// D3D12 vtable layout and must get the raw desktop device, not the Xbox
+// wrapper.
+extern bool g_scGuestIsRealXboxTitle;
+
 // Host implementations of the shimmed Xbox functions.
 extern "C" HRESULT HleXGameRuntimeInitialize();
 extern "C" void* HleXMemAlloc(SIZE_T size, DWORD attrs);

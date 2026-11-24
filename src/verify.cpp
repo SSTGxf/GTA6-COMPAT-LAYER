@@ -1,6 +1,6 @@
 // scarlett_verify.cpp — verification harness.
 // The bar for this scaffolding (research brief §8): a loader + shimmed boot
-// path for a synthetic guest title and a first d3d12_xs frame — NOT GTA 6
+// path for a synthetic guest title and a first d3d12_xs frame — NOT the title
 // playable. This harness proves that bar per subsystem.
 //
 // Usage: scarlett_verify.exe <guest_pe_path> [timeout_ms]

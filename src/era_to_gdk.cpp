@@ -46,7 +46,7 @@ bool StartsWithCi(const char* s, const char* prefix) {
 // ERA modules the layer translates. None of these exist on desktop
 // ERA modules (phase 5): the Xbox One shim DLLs. A title importing any
 // of these is ERA. AcpHal.dll is NOT in this list: it is the audio DSP
-// HAL, shared across Xbox One and Series X — the real GTA 6 (GDK)
+// HAL, shared across Xbox One and Series X — the real title (GDK)
 // exe imports it (9 imports), so counting it as ERA mis-detected a
 // GDK title as ERA (boot #1, 2026-11-23). The _x modules below are
 // the ERA-only signal. AcpHal.dll still resolves through the HLE

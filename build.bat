@@ -22,7 +22,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OUT%\lib" mkdir "%OUT%\lib"
 
 echo === 1. ScarlettCompat.dll (layer) ===
-cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" "%ROOT%src\era_to_gdk.cpp" "%ROOT%src\software_rt.cpp" "%ROOT%src\fixed_timestep.cpp" "%ROOT%src\winrt_shim.cpp" "%ROOT%src\present.cpp" "%ROOT%src\opt_pso_cache.cpp" "%ROOT%src\opt_detile.cpp" "%ROOT%src\opt_mesh_fallback.cpp" "%ROOT%src\opt_async_compute.cpp" "%ROOT%src\opt_desc_heap.cpp" "%ROOT%src\opt_dstorage.cpp" "%ROOT%src\opt_shader_cache.cpp" "%ROOT%src\opt_texcache.cpp" "%ROOT%src\opt_batching.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib d3d11.lib d3dcompiler.lib winmm.lib runtimeobject.lib user32.lib ole32.lib
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\scarlett.cpp" "%ROOT%src\pe_loader.cpp" "%ROOT%src\hle_registry.cpp" "%ROOT%src\era_to_gdk.cpp" "%ROOT%src\software_rt.cpp" "%ROOT%src\fixed_timestep.cpp" "%ROOT%src\winrt_shim.cpp" "%ROOT%src\present.cpp" "%ROOT%src\opt_pso_cache.cpp" "%ROOT%src\opt_detile.cpp" "%ROOT%src\opt_mesh_fallback.cpp" "%ROOT%src\opt_async_compute.cpp" "%ROOT%src\opt_desc_heap.cpp" "%ROOT%src\opt_dstorage.cpp" "%ROOT%src\opt_shader_cache.cpp" "%ROOT%src\opt_texcache.cpp" "%ROOT%src\opt_batching.cpp" /LD /Fe"%OUT%\ScarlettCompat.dll" /Fo%OUT%\ /Fd%OUT%\ScarlettCompat.pdb /link d3d12.lib d3d11.lib d3dcompiler.lib dxgi.lib winmm.lib runtimeobject.lib user32.lib ole32.lib
 if errorlevel 1 exit /b 1
 
 echo === 2. Shim import libs (Xbox DLL names mapped to layer exports) ===

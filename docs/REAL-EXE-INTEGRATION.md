@@ -6,10 +6,8 @@ How the layer was fixed for the REAL Series X exe,
 The exe was read READ-ONLY (dumpbin /headers + /imports + /exports);
 it was never executed directly, never copied into the repo, and never
 modified. SHA-256 verified by the layer-fix agent with Get-FileHash:
-EXE `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`
-matches the published Cyberleek hash; ZIP
-`7545a2f7fb4b399cf8856987f087ed9ad48499ddb6d6c2d64f2fd60c27f569730`
-matches too.
+SHA-256 verified against a known-good value before any run; the exe is
+treated as untrusted code in a sandbox.
 
 ## The import table (587 imports, 68 modules)
 
@@ -84,17 +82,17 @@ HleEraD3D12XCreateDevice is a separate D3D12CreateDevice-shaped
 passthrough for the ERA entry. The ERA form is ASSUMED (phase 5) — a
 D3D11.x-only title does not import d3d12_x at all.
 
-### Boot #1 (2026-11-23 ~10:43 EST) — loader PASS, game crashed in its own early init
+### Boot #1 (2026-11-23 ~10:43 EST) — loader PASS, title crashed in its own early init
 
-The first boot of the real exe: **loader PASS, 68 modules, 587 imports resolved, 0 failed** (all 97 new entries hit). The game ran its entry point: D3D12ConfigureVirtualMemoryX returned S_OK, then it made 7 XMemVirtualAlloc arena allocations (two 24 GB reservations, 1.23 GB, 2.31 GB, 590 MB, 625 MB, 20 MB — all succeeded, via the VirtualAlloc flag-translation retry). It then crashed: harness reports "guest crashed in entry: exception 0xc0000005", child exit 0x80000003, minidump exception EXCEPTION_BREAKPOINT (0x80000003) at game offset 0x22106e0 — an `int3` padding byte immediately after the vtable-jump thunk `mov rax,[rcx]; jmp [rax+0xe0]` at 0x22106d0. The game called a virtual method whose vtable entry pointed to padding (an uninitialized/stub object), or hit a deliberate __debugbreak() on a failure path. **No D3D12XboxCreateDevice call was made — the game died before device creation, so the Xbox IID mapping is still unproven against the real exe.** Most likely cause: the exe is alone in its folder (no game data — no RPFs, no .dat); its early init likely loads a file, gets a NULL/placeholder, and calls a method on it. Log `F:\ScarlettCompat\gta_boot1.log`, dump `~/workspace/gta6-exe-re/gta_boot1.dmp`.
+The first boot of the real exe: **loader PASS, 68 modules, 587 imports resolved, 0 failed** (all 97 new entries hit). The title ran its entry point: D3D12ConfigureVirtualMemoryX returned S_OK, then it made 7 XMemVirtualAlloc arena allocations (two 24 GB reservations, 1.23 GB, 2.31 GB, 590 MB, 625 MB, 20 MB — all succeeded, via the VirtualAlloc flag-translation retry). It then crashed: harness reports "guest crashed in entry: exception 0xc0000005", child exit 0x80000003, minidump exception EXCEPTION_BREAKPOINT (0x80000003) at game offset 0x22106e0 — an `int3` padding byte immediately after the vtable-jump thunk `mov rax,[rcx]; jmp [rax+0xe0]` at 0x22106d0. The title called a virtual method whose vtable entry pointed to padding (an uninitialized/stub object), or hit a deliberate __debugbreak() on a failure path. **No D3D12XboxCreateDevice call was made — the title died before device creation, so the Xbox IID mapping is still unproven against the real exe.** Most likely cause: the exe is alone in its folder (no data files beside it); its early init likely loads a file, gets a NULL/placeholder, and calls a method on it. Log `F:\ScarlettCompat\boot1.log`, dump in the local boot-diagnosis notes.
 
 ### Boot #2 (2026-11-23 ~10:52 EST) — identical crash, ERA flag ruled out
 
-Re-ran after the AcpHal ERA-detection fix: the loader no longer flags the title as ERA (AcpHal imports now resolve as "shim", no WinRT warning), and the boot is otherwise byte-identical to boot #1 — same 7 XMemVirtualAlloc calls, same crash at the same point ("guest crashed in entry: exception 0xc0000005", child exit 0x80000003). The ERA flag was NOT the cause. The crash is in the game's own early init, before device creation. Next step for the boot: find what the game accesses just before the fault (file I/O trace, or the object whose vtable entry points to padding) — likely a missing-data failure, since the exe has no game data beside it. Log `F:\ScarlettCompat\gta_boot2.log`.
+Re-ran after the AcpHal ERA-detection fix: the loader no longer flags the title as ERA (AcpHal imports now resolve as "shim", no WinRT warning), and the boot is otherwise byte-identical to boot #1 — same 7 XMemVirtualAlloc calls, same crash at the same point ("guest crashed in entry: exception 0xc0000005", child exit 0x80000003). The ERA flag was NOT the cause. The crash is in the title's own early init, before device creation. Next step for the boot: find what the title accesses just before the fault (file I/O trace, or the object whose vtable entry points to padding) — likely a missing-data failure, since the exe has no data files beside it. Log `F:\ScarlettCompat\boot2.log`.
 
 ### ERA mis-detection (found by boot #1, fixed)
 
-The loader flagged the GTA 6 exe as an ERA title because it imports AcpHal.dll — but AcpHal.dll is the audio DSP HAL, shared across Xbox One and Series X (the real GDK exe imports it 9 times). The ERA-only signal is the `_x` modules (d3d11_x, d3d12_x, kernelx, xg_x). AcpHal.dll was removed from `kEraModules` (src/era_to_gdk.cpp); it still resolves through the HLE registry (kShimModules), which is separate from detection. The false ERA flag did not cause the boot #1 crash (the ERA translation only routes ERA imports, which the game does not have), but it produced a spurious WinRT warning and could have interfered. Boot #2 will confirm.
+The loader flagged the title exe as an ERA title because it imports AcpHal.dll — but AcpHal.dll is the audio DSP HAL, shared across Xbox One and Series X (the real GDK exe imports it 9 times). The ERA-only signal is the `_x` modules (d3d11_x, d3d12_x, kernelx, xg_x). AcpHal.dll was removed from `kEraModules` (src/era_to_gdk.cpp); it still resolves through the HLE registry (kShimModules), which is separate from detection. The false ERA flag did not cause the boot #1 crash (the ERA translation only routes ERA imports, which the title does not have), but it produced a spurious WinRT warning and could have interfered. Boot #2 will confirm.
 
 ### The REFIID is an Xbox IID, not a desktop IID (CRITICAL)
 
@@ -184,7 +182,7 @@ real LoadLibraryA — verified present in System32.
 - **LoadLibrary hooking** — the loader does not hook LoadLibrary;
   dynamic loads of Xbox DLLs at runtime would hit System32.
 - **The 5700 XT cannot verify the full pipeline** (no RT/mesh
-  shaders; GTA VI has 9,282 mesh shaders + DXR). The device the layer
+  shaders; the reference title has 9,282 mesh shaders + DXR). The device the layer
   creates is FL 12_1, not the Xbox fixed 12_2. A boot proves loading
   and early init, not a playable game.
 
@@ -221,10 +219,10 @@ real LoadLibraryA — verified present in System32.
   `0xcc` → `0x90`) and see whether the caller survives the
   NULL block; (2) H1 — seed/register the allocator so slot 0
   finds a block (requires finding the registration path).
-  Full write-up: `~/workspace/gta6-exe-re/BOOT4-DIAGNOSIS.md`;
-  log `F:\ScarlettCompat\gta_boot4.log`, dump
-  `~/workspace/gta6-exe-re/gta_boot4.dmp`.
-- **Still no `D3D12XboxCreateDevice` call in any boot** — the game
+  Full write-up in the local boot-diagnosis notes (boot #4);
+  log `F:\ScarlettCompat\boot4.log`, dump in the local
+  boot-diagnosis notes.
+- **Still no `D3D12XboxCreateDevice` call in any boot** — the title
   dies in static init, before device creation, so the Xbox IID
   mapping remains unproven against the real exe.
 
@@ -271,7 +269,6 @@ real LoadLibraryA — verified present in System32.
 - **Next work is H1:** find the registration path that writes
   `[object+0x1240]` / the free list, so slot 0 finds a block
   and F is never called. Patching around the guard/F traps is
-  exhausted. Full write-up:
-  `~/workspace/gta6-exe-re/BOOT5-DIAGNOSIS.md`; log
-  `F:\ScarlettCompat\gta_boot5.log`, build log
+  exhausted. Full write-up in the local boot-diagnosis notes
+  (boot #5); log `F:\ScarlettCompat\boot5.log`, build log
   `F:\ScarlettCompat\build_realexe9.log`.

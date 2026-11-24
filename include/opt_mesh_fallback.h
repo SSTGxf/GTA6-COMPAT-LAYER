@@ -1,5 +1,5 @@
 // opt_mesh_fallback.h — mesh-shader fallback for RDNA1
-// (docs/OPTIMIZATION.md item 3). GTA VI has 9,282 mesh shaders; mesh
+// (docs/OPTIMIZATION.md item 3). The title has 9,282 mesh shaders; mesh
 // shaders need FL 12_2 and the RX 5700 XT is FL 12_1 with no
 // mesh-shader hardware. This module replaces the mesh pipeline with the
 // classic pipeline: a meshlet (vertices + indices) is expanded into a

@@ -158,7 +158,7 @@ void ApplySectionProtections(void* base, const IMAGE_NT_HEADERS64* nt) {
     }
 }
 
-// GTA 6 boot #3 fix (game_scarlett_master.exe): the title's global
+// real-exe boot #3 fix (game_scarlett_master.exe): the title's global
 // memory-pool singleton has a derived vtable whose slot 6 is a deliberate
 // int3 trap (VA 0x1422106e0, bytes cc c3) in the shipped binary. During
 // static init the allocator's slot 0 returns NULL (empty, capacity 0)
@@ -172,7 +172,7 @@ void ApplySectionProtections(void* base, const IMAGE_NT_HEADERS64* nt) {
 // Fingerprint-gated on all three values, so proof guests (which have
 // neither the vtable nor the trap) are untouched. Runs while the image
 // is still RWX, before section protections make .rdata read-only.
-// Boot #5 (see gta6-exe-re/BOOT4-DIAGNOSIS.md): the vtable patch moved
+// Boot #5 (see the local boot #4 diagnosis): the vtable patch moved
 // the fault one step — F itself (RVA 0x2219620) is a noreturn path with
 // its own int3 at RVA 0x2219650 right after the slot-6 call, so slot 6
 // returning is fatal inside F. NOP that int3 (0xcc -> 0x90) so F
@@ -182,11 +182,11 @@ void ApplySectionProtections(void* base, const IMAGE_NT_HEADERS64* nt) {
 // (4C 89 F1 = mov rcx, r14), all verified against the exe bytes on
 // disk before patching.
 void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
-    // RVAs from the boot #3 diagnosis (see gta6-exe-re/BOOT3-DIAGNOSIS.md):
+    // RVAs from the boot #3 diagnosis (see the local boot #3 diagnosis):
     //   slot 6 qword  VA 0x1465f5450 -> RVA 0x65f5450
     //   trap          VA 0x1422106e0 -> RVA 0x22106e0
     //   base stub     VA 0x140004810 -> RVA 0x4810
-    // F's int3 (boot #5, see gta6-exe-re/BOOT4-DIAGNOSIS.md):
+    // F's int3 (boot #5, see the local boot #4 diagnosis):
     //   F int3        VA 0x142219650 -> RVA 0x2219650
     const uint32_t kSlotRva = 0x65f5450;
     const uint32_t kTrapRva = 0x22106e0;
@@ -233,7 +233,7 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
             "(byte 0x%02x, want 0xcc)",
             fInt3[0]);
     }
-    // Boot #6 / H1 Option A (see gta6-exe-re/BOOT6-H1-DIAGNOSIS.md):
+    // Boot #6 / H1 Option A (see the local boot #6 diagnosis):
     // grow the pool at construction so slot 0 returns a real block.
     // The pool is built as a 0x20-byte pool over a 0x60-byte BSS buffer;
     // the caller needs a 4-byte bitmap + a 0x5c0-byte entries array, so
@@ -349,6 +349,152 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
     Log("loader",
         "scarlett pool buffer patch: lea r8,[BSS] -> mov r8,[scratch] "
         "at RVA 0x1cff465");
+    // Boot #24: the pack-mgr fault fn (0x142236e00) gates its
+    // push-back registrations on the first pack lookup
+    // (0x14056eb10 for "appdata0.rpf"): `test al,al; je
+    // 0x14223716c` at RVA 0x2236e75. The lookup returns 0 even
+    // though the mount registry, the table, the dispatcher, the
+    // default object and its slot 0x168 (xor eax,eax; ret) all
+    // check out — so the push-backs never run, [rsi+0xc] stays 0,
+    // and the assert-check at 0x14223716c int3s on the empty
+    // count. NOP the 6-byte `je` so the fault fn always proceeds
+    // to the push-backs (which register the pack mounts and append
+    // to [rsi+0xc]). Fingerprint: 0F 84 <disp32>, disp must target
+    // the assert-check RVA 0x223716c.
+    const uint32_t kPackGateRva = 0x2236e75;
+    const uint32_t kPackGateTargetRva = 0x223716c;
+    if ((SIZE_T)kPackGateRva + 6 <= imageSize) {
+        uint8_t* gateSite = img + kPackGateRva;
+        const int32_t gateDisp = *(const int32_t*)(gateSite + 2);
+        const uint32_t gateTarget =
+            kPackGateRva + 6 + (uint32_t)gateDisp;
+        const bool gateOk =
+            gateSite[0] == 0x0f && gateSite[1] == 0x84 &&
+            gateTarget == kPackGateTargetRva;
+        if (!gateOk) {
+            Log("loader",
+                "scarlett pack-gate patch: fingerprint mismatch, "
+                "skipped (target RVA 0x%x, want 0x%x)",
+                gateTarget, kPackGateTargetRva);
+        } else {
+            for (int i = 0; i < 6; ++i) gateSite[i] = 0x90;
+            Log("loader",
+                "scarlett pack-gate patch: NOP je at RVA 0x2236e75 "
+                "(fault fn proceeds to push-backs)");
+        }
+    } else {
+        Log("loader",
+            "scarlett pack-gate patch: RVA out of range, skipped");
+    }
+    // DIAGNOSTIC (boot #38): the init function 0x142478440 returns false
+    // and its caller int3s at RVA 0x19f4f58 (`test al,al; jne +1; int3`).
+    // The IDXGIDevice wrapper (build 57) did NOT fix it, and the exact
+    // step inside 0x142478440 that returns false is not yet identified
+    // (GetCustomHeapProperties is never reached — count 0 in boot #38).
+    // NOP the single int3 byte so the game proceeds past the failed init
+    // check and reveals the NEXT blocker. This is a diagnostic bypass,
+    // not a fix: if the game crashes in a confusing place, the init
+    // function was essential and this NOP gets reverted. Fingerprint:
+    // bytes at RVA 0x19f4f54 must be 84 C0 75 01 CC
+    // (test al,al / jne +1 / int3).
+    const uint32_t kInitCheckRva = 0x19f4f58;
+    if ((SIZE_T)kInitCheckRva + 1 <= imageSize) {
+        uint8_t* int3Site = img + kInitCheckRva;
+        const bool int3Ok =
+            int3Site[-4] == 0x84 && int3Site[-3] == 0xc0 &&
+            int3Site[-2] == 0x75 && int3Site[-1] == 0x01 &&
+            int3Site[0] == 0xcc;
+        if (!int3Ok) {
+            Log("loader",
+                "scarlett init-check patch: fingerprint mismatch, "
+                "skipped");
+        } else {
+            int3Site[0] = 0x90;
+            Log("loader",
+                "scarlett init-check patch: NOP int3 at RVA 0x19f4f58 "
+                "(DIAGNOSTIC — game proceeds past failed init check)");
+        }
+    } else {
+        Log("loader",
+            "scarlett init-check patch: RVA out of range, skipped");
+    }
+    // DIAGNOSTIC (boot #48): the descriptor-heap creator 0x141cf3280
+    // asserts the CPU handle returned by heap slot 9 equals the base of
+    // the game's 185 MB reservation ([0x1475DF188], set by 0x141e86440):
+    //   test rbx,rbx; je +6; cmp r14,rbx; je +1; int3   (RVA 0x1cf3362)
+    // where r14 = the slot-9 CPU handle and rbx = [0x1475DF188]. On
+    // Xbox the heap is backed by that reservation, so the equality
+    // holds; on desktop D3D12 the driver allocates the heap's storage
+    // itself and the CPU handle is a driver pointer (boot #48:
+    // 0x1bfe1beb1a0), so the assert can never hold. NOP the single
+    // int3 byte so the game proceeds with the REAL CPU handle (which is
+    // what the descriptor writes and the GPU actually need) and reveals
+    // the NEXT blocker. This is a diagnostic bypass, not a fix: if the
+    // game later depends on the CPU handle being the reservation base,
+    // this NOP gets reverted and the heap backing rethought.
+    // Fingerprint: bytes at RVA 0x1cf3362 must be
+    // 48 85 DB 74 06 49 39 DE 74 01 CC
+    // (test rbx,rbx / je +6 / cmp r14,rbx / je +1 / int3).
+    const uint32_t kHeapHandleAssertRva = 0x1cf336c;
+    if ((SIZE_T)kHeapHandleAssertRva + 1 <= imageSize) {
+        uint8_t* heapAssertSite = img + kHeapHandleAssertRva;
+        const bool heapAssertOk =
+            heapAssertSite[-10] == 0x48 && heapAssertSite[-9] == 0x85 &&
+            heapAssertSite[-8] == 0xdb && heapAssertSite[-7] == 0x74 &&
+            heapAssertSite[-6] == 0x06 && heapAssertSite[-5] == 0x49 &&
+            heapAssertSite[-4] == 0x39 && heapAssertSite[-3] == 0xde &&
+            heapAssertSite[-2] == 0x74 && heapAssertSite[-1] == 0x01 &&
+            heapAssertSite[0] == 0xcc;
+        if (!heapAssertOk) {
+            Log("loader",
+                "scarlett heap-handle-assert patch: fingerprint mismatch, "
+                "skipped");
+        } else {
+            heapAssertSite[0] = 0x90;
+            Log("loader",
+                "scarlett heap-handle-assert patch: NOP int3 at RVA "
+                "0x1cf336c (DIAGNOSTIC — game proceeds with real CPU "
+                "handle)");
+        }
+    } else {
+        Log("loader",
+            "scarlett heap-handle-assert patch: RVA out of range, skipped");
+    }
+    // Boot #17: the VFS initializer (0x1428c2010) zeroes the mount
+    // registry (initFlag/count/array) with a single vmovups at RVA
+    // 0x28c21b7 — which wipes the layer's pre-entry registry
+    // population before pack-init ever runs. NOP that one instruction
+    // so the populated registry survives static init. Fingerprint:
+    // VEX vmovups [rip+disp32], xmm6 = c5 f8 11 35 <disp32>, and the
+    // disp must target the mount init flag (RVA 0x78f5ec0).
+    // The lock write just after it (mov [rip+...], rsi at 0x28c21d7)
+    // is left alone — the lock still gets initialized.
+    const uint32_t kVfsWipeRva = 0x28c21b7;
+    const uint32_t kMountInitFlagTargetRva = 0x78f5ec0;
+    if ((SIZE_T)kVfsWipeRva + 8 > imageSize) {
+        Log("loader",
+            "scarlett VFS wipe patch: RVA out of range, skipped");
+        return;
+    }
+    uint8_t* wipeSite = img + kVfsWipeRva;
+    const int32_t wipeDisp = *(const int32_t*)(wipeSite + 4);
+    const uint32_t wipeTarget =
+        kVfsWipeRva + 8 + (uint32_t)wipeDisp;
+    const bool wipeOk =
+        wipeSite[0] == 0xc5 && wipeSite[1] == 0xf8 &&
+        wipeSite[2] == 0x11 && wipeSite[3] == 0x35 &&
+        wipeTarget == kMountInitFlagTargetRva;
+    if (!wipeOk) {
+        Log("loader",
+            "scarlett VFS wipe patch: fingerprint mismatch, skipped "
+            "(target RVA 0x%x, want 0x%x)",
+            wipeTarget, kMountInitFlagTargetRva);
+        return;
+    }
+    for (int i = 0; i < 8; ++i) wipeSite[i] = 0x90;
+    Log("loader",
+        "scarlett VFS wipe patch: NOP vmovups at RVA 0x28c21b7 "
+        "(mount registry survives VFS init)");
 }
 
 // Per-thread TLS for guest worker threads (phase 3). SetupTls fills
@@ -494,6 +640,89 @@ using CreateRemoteThreadFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES,
                                              LPVOID, DWORD, LPDWORD);
 static CreateThreadFn g_realCreateThread = nullptr;
 static CreateRemoteThreadFn g_realCreateRemoteThread = nullptr;
+
+// Guest-drive path rewrite (real-exe boot #26): the game builds pack paths
+// as "G:/<name>" (the Xbox content drive; the pack table's entry string
+// is "G:/") and opens them via CreateFileW / GetFileAttributesW through
+// the VFS object's vtable slots 0x28 / 0x168. On Seth's PC, G: is a REAL
+// USB drive (ESD-USB), so "G:/appdata0.rpf" does not exist there and the
+// open returns -1 — which is why the pack-mgr lookup returns 0 and the
+// sibling ctor NULL-derefs (boots #25/#26). DefineDosDevice cannot be
+// used (it would shadow the real USB drive). Instead, the layer rewrites
+// a leading "G:/" or "G:\" (case-insensitive) to the guest dir in the
+// game's own file-API imports, so "G:/appdata0.rpf" opens
+// D:\game\game\appdata0.rpf. Only the guest image's IAT is patched —
+// the layer's own calls are untouched.
+static wchar_t g_scarlettGuestDir[MAX_PATH] = {};
+static LONG g_pathRewriteLogged = 0;
+
+using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD,
+                                       LPSECURITY_ATTRIBUTES, DWORD, DWORD,
+                                       HANDLE);
+using GetFileAttributesWFn = DWORD(WINAPI*)(LPCWSTR);
+using GetFileAttributesExWFn = BOOL(WINAPI*)(LPCWSTR,
+                                             GET_FILEEX_INFO_LEVELS, LPVOID);
+static CreateFileWFn g_realCreateFileW = nullptr;
+static GetFileAttributesWFn g_realGetFileAttributesW = nullptr;
+static GetFileAttributesExWFn g_realGetFileAttributesExW = nullptr;
+
+// Rewrite a leading "G:/" or "G:\" to the guest dir. Returns true if
+// rewritten (out holds the new path), false if the path is untouched.
+static bool RewriteGuestDrivePath(LPCWSTR in, wchar_t* out,
+                                  size_t outChars) {
+    if (!in || !g_scarlettGuestDir[0]) return false;
+    if (!((in[0] == L'G' || in[0] == L'g') && in[1] == L':' &&
+          (in[2] == L'/' || in[2] == L'\\')))
+        return false;
+    // Skip "G:/" (3 chars); the rest is relative to the guest dir.
+    const wchar_t* rest = in + 3;
+    size_t gdLen = wcslen(g_scarlettGuestDir);
+    if (gdLen + 1 + wcslen(rest) + 1 > outChars) return false;
+    wcscpy_s(out, outChars, g_scarlettGuestDir);
+    if (gdLen > 0 && g_scarlettGuestDir[gdLen - 1] != L'\\')
+        wcscat_s(out, outChars, L"\\");
+    size_t pos = wcslen(out);
+    for (size_t i = 0; rest[i] && pos + 1 < outChars; ++i)
+        out[pos++] = (rest[i] == L'/') ? L'\\' : rest[i];
+    out[pos] = L'\0';
+    if (InterlockedExchange(&g_pathRewriteLogged, 1) == 0)
+        Log("loader", "path-rewrite: \"%ls\" -> \"%ls\"", in, out);
+    return true;
+}
+
+static HANDLE WINAPI ScarlettCreateFileW(
+    LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
+    if (!g_realCreateFileW) return INVALID_HANDLE_VALUE;
+    wchar_t rewritten[MAX_PATH * 2];
+    LPCWSTR name = lpFileName;
+    if (RewriteGuestDrivePath(lpFileName, rewritten, _countof(rewritten)))
+        name = rewritten;
+    return g_realCreateFileW(name, dwDesiredAccess, dwShareMode,
+                             lpSecurityAttributes, dwCreationDisposition,
+                             dwFlagsAndAttributes, hTemplateFile);
+}
+
+static DWORD WINAPI ScarlettGetFileAttributesW(LPCWSTR lpFileName) {
+    if (!g_realGetFileAttributesW) return INVALID_FILE_ATTRIBUTES;
+    wchar_t rewritten[MAX_PATH * 2];
+    LPCWSTR name = lpFileName;
+    if (RewriteGuestDrivePath(lpFileName, rewritten, _countof(rewritten)))
+        name = rewritten;
+    return g_realGetFileAttributesW(name);
+}
+
+static BOOL WINAPI ScarlettGetFileAttributesExW(
+    LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId,
+    LPVOID lpFileInformation) {
+    if (!g_realGetFileAttributesExW) return FALSE;
+    wchar_t rewritten[MAX_PATH * 2];
+    LPCWSTR name = lpFileName;
+    if (RewriteGuestDrivePath(lpFileName, rewritten, _countof(rewritten)))
+        name = rewritten;
+    return g_realGetFileAttributesExW(name, fInfoLevelId, lpFileInformation);
+}
 
 // Set up TLS for the calling thread: allocate a block, copy the
 // template, write it into the TEB TLS array, and run the .CRT$XLB
@@ -673,6 +902,130 @@ void HookThreadCreation(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
                     (uint64_t)(void*)ScarlettCreateRemoteThread;
                 Log("loader",
                     "hooked kernel32!CreateRemoteThread for guest TLS");
+            }
+        }
+    }
+}
+
+// Crash-filter protection (real-exe boot #13): the guest imports
+// kernel32!SetUnhandledExceptionFilter and its CRT replaces the
+// layer's UnhandledFilter during static init. Boots #12/#13 died on
+// an int3 assert (0x80000003) with NO layer dump and NO "guest
+// crashed" log line — the unhandled filter never fired — while the
+// boot #6 AVs (entry thread, CrashFilter) DID dump. The game's filter
+// is a crash reporter/telemetry hook; the layer owns crash handling
+// (WriteCrashDump), so the game's replacement is dropped and the
+// layer's filter stays installed. Matches the import by NAME under any
+// module (kernel32.dll or the errorhandling API set) — the exact
+// descriptor the game uses was not pinned down, and the name is
+// unambiguous.
+// NOTE: this stub deliberately does NOT return the layer's filter
+// (UnhandledFilter lives in namespace sc, outside the anonymous
+// namespace this hook is in, so naming it here would create a second
+// overload). It returns nullptr — "no previous filter" — which is safe:
+// even if the game later tries to restore the returned value, the hook
+// intercepts that call too and the layer filter stays installed.
+static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI
+ScarlettSetUnhandledExceptionFilter(
+    LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter) {
+    (void)lpTopLevelExceptionFilter;
+    Log("loader",
+        "crash-filter: guest tried to replace UnhandledFilter; "
+        "keeping the layer filter installed");
+    return nullptr;
+}
+
+// Patches the guest's SetUnhandledExceptionFilter import (any module)
+// to ScarlettSetUnhandledExceptionFilter. Runs in the same window as
+// HookThreadCreation: after import resolution (FT holds the real
+// addresses), before section protections (.rdata -> R). A missing
+// import is fine (the guest may not use that path); the VEH installed
+// in RunXboxPe is the backstop for the breakpoint case.
+void HookCrashFilterProtection(const uint8_t* file,
+                               const IMAGE_NT_HEADERS64* nt, void* base) {
+    const IMAGE_DATA_DIRECTORY& impDir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!impDir.VirtualAddress || !impDir.Size) return;
+    auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)RvaToFile(
+        file, nt, impDir.VirtualAddress, nullptr);
+    for (; desc && desc->Name; ++desc) {
+        uint32_t oftRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                   : desc->FirstThunk;
+        auto* oft = (const IMAGE_THUNK_DATA64*)RvaToFile(file, nt, oftRva,
+                                                         nullptr);
+        auto* ft = (IMAGE_THUNK_DATA64*)((uint8_t*)base + desc->FirstThunk);
+        if (!oft || !ft) continue;
+        for (size_t k = 0; oft[k].u1.Ordinal != 0; ++k) {
+            if (oft[k].u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            auto* ibn = (const IMAGE_IMPORT_BY_NAME*)RvaToFile(
+                file, nt, (uint32_t)oft[k].u1.AddressOfData, nullptr);
+            if (!ibn) continue;
+            if (CiEq((const char*)ibn->Name,
+                     "SetUnhandledExceptionFilter")) {
+                ft[k].u1.Function =
+                    (uint64_t)(void*)ScarlettSetUnhandledExceptionFilter;
+                Log("loader",
+                    "hooked SetUnhandledExceptionFilter for guest "
+                    "crash-filter protection");
+                return;
+            }
+        }
+    }
+}
+
+// Patch the guest's file-API imports (CreateFileW, GetFileAttributesW,
+// GetFileAttributesExW) to the path-rewrite stubs above (real-exe boot #26).
+// Runs in the same window as HookThreadCreation /
+// HookCrashFilterProtection: after import resolution (the FT entries hold
+// the real addresses) and before section protections (.rdata -> R).
+// Matches the import by NAME under any module (kernel32.dll or the file
+// API set api-ms-win-core-file-l1-1-0.dll — the real exe imports
+// CreateFileW / GetFileAttributesW from the API set, which is why the
+// module is not pinned down). A missing import is fine; the guest may
+// simply not use that path.
+void HookGuestDrivePaths(const uint8_t* file, const IMAGE_NT_HEADERS64* nt,
+                         void* base) {
+    const IMAGE_DATA_DIRECTORY& impDir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!impDir.VirtualAddress || !impDir.Size) return;
+    auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)RvaToFile(
+        file, nt, impDir.VirtualAddress, nullptr);
+    for (; desc && desc->Name; ++desc) {
+        uint32_t oftRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                   : desc->FirstThunk;
+        auto* oft = (const IMAGE_THUNK_DATA64*)RvaToFile(file, nt, oftRva,
+                                                         nullptr);
+        auto* ft = (IMAGE_THUNK_DATA64*)((uint8_t*)base + desc->FirstThunk);
+        if (!oft || !ft) continue;
+        for (size_t k = 0; oft[k].u1.Ordinal != 0; ++k) {
+            if (oft[k].u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            auto* ibn = (const IMAGE_IMPORT_BY_NAME*)RvaToFile(
+                file, nt, (uint32_t)oft[k].u1.AddressOfData, nullptr);
+            if (!ibn) continue;
+            const char* fnName = (const char*)ibn->Name;
+            if (CiEq(fnName, "CreateFileW") && !g_realCreateFileW) {
+                g_realCreateFileW = (CreateFileWFn)ft[k].u1.Function;
+                ft[k].u1.Function = (uint64_t)(void*)ScarlettCreateFileW;
+                Log("loader",
+                    "hooked CreateFileW for guest-drive path rewrite");
+            } else if (CiEq(fnName, "GetFileAttributesW") &&
+                       !g_realGetFileAttributesW) {
+                g_realGetFileAttributesW =
+                    (GetFileAttributesWFn)ft[k].u1.Function;
+                ft[k].u1.Function =
+                    (uint64_t)(void*)ScarlettGetFileAttributesW;
+                Log("loader",
+                    "hooked GetFileAttributesW for guest-drive path "
+                    "rewrite");
+            } else if (CiEq(fnName, "GetFileAttributesExW") &&
+                       !g_realGetFileAttributesExW) {
+                g_realGetFileAttributesExW =
+                    (GetFileAttributesExWFn)ft[k].u1.Function;
+                ft[k].u1.Function =
+                    (uint64_t)(void*)ScarlettGetFileAttributesExW;
+                Log("loader",
+                    "hooked GetFileAttributesExW for guest-drive path "
+                    "rewrite");
             }
         }
     }
@@ -947,6 +1300,10 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
         if (p != std::wstring::npos) {
             dir = dir.substr(0, p);
             SetGuestDir(dir.c_str());
+            wcsncpy_s(out->guestDir, dir.c_str(), _TRUNCATE);
+            // The guest-drive path rewrite (real-exe boot #26) needs the
+            // guest dir at runtime, after LoadXboxPe returns.
+            wcsncpy_s(g_scarlettGuestDir, dir.c_str(), _TRUNCATE);
         }
     }
     auto fail = [&](const char* fmt, ...) {
@@ -1007,6 +1364,19 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     } else {
         Log("loader", "WARNING: no .xbld section (not an Xbox-built PE?)");
     }
+    // The Xbox COM wrapper only applies to real Xbox titles. Synthetic
+    // guests are ALSO .xbld-built (GXDK/ERA toolchain) and have a real
+    // .xbld section, so hasXbld alone cannot distinguish them — but
+    // they are small test programs that use the DESKTOP D3D12 vtable
+    // layout and must get the raw device (build 44 proved wrapping
+    // them breaks every gfx verify run with E_NOTIMPL). The real game
+    // is a 120 MB image (SizeOfImage ~176 MB); every synthetic guest
+    // is a few MB at most. Gate the wrapper on a large image as well
+    // as .xbld. This is a heuristic, documented as such: if a future
+    // real title is ever under 32 MB, or a synthetic guest over it,
+    // this gate needs revisiting. NOTE: this must run AFTER
+    // out->imageSize is assigned below (it is 0 until then).
+    // (Set after the mapping, below.)
 
     // Map the image.
     SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
@@ -1021,6 +1391,10 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     }
     if (!base) return fail("VirtualAlloc failed (err %lu)", GetLastError());
     out->base = base;
+    out->imageSize = imageSize;
+    // Now that out->imageSize is assigned, set the COM-wrapper gate.
+    g_scGuestIsRealXboxTitle =
+        out->hasXbld && out->imageSize >= (32ULL << 20);
 
     // Copy headers + sections.
     memcpy(base, buf, nt->OptionalHeader.SizeOfHeaders);
@@ -1243,6 +1617,18 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     // real addresses) and before section protections (.rdata -> R).
     HookThreadCreation(buf, nt, base);
 
+    // Crash-filter protection (real-exe boot #13): the guest replaces the
+    // layer's UnhandledFilter during static init, so int3 asserts never
+    // dump. Same window as the thread hooks (after imports, before
+    // protections).
+    HookCrashFilterProtection(buf, nt, base);
+
+    // Guest-drive path rewrite (real-exe boot #26): the game opens pack
+    // files as "G:/<name>" and G: is a real USB drive on this PC, so
+    // the opens fail. Rewrite "G:/..." to the guest dir in the game's
+    // file-API imports. Same window as the hooks above.
+    HookGuestDrivePaths(buf, nt, base);
+
     // WinRT activation hooks (WinRT phase): only for ERA titles —
     // routes CoreApplication activation through the layer's shim (both
     // the direct RoGet path and the vccorlib110 path an Xbox One title
@@ -1250,7 +1636,7 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     // before protections).
     if (out->eraDetected) HookWinRtActivation(buf, nt, base);
 
-    // GTA 6 boot #3/#5 fix: patch the derived vtable's slot 6 and NOP
+    // real-exe boot #3/#5 fix: patch the derived vtable's slot 6 and NOP
     // F's int3 (see ApplyScarlettVtablePatch). Must run while the image
     // is still RWX, i.e. before section protections make .rdata
     // read-only.
@@ -1372,7 +1758,354 @@ static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// Crash filter for the guest entry point (GTA 6 boot #6 / H1 harness
+// Vectored-handler backstop (real-exe boot #13). The int3 assert that
+// killed boots #12/#13 (0x80000003) never reached UnhandledFilter and
+// never dumped — the game's CRT replaces the unhandled filter during
+// static init (see HookCrashFilterProtection). A VEH fires first-chance
+// on ANY thread and cannot be displaced by SetUnhandledExceptionFilter,
+// so it guarantees a dump + a mount-registry probe for the breakpoint
+// case. It handles ONLY 0x80000003, once per run, and returns
+// CONTINUE_SEARCH so normal handling (and the exit code) is unchanged.
+// AVs are deliberately left alone: the guest may catch them itself, and
+// a first-chance dump there would be noise.
+static void* g_guestBaseForVeh = nullptr;
+static LONG g_vehDumped = 0;
+
+// Boot #13 diagnostic probe: reads the the title VFS mount-registry state
+// from the guest image at fixed RVAs (same convention as the existing
+// title-specific patches: pool vtable patch, F int3 NOP, Option A).
+//   mount count 0x78f5ec4, array 0x78f5ec8, init flag 0x78f5ec0,
+//   lookup name pointer 0x74539f6,
+//   scheme globals 0x78f6250 / 0x78f6888 / 0x78f6880.
+// All reads guarded — the registry may be uninitialized and the name
+// pointer may be null. The answers decide the boot #13 fix: a count of
+// 0 means no mount was ever registered before pack-init; a non-empty
+// registry with no "packroot" entry means the wrong mounts registered.
+static void LogMountProbe() {
+    uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+    if (!base) {
+        Log("loader", "mount-probe: no guest base");
+        return;
+    }
+    __try {
+        uint32_t count = *(uint32_t*)(base + 0x78f5ec4);
+        void* array = *(void**)(base + 0x78f5ec8);
+        uint32_t initFlag = *(uint32_t*)(base + 0x78f5ec0);
+        // The lookup name global at RVA 0x74539f6 is NOT a pointer: the
+        // string itself is stored INLINE in a .data char buffer (boot #14
+        // showed its first qword = the ASCII bytes "appdata0"). Read the
+        // buffer directly instead of dereferencing the qword as a pointer.
+        const char* nameStr = (const char*)(base + 0x74539f6);
+        void* h1 = *(void**)(base + 0x78f6250);
+        void* h2 = *(void**)(base + 0x78f6888);
+        void* h3 = *(void**)(base + 0x78f6880);
+        static char nameBuf[64];
+        const char* name = "<null>";
+        __try {
+            size_t i = 0;
+            for (; i < sizeof(nameBuf) - 1 && nameStr[i]; ++i)
+                nameBuf[i] = nameStr[i];
+            nameBuf[i] = '\0';
+            name = nameBuf;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            name = "<unreadable>";
+        }
+        Log("loader",
+            "mount-probe: count=%lu array=%p initFlag=%lu "
+            "nameBuf=\"%s\" schemeH1=%p schemeH2=%p schemeH3=%p",
+            (unsigned long)count, array, (unsigned long)initFlag,
+            name, h1, h2, h3);
+        // The fault fn's 3rd lookup arg (r9) is a runtime-filled
+        // buffer at RVA 0x678d1bb; it drives the transform's join
+        // logic. Log it, plus the pack-mgr vector count [obj+0xc]
+        // (manager object global at RVA 0x7f00510) — the assert is
+        // gated on that count, not directly on the lookup result.
+        __try {
+            static char r9Buf[64];
+            const char* r9s = (const char*)(base + 0x678d1bb);
+            size_t i = 0;
+            for (; i < sizeof(r9Buf) - 1 && r9s[i]; ++i)
+                r9Buf[i] = r9s[i];
+            r9Buf[i] = '\0';
+            Log("loader", "mount-probe: r9buf=\"%s\"", r9Buf);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("loader", "mount-probe: r9buf=<unreadable>");
+        }
+        __try {
+            void* mgr = *(void**)(base + 0x7f00510);
+            uint32_t mgrCount =
+                mgr ? *(uint32_t*)((uint8_t*)mgr + 0xc) : 0xffffffffu;
+            Log("loader", "mount-probe: packMgr=%p count=%lu",
+                mgr, (unsigned long)mgrCount);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("loader", "mount-probe: packMgr=<unreadable>");
+        }
+        // The pack-mgr lookup's table is a TLS singleton: flag at
+        // TLS[0]+0x7f8, table at TLS[0]+0x7f0, count at
+        // [table+0xc04]. NOTE: the game's patched code reads the
+        // /GA view (TlsSlots[gaSlot]), whose [0] is the game block —
+        // but the real TLS array's slot 10 IS the game block too
+        // (TlsAlloc returned 10, and the loader writes the block
+        // there as well). Read the table from slot10, the real game
+        // block; slot0 is another module's block and reads 0/NULL.
+        __try {
+            void** tlsArray = (void**)__readgsqword(0x58);
+            void* slot0 = tlsArray ? tlsArray[0] : nullptr;
+            void* slot10 = tlsArray ? tlsArray[10] : nullptr;
+            void* view = (void*)TlsGetValue(g_gaSlot);
+            void* view0 = view ? ((void**)view)[0] : nullptr;
+            void* tbl = nullptr;
+            uint32_t tblFlag = 0xffffffffu;
+            uint32_t tblCount = 0xffffffffu;
+            // The game reads the table through the /GA view
+            // (view[0]), NOT through the real TLS array[10] —
+            // view0 and slot10 are different blocks, so read the
+            // table from view0, the block the game actually uses.
+            if (view0) {
+                tblFlag = *(uint32_t*)((uint8_t*)view0 + 0x7f8);
+                tbl = *(void**)((uint8_t*)view0 + 0x7f0);
+                if (tbl)
+                    tblCount = *(uint32_t*)((uint8_t*)tbl + 0xc04);
+            }
+            Log("loader",
+                "mount-probe: tlsArray=%p slot0=%p slot10=%p "
+                "view=%p view0=%p tblFlag=%lu table=%p tblCount=%lu",
+                tlsArray, slot0, slot10, view, view0,
+                (unsigned long)tblFlag, tbl,
+                (unsigned long)tblCount);
+            // Boot #25: the table header is valid (tblCount=1) but the
+            // lookup still returns 0, so dump the table ENTRY contents
+            // the lookup iterates — if the entry region is all zeros,
+            // the ctor only wrote the header and never populated an
+            // entry. Also confirm the default object's runtime vtable
+            // and slot 0x28 (the ctor's open/get-info call, which
+            // returned -1 in boot #25).
+            if (tbl) {
+                uint64_t t0 = *(uint64_t*)((uint8_t*)tbl + 0x0);
+                uint64_t t8 = *(uint64_t*)((uint8_t*)tbl + 0x8);
+                uint64_t tc00 = *(uint64_t*)((uint8_t*)tbl + 0xc00);
+                uint64_t tc08 = *(uint64_t*)((uint8_t*)tbl + 0xc08);
+                uint64_t tc10 = *(uint64_t*)((uint8_t*)tbl + 0xc10);
+                uint64_t tc18 = *(uint64_t*)((uint8_t*)tbl + 0xc18);
+                Log("loader",
+                    "mount-probe: table[0]=%llx table[8]=%llx "
+                    "table[c00]=%llx table[c08]=%llx "
+                    "table[c10]=%llx table[c18]=%llx",
+                    (unsigned long long)t0, (unsigned long long)t8,
+                    (unsigned long long)tc00,
+                    (unsigned long long)tc08,
+                    (unsigned long long)tc10,
+                    (unsigned long long)tc18);
+            }
+            {
+                void* defObj = *(void**)(base + 0x78f5eb0);
+                void* defVt = defObj ? *(void**)defObj : nullptr;
+                void* slot28 =
+                    defVt ? *(void**)((uint8_t*)defVt + 0x28) : nullptr;
+                void* slot168 =
+                    defVt ? *(void**)((uint8_t*)defVt + 0x168) : nullptr;
+                Log("loader",
+                    "mount-probe: defObj=%p vtable=%p slot28=%p "
+                    "slot168=%p",
+                    defObj, defVt, slot28, slot168);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("loader", "mount-probe: tls=<unreadable>");
+        }
+        if (array && count > 0 && count < 10000) {
+            // The array holds 0x20-byte entries INLINE (not pointers
+            // to entries): entry i is at (uint8_t*)array + i*0x20.
+            uint8_t* entries = (uint8_t*)array;
+            uint32_t n = count < 4 ? count : 4;
+            for (uint32_t i = 0; i < n; ++i) {
+                __try {
+                    uint8_t* e = entries + i * 0x20;
+                    const char* ename = *(const char**)e;
+                    uint16_t elen = *(uint16_t*)(e + 0xa);
+                    uint16_t ekind = *(uint16_t*)(e + 0x8);
+                    uint32_t ecount = *(uint32_t*)(e + 0x14);
+                    void* eobj = *(void**)(e + 0x18);
+                    char ebuf[64] = {};
+                    if (ename) {
+                        size_t j = 0;
+                        for (; j < sizeof(ebuf) - 1 && ename[j]; ++j)
+                            ebuf[j] = ename[j];
+                    }
+                    Log("loader",
+                        "mount-probe: entry %lu name=\"%s\" len=%u "
+                        "kind=%u count=%lu objList=%p",
+                        (unsigned long)i, ebuf, (unsigned)elen,
+                        (unsigned)ekind, (unsigned long)ecount, eobj);
+                    // Also verify the mounted object itself: the
+                    // lookup calls vtable slot 0x168 on objList[0],
+                    // so a NULL/garbage vtable there would make the
+                    // lookup fail even with a valid registry.
+                    if (eobj && ecount > 0) {
+                        __try {
+                            void* obj = *(void**)eobj;
+                            void* vt = obj ? *(void**)obj : nullptr;
+                            void* slot168 =
+                                vt ? *(void**)((uint8_t*)vt + 0x168)
+                                   : nullptr;
+                            Log("loader",
+                                "mount-probe: entry %lu obj=%p "
+                                "vtable=%p slot168=%p",
+                                (unsigned long)i, obj, vt, slot168);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            Log("loader",
+                                "mount-probe: entry %lu obj unreadable",
+                                (unsigned long)i);
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    Log("loader", "mount-probe: entry %lu unreadable",
+                        (unsigned long)i);
+                }
+            }
+        }
+        // Boot #42: 0x142478440 (D3D12 init) returns false and the
+        // global at RVA 0x75df128 is NULL at the crash in 0x145eb2480.
+        // The setter (0x145bdb830, called from 0x1424792f4) stores the
+        // return of 0x145bdb8c0 into 0x75df128 unconditionally, and
+        // 0x145bdb8c0 crashes at [NULL+8] if its factory returns NULL
+        // — so if the setter ran, the global is non-NULL. The failure
+        // is therefore BEFORE the setter or in the two 0x14161cef0
+        // calls after it (0x142479345 / 0x142479366, each `je` to a
+        // false return). Dump the globals that distinguish the cases:
+        //   setter ran?  -> 0x75df130 non-NULL, flags 0x75df0f6 bit 2
+        //   reached 0x142479337? -> 0x75e75d0 non-NULL
+        //   0x14161cef0 #1 ok? -> 0x75df220 non-NULL (its out ptr);
+        //     its count input is the u32 at 0x75df1c8
+        //   0x14161cef0 #2 ok? -> 0x75df240 non-NULL
+        //   0x1417f6a30 objects (both calls proved ok by the 512+64
+        //     command lists in the boot #41 log) -> 0x75e7360/70
+        //   slot-41 `this` object -> 0x8759d00 (should be the device
+        //     wrapper; if the slot-41 calls ran, the layer would have
+        //     logged UNIMPLEMENTED — none appear, so they never ran)
+        __try {
+            uint64_t g128 = *(uint64_t*)(base + 0x75df128);
+            uint64_t g130 = *(uint64_t*)(base + 0x75df130);
+            uint16_t flags = *(uint16_t*)(base + 0x75df0f6);
+            uint32_t cnt = *(uint32_t*)(base + 0x75df1c8);
+            uint64_t r886 = *(uint64_t*)(base + 0x75e75d0);
+            uint64_t out1 = *(uint64_t*)(base + 0x75df220);
+            uint64_t out2 = *(uint64_t*)(base + 0x75df240);
+            uint64_t objA = *(uint64_t*)(base + 0x75e7360);
+            uint64_t objB = *(uint64_t*)(base + 0x75e7370);
+            uint64_t ba0 = *(uint64_t*)(base + 0x75df010);
+            uint64_t dev = *(uint64_t*)(base + 0x8759d00);
+            uint64_t a18 = *(uint64_t*)(base + 0x75df0a8);
+            uint32_t tlsIdx = *(uint32_t*)(base + 0x6e08b2c);
+            Log("loader",
+                "mount-probe: init42 g128=%llx g130=%llx flags=%x "
+                "count=%lu r886=%llx out1=%llx out2=%llx",
+                (unsigned long long)g128, (unsigned long long)g130,
+                (unsigned)flags, (unsigned long)cnt,
+                (unsigned long long)r886, (unsigned long long)out1,
+                (unsigned long long)out2);
+            Log("loader",
+                "mount-probe: init42 objA=%llx objB=%llx ba0obj=%llx "
+                "devglob=%llx alloc18=%llx tlsIdx=%lu",
+                (unsigned long long)objA, (unsigned long long)objB,
+                (unsigned long long)ba0, (unsigned long long)dev,
+                (unsigned long long)a18, (unsigned long)tlsIdx);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("loader", "mount-probe: init42=<unreadable>");
+        }
+        // Boot #43: bracket the stop point inside 0x142478440.
+        // Boot #42 proved the setter (0x1424792f4) never runs
+        // (g130=0, flags=0, r886=0, alloc18=0) while the two
+        // 0x1417f6a30 objects ARE allocated — and the log shows only
+        // ONE GetDescriptorHandleIncrementSize (type 0) although the
+        // code has five sequential slot-15 calls on the same object.
+        // The stores below are written in order by the tail, so their
+        // values bracket exactly how far the flow got:
+        //   0x75e7000 = descriptor-size type-0 result (expect 32)
+        //   0xa943aa0/a8 = slot-9 #1 result (0x142478f74/7b)
+        //   0x75e7010 = sub-result (0x142478f9d, after slot-9 #2)
+        //   0x75e7540..60 = the 0x14006de60 series stores
+        //   0x75e7390/0x75e7420 = the slot-9 `this` globals
+        __try {
+            uint32_t d0 = *(uint32_t*)(base + 0x75e7000);
+            uint64_t s9a = *(uint64_t*)(base + 0xa943aa0);
+            uint64_t s9b = *(uint64_t*)(base + 0xa943aa8);
+            uint64_t sub = *(uint64_t*)(base + 0x75e7010);
+            uint64_t t1 = *(uint64_t*)(base + 0x75e7390);
+            uint64_t t2 = *(uint64_t*)(base + 0x75e7420);
+            Log("loader",
+                "mount-probe: init43 d0=%lu s9a=%llx s9b=%llx "
+                "sub=%llx t1=%llx t2=%llx",
+                (unsigned long)d0, (unsigned long long)s9a,
+                (unsigned long long)s9b, (unsigned long long)sub,
+                (unsigned long long)t1, (unsigned long long)t2);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("loader", "mount-probe: init43a=<unreadable>");
+        }
+        __try {
+            uint64_t q0 = *(uint64_t*)(base + 0x75e7540);
+            uint64_t q1 = *(uint64_t*)(base + 0x75e7548);
+            uint64_t q2 = *(uint64_t*)(base + 0x75e7550);
+            uint64_t q3 = *(uint64_t*)(base + 0x75e7558);
+            uint64_t q4 = *(uint64_t*)(base + 0x75e7560);
+            Log("loader",
+                "mount-probe: init43 q0=%llx q1=%llx q2=%llx "
+                "q3=%llx q4=%llx",
+                (unsigned long long)q0, (unsigned long long)q1,
+                (unsigned long long)q2, (unsigned long long)q3,
+                (unsigned long long)q4);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("loader", "mount-probe: init43b=<unreadable>");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "mount-probe: registry unreadable");
+    }
+}
+
+static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    // Boot #25: the fault moved from the pack assert (0x80000003) to an
+    // access violation (0xc0000005, NULL-deref in the sibling pack fn).
+    // Catch both so the mount probe + dump fire at the AV too — the
+    // 0x80000003-only gate is why boot #25 produced no probe.
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != 0x80000003 && code != 0xc0000005)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedExchange(&g_vehDumped, 1) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+    Log("loader", "veh: exception 0x%08lx at %p thread %lu",
+        (unsigned long)code,
+        ep->ExceptionRecord->ExceptionAddress,
+        (unsigned long)GetCurrentThreadId());
+    // Boot #46: the fault IP can be inside a system DLL (not the game
+    // image), so resolve it to a module name + offset — otherwise the
+    // crashing DLL is unknowable from the log alone.
+    {
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCSTR)ep->ExceptionRecord->ExceptionAddress, &mod) &&
+            mod) {
+            char modPath[MAX_PATH] = {};
+            GetModuleFileNameA(mod, modPath, MAX_PATH);
+            const char* base = strrchr(modPath, '\\');
+            Log("loader", "veh: fault module %s +0x%llx (params[0]=0x%llx params[1]=0x%llx)",
+                base ? base + 1 : modPath,
+                (unsigned long long)((uintptr_t)ep->ExceptionRecord
+                                         ->ExceptionAddress -
+                                     (uintptr_t)mod),
+                (unsigned long long)ep->ExceptionRecord
+                    ->ExceptionInformation[0],
+                (unsigned long long)ep->ExceptionRecord
+                    ->ExceptionInformation[1]);
+        }
+    }
+    LogMountProbe();
+    WriteCrashDump(ep, "veh-breakpoint");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Crash filter for the guest entry point (real-exe boot #6 / H1 harness
 // improvement). Runs in the exception
 // filter expression, where GetExceptionInformation() is valid — the
 // __except handler body cannot see the record. Logs the exception
@@ -1390,12 +2123,237 @@ LONG CrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// ---- App-manifest mount registration (the title pack-table blocker) ----
+// Boot #15 proved the pack filesystem's first lookup is for the bare
+// filename "appdata0.rpf", and the VFS mount registry is EMPTY
+// (count=0), so the lookup returns 0 and pack-init asserts (int3 at
+// 0x142237178). The game does NOT read AppxManifest.xml itself and
+// imports NO Package/XPackage APIs, so registering the manifest with
+// Windows cannot populate the table — the table is fed by the game's
+// own VFS registration path (register fns 0x1412c5670/0x141fb2210),
+// which never runs before pack-init. What DOES feed it is the app's
+// data directory: the game needs a mount for the app (its manifest
+// identity + data dir) so "appdata0.rpf" resolves.
+//   So the layer registers the app manifest here: it reads
+// AppxManifest.xml from the guest dir (logging the Identity), then
+// populates the VFS mount registry DIRECTLY (writes the entries +
+// globals). It does NOT call the game's register fn: boot #16 proved
+// that fn cannot run pre-entry — its lazy-init allocator needs the
+// game's memory pool, which is only constructed during static init,
+// so the call faults in ntdll (WER: scarlett_verify.exe,
+// ntdll.dll+0x1a12d, 0xc0000005) and the __try does not catch it.
+// The registry is just data (count/array/entries), and the lookup
+// only reads it, so the layer writes it. The mounts cover every form
+// the name transform (0x14128bb70) can produce: "appdata/",
+// "appdata0/", "./", "D:/" (drive letter from the guest dir).
+// The mount object is a layer-built fake VFS filesystem object (same
+// pattern as the stub COM object): a 64-slot vtable where every slot
+// returns 0. Slot 45 (byte offset 0x168) is the "open/exists" the VFS
+// lookup calls; returning 0 (!= -1) makes the lookup report the name
+// as resolvable, so pack-init proceeds past the assert. The pack-mgr
+// will then try to actually open/read appdata0.rpf — that is the NEXT
+// fault to diagnose (a real file-serving object comes then, if the
+// fake one cannot serve it). The "g:" scheme object cannot be used
+// here: it lives in BSS and its vtable pointer is only set at runtime
+// by the VFS initializer, which has not run yet at this point.
+//   Called from RunXboxPe before the entry point (static init has not
+// run, but the guest is mapped). No game code is called here, so a
+// failure cannot kill the boot — the worst case is the registry
+// stays empty and the boot proceeds to the same pack assert as before.
+struct FakeVfsObject {
+    void** vtable;
+};
+static void* g_fakeVfsVtable[64];
+static FakeVfsObject g_fakeVfsObject;
+extern "C" LONG FakeVfsGeneric() { return 0; }
+struct FakeVfsVtableInit {
+    FakeVfsVtableInit() {
+        for (int i = 0; i < 64; ++i)
+            g_fakeVfsVtable[i] = (void*)FakeVfsGeneric;
+        g_fakeVfsObject.vtable = g_fakeVfsVtable;
+    }
+};
+static FakeVfsVtableInit g_fakeVfsVtableInit;
+
+// Mount-registry entry (0x20 bytes), as built by the game's register
+// fn (0x1412c5670) and read by the mount-registry lookup (0x1428c8ec0).
+// Layout confirmed from both functions' disassembly:
+//   +0x00 name pointer (qword)   +0x08 kind (word)   +0x0a length (word)
+//   +0x10 object-list capacity (dword)  +0x14 object count (dword)
+//   +0x18 object-list pointer (qword, array of object pointers)
+// The lookup returns the object directly when count==1 (no vtable
+// call); otherwise it calls vtable slot 0x168 on the objects in turn.
+struct MountRegistryEntry {
+    const char* name;       // +0x00
+    uint16_t kind;          // +0x08
+    uint16_t length;        // +0x0a
+    uint32_t reserved;      // +0x0c (padding; register fn leaves it zero)
+    uint32_t objCapacity;   // +0x10
+    uint32_t objCount;      // +0x14
+    void** objList;         // +0x18
+};
+static_assert(sizeof(MountRegistryEntry) == 0x20, "mount entry is 0x20");
+static_assert(offsetof(MountRegistryEntry, kind) == 0x08, "kind at +0x08");
+static_assert(offsetof(MountRegistryEntry, length) == 0x0a, "len at +0x0a");
+static_assert(offsetof(MountRegistryEntry, objCapacity) == 0x10, "cap +0x10");
+static_assert(offsetof(MountRegistryEntry, objCount) == 0x14, "cnt +0x14");
+static_assert(offsetof(MountRegistryEntry, objList) == 0x18, "list +0x18");
+// Registry globals (RVAs, confirmed from the register fn + lookup
+// disassembly): init flag 0x78f5ec0, count 0x78f5ec4, array 0x78f5ec8,
+// lock 0x78f5ed0 (left 0 = unlocked). The entries array has room for
+// 16 mounts so a later in-game registration can append without
+// overflowing it.
+static const uint32_t kMountInitFlagRva = 0x78f5ec0;
+static const uint32_t kMountCountRva = 0x78f5ec4;
+static const uint32_t kMountArrayRva = 0x78f5ec8;
+static const int kMountCapacity = 16;
+static MountRegistryEntry g_mountEntries[kMountCapacity];
+static void* g_mountObjLists[4];
+static char g_driveMount[8];
+
+static void RegisterAppManifestMount(LoadedPe* pe) {
+    // The registry globals live at RVAs 0x78f5ec0..0x78f5ed0; synthetic
+    // guests are far smaller, so this skips them (no game code is
+    // called here at all).
+    if ((uint64_t)kMountArrayRva + 8 > pe->imageSize) {
+        Log("loader",
+            "app-manifest: mount registry outside image — not the "
+            "real title, skipping mount registration");
+        return;
+    }
+    // 1. Read the app manifest (AppxManifest.xml) from the guest dir
+    //    and log the package Identity. This is the layer registering
+    //    the app by its manifest.
+    char manifest[8192] = {};
+    bool haveManifest = false;
+    {
+        std::wstring mpath = pe->guestDir;
+        if (!mpath.empty()) {
+            mpath += L"\\appxmanifest.xml";
+            HANDLE h = CreateFileW(mpath.c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                DWORD read = 0;
+                if (ReadFile(h, manifest, sizeof(manifest) - 1, &read,
+                             nullptr) &&
+                    read > 0) {
+                    haveManifest = true;
+                }
+                CloseHandle(h);
+            }
+        }
+    }
+    if (haveManifest) {
+        // Minimal parse: <Identity Name="..." ... Version="..." />
+        const char* id = strstr(manifest, "<Identity");
+        const char* name = id ? strstr(id, "Name=\"") : nullptr;
+        const char* ver = id ? strstr(id, "Version=\"") : nullptr;
+        char idName[128] = {};
+        char idVer[64] = {};
+        if (name) {
+            name += 6;
+            size_t n = 0;
+            while (n < sizeof(idName) - 1 && name[n] && name[n] != '"') {
+                idName[n] = name[n];
+                ++n;
+            }
+        }
+        if (ver) {
+            ver += 9;
+            size_t n = 0;
+            while (n < sizeof(idVer) - 1 && ver[n] && ver[n] != '"') {
+                idVer[n] = ver[n];
+                ++n;
+            }
+        }
+        Log("loader",
+            "app-manifest: registered \"%s\" version %s (from %ls)",
+            idName, idVer, pe->guestDir);
+    } else {
+        Log("loader",
+            "app-manifest: WARNING appxmanifest.xml not found in %ls; "
+            "registering mounts anyway",
+            pe->guestDir);
+    }
+    // 2. Populate the mount registry DIRECTLY (write the entries +
+    //    globals), instead of calling the game's register fn.
+    //    Boot #16 proved the register fn cannot run pre-entry: its
+    //    lazy-init allocator needs the game's memory pool, which is
+    //    only constructed during static init, so the call faults in
+    //    ntdll (WER: scarlett_verify.exe, ntdll.dll+0x1a12d,
+    //    0xc0000005) and the __try does not catch it (no register-
+    //    mount log lines, no crash dump). The registry is just data,
+    //    so the layer writes it: the lookup only reads count/array/
+    //    entries, never how they got there. The mounts cover every
+    //    form the name transform (0x14128bb70) can produce:
+    //      "appdata/"  — the bare name "appdata0.rpf" (prefix "appdata")
+    //      "appdata0/" — the bare name itself (longest prefix)
+    //      "./"        — the transform prepends "." -> "./appdata0.rpf"
+    //      "D:/"       — the transform may resolve "." to the absolute
+    //                    drive path (drive letter from the guest dir)
+    //    Each entry holds one object (count==1), so the lookup returns
+    //    the fake VFS object directly; the pack-mgr lookup then calls
+    //    its vtable slot 0x168, which returns 0 (!= -1), so the name
+    //    resolves and pack-init proceeds past the assert.
+    uint8_t* base = (uint8_t*)pe->base;
+    g_driveMount[0] = 0;
+    if (pe->guestDir[0] && pe->guestDir[1] == L':') {
+        // e.g. "D:/" from "D:\game\game".
+        g_driveMount[0] = (char)pe->guestDir[0];
+        g_driveMount[1] = ':';
+        g_driveMount[2] = '/';
+        g_driveMount[3] = 0;
+    }
+    const char* names[4] = {"appdata/", "appdata0/", "./", g_driveMount};
+    int mounted = 0;
+    for (int i = 0; i < 4; ++i) {
+        const char* mname = names[i];
+        if (!mname[0]) continue;
+        g_mountObjLists[i] = &g_fakeVfsObject;
+        MountRegistryEntry& e = g_mountEntries[mounted];
+        e.name = mname;
+        e.kind = 1;
+        e.length = (uint16_t)strlen(mname);
+        e.objCapacity = 1;
+        e.objCount = 1;
+        e.objList = &g_mountObjLists[i];
+        Log("loader", "app-manifest: mount \"%s\" -> entry %d (len %u)",
+            mname, mounted, e.length);
+        ++mounted;
+    }
+    *(uint32_t*)(base + kMountInitFlagRva) = 1;
+    *(uint32_t*)(base + kMountCountRva) = (uint32_t)mounted;
+    *(void**)(base + kMountArrayRva) = g_mountEntries;
+    Log("loader",
+        "app-manifest: mount registry populated: count=%d array=%p "
+        "initFlag=1",
+        mounted, (void*)g_mountEntries);
+}
+
 bool RunXboxPe(LoadedPe* pe, DWORD* exitCode) {
     typedef DWORD(WINAPI* EntryFn)();
     // Catch a fatal crash on ANY thread (boot #7 died on a worker
     // thread and the __except below never fired). Installed here so it
     // is live for the whole guest run.
     SetUnhandledExceptionFilter(UnhandledFilter);
+    // Vectored-handler backstop (real-exe boot #13): fires first-chance on
+    // ANY thread for the breakpoint code only, so an int3 assert dumps
+    // + probes even if the game's own filter handling swallows the
+    // unhandled path. Lives until process exit (the harness child exits
+    // after the run); g_vehDumped is reset per run.
+    g_guestBaseForVeh = pe->base;
+    g_vehDumped = 0;
+    AddVectoredExceptionHandler(1, ScarlettVehHandler);
+    // App-manifest mount registration (the title pack-table blocker): read
+    // AppxManifest.xml and populate the VFS mount registry directly
+    // so the pack filesystem can resolve "appdata0.rpf". The registry
+    // globals live at title-specific RVAs; synthetic guests are
+    // skipped by the bounds check inside. Runs before the entry
+    // point; no game code is called here.
+    if (pe->hasXbld) {
+        RegisterAppManifestMount(pe);
+    }
     // TLS state just before the entry point (diagnostic).
     if (pe->tlsIndexValid) {
         void* check = TlsGetValue(pe->tlsIndex);

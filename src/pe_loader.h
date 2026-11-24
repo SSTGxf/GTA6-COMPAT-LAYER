@@ -11,6 +11,9 @@ namespace sc {
 struct LoadedPe {
     void* base = nullptr;       // Mapped image base.
     void* entry = nullptr;      // Entry point (after relocation).
+    size_t imageSize = 0;       // OptionalHeader.SizeOfImage (mapped size).
+    wchar_t guestDir[MAX_PATH] = {};  // Directory of the exe (guest data
+                                      // dir); used to find AppxManifest.xml.
     uint64_t preferredBase = 0;
     bool relocated = false;     // True if mapped away from preferred base.
     char xbldEdition[128] = {}; // e.g. "GXDK,October 2026 GXDK"

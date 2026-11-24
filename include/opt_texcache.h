@@ -2,7 +2,7 @@
 // (docs/OPTIMIZATION.md item 2, memory management). The CPU de-tile
 // cache (opt_detile.h) holds byte buffers; THIS cache holds the GPU
 // resources the game actually binds, with a VRAM budget and LRU
-// eviction, so GTA's gigabytes of textures cannot grow it without
+// eviction, so the title's gigabytes of textures cannot grow it without
 // bound. These are ScarlettCompat-defined entry points, NOT Xbox APIs.
 //
 // Bind-time contract (the lookup path, on every texture bind/use):

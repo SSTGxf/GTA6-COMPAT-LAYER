@@ -1,6 +1,6 @@
 # Software ray tracing (DXR replacement for GPUs with no RT cores)
 
-Why this exists: GTA VI uses DirectX Raytracing (DXR Tier 1.1) and
+Why this exists: modern Series X titles use DirectX Raytracing (DXR Tier 1.1) and
 mesh shaders — both need Feature Level 12_2 (DirectX 12 Ultimate).
 The build machine's RX 5700 XT is RDNA1, Feature Level 12_1: no
 hardware ray tracing units, no mesh shaders. Desktop D3D12 reports
@@ -171,7 +171,7 @@ magnitude for a real scene — the RT cores do BVH traversal and
 triangle intersection in fixed-function hardware; the compute path
 does both in shader code. Expect roughly 10–100x slower for a
 full-scene workload (a hardware-RT frame that takes 2 ms of GPU
-time would take tens of ms in compute), so a full GTA VI frame
+time would take tens of ms in compute), so a full title frame
 through software RT is not 60 FPS on this card — it is a
 correctness path, not a performance path. The proof scene (one
 triangle, 256x256) is far too small to measure meaningfully; its
@@ -183,15 +183,15 @@ correct image back instead of a failed device call — the same trade
 Lumen's software path makes. On a GPU with real RT cores the layer
 takes the hardware path instead (once that passthrough exists).
 
-## What is still missing for GTA's real DXR workload
+## What is still missing for a real title's DXR workload
 
 - The COM wrapper above (real-title routing).
 - Hardware DXR passthrough for tier ≥ 1_0 adapters (cannot be
   verified on the 5700 XT).
-- Mesh shaders (9,282 in GTA VI): a separate problem — mesh shaders
+- Mesh shaders (9,282 in the reference title): a separate problem — mesh shaders
   are not ray tracing and are not covered here. They need either a
   mesh-shader-capable GPU or a compute emulation of the mesh pipeline.
-- The real shaders: GTA's 26,503 shaders are precompiled RDNA2
+- The real shaders: the reference title's 26,503 shaders are precompiled RDNA2
   programs that need the DXIL lifting route (research brief §3).
   The software path traces with its own compute shader, not the
   game's raygen/miss/hit shaders — lifting those is still open.

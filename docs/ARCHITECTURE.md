@@ -118,5 +118,5 @@ storage shim stalls the world streamer before graphics ever matters.
 1. Synthetic guest boots through the loader (done — `scarlett_verify`).
 2. First `d3d12_xs` frame on screen (real device + swapchain, not the stub).
 3. One small real Game Core title boots (e.g. an unencrypted Unity indie).
-4. Point the layer at the GTA VI exe once it lands; read its import table
+4. Point the layer at a large real title exe; read its import table
    first, then its boot call order.

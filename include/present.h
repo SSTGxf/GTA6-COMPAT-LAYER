@@ -1,7 +1,7 @@
 // Presentation contract — real-exe path only (Seth, 2026-11-23).
 //
 // Two rules, both hard:
-//  1. BLACK UNTIL THE TITLE LOADS. The screen stays BLACK unless GTA
+//  1. BLACK UNTIL THE TITLE LOADS. The screen stays BLACK unless the title
 //     itself is trying to load. No test pattern, no red triangle, no
 //     placeholder output in the real-exe path. Default presentation
 //     is a black clear; only once the title has actually submitted a

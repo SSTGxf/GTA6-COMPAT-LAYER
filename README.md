@@ -1,4 +1,4 @@
-# GTA6-COMPAT-LAYER (ScarlettCompat)
+# ScarlettCompat
 
 A compatibility layer for running Xbox Series X (Scarlett) Game Core titles on
 Windows PC — built from scratch, because nothing existing covers Series X.
@@ -29,13 +29,11 @@ layer, and nobody had built one for a AAA open-world title.
 
 ### Why now
 
-The leaked GTA VI Xbox Series X build v1.0.2.1 (TitleId `7952987A`) is on
-disk with all game data — 131 GB, all 25 layout chunks — but **no exe**
-(it was deliberately withheld from the leak). The exe is expected to drop
-separately (~Nov 23, 2026). The moment it lands, the only thing between the
-game and a PC is a layer that can load it and answer its system calls. This
-repo is that layer, built ahead of the exe so the work is ready to verify
-the second it arrives.
+Xbox Series X titles are GDK / Game Core packages: a native x86-64 PE32+
+plus its game data. The only thing between such a title and a PC is a
+layer that can load its exe and answer its system calls. This repo is
+that layer — built and verified against synthetic guest titles and
+real-title boots, so the boot path is exercised end to end.
 
 ### Why a compat layer instead of an emulator or a recomp
 
@@ -376,17 +374,18 @@ ALL PASS):**
 
 **The honest bar for this work (15-hour window):** a loader + shimmed
 boot path for a synthetic guest title and a first `d3d12_xs`
-frame — **not GTA 6 playable.** No public project boots this game; the
+frame — **not a playable title.** No public project boots a full AAA
+Series X title; the
 realistic ladder is (1) synthetic guest boots, (2) first `d3d12_xs` frame
 on screen, (2.5) a realistic guest boots a full title-shaped boot with a
 real rendered scene and a 60-frame loop, (3) one small real Game Core
-title boots, (4) only then point the layer at the GTA VI exe once it lands
+title boots, (4) only then point the layer at a large real title exe
 and read its import table.
 Steps 1, 2, and 2.5 are done and verified (above).
 
 **Blocked on the exe (nothing here can substitute):**
 
-- The exact import list (which Xbox DLLs/functions the GTA VI exe imports).
+- The exact import list (which Xbox DLLs/functions a real title exe imports).
 - The GDK/GDKX version the title was built against.
 - Boot call order, first fatal dependency, and whether it hard-aborts when
   Xbox Live / XSAPI is unreachable.
@@ -403,8 +402,9 @@ Steps 1, 2, and 2.5 are done and verified (above).
   already-readable (extracted) files.
 - Live Xbox Live / XSAPI services — stubbed / fail-soft only.
 - Hardware ray tracing / mesh shaders — desktop D3D12 supports both, but
-  the build machine's RX 5700 XT (RDNA1) has neither, so the full GTA VI
-  pipeline cannot be verified on it (9,282 mesh shaders + DXR in the game).
+  the build machine's RX 5700 XT (RDNA1) has neither, so the full
+  mesh-shader + DXR pipeline cannot be verified on it (9,282 mesh shaders
+  + DXR in the reference title).
   **Ray tracing has a software path now** (compute-shader replacement,
   verified — see above); hardware DXR passthrough and mesh shaders are
   still open.
@@ -428,8 +428,7 @@ src/              pe_loader.{h,cpp}   — Xbox PE loader
                   verify.cpp          — scarlett_verify harness
 tests/            guest_minimal.cpp   — synthetic Xbox-style guest title
 defs/             *.def               — shim import-lib definitions (Xbox DLL names)
-docs/             FILE_MAP.md         — measured inventory of the game package
-                  ARCHITECTURE.md     — loader / shim / graphics design
+docs/             ARCHITECTURE.md     — loader / shim / graphics design
                   STATUS.md           — per-function implementation status
                   SCAFFOLDING-NOTES.md — day-1 working notes
 ```
@@ -440,10 +439,8 @@ docs/             FILE_MAP.md         — measured inventory of the game package
 - No exe is fetched, reconstructed, or downloaded by this project. The exe
   arrives on its own; until then the layer is verified against the synthetic
   guest only.
-- No game code, assets, shaders, or RPF contents are in this repo — only
-  packaging metadata (file names, sizes, manifest/config XML) measured
-  during the file-map step.
-- **Do not run the harness against any binary claiming to be the missing
-  exe from unofficial sources** — the leak hype is a documented malware
-  vector. Only the Cyberleek drop with matching SHA-256 counts, and even
-  that must be treated as untrusted code in a sandbox.
+- No game code, assets, shaders, or package contents are in this repo —
+  only the layer itself, its tests, and documentation.
+- **Do not run the harness against an exe from an unofficial source** —
+  treat any third-party exe as untrusted code in a sandbox, and verify
+  its SHA-256 against a known-good value before running it.

@@ -78,10 +78,10 @@ static bool CALLBACK EnumPackagesCallback(void* context,
     (*count)++;
     // The synthetic package must identify itself consistently.
     if (strcmp(details->packageIdentifier,
-               "ScarlettCompat-Guest-7952987A") != 0)
+               "ScarlettCompat-Guest-00000001") != 0)
         return false;
     if (details->kind != XPackageKind_Game) return false;
-    if (strcmp(details->titleID, "7952987A") != 0) return false;
+    if (strcmp(details->titleID, "00000001") != 0) return false;
     return true;  // continue enumerating
 }
 

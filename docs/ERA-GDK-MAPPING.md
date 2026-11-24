@@ -9,8 +9,7 @@ Sources: the public Xbox One shim-DLL d3d11.x.cpp (XDK-derived
 signatures for D3D11XCreateDeviceX, D3DMapEsramMemory,
 DXGIXPresentArray, D3DAllocateGraphicsMemory); the Xbox One shim-DLL
 exports for the ordinal layout; Microsoft Learn / docs.xbox.com GDK
-docs (public); the research brief
-(`~/workspace/gta6-scarlett-compat-research-2026-11-22.md` §1, §3).
+docs (public); the GDK research notes (§1, §3).
 Anything marked ASSUMED is not public: the real Xbox One XDK headers
 and the real ERA ordinals are NDA-gated. No real ERA title, exe, or
 data is IN this repo.
@@ -156,7 +155,7 @@ Xbox 360's 10 MB EDRAM, but ESRAM is a different, larger, SRAM pool
 on a different console — the two must not be conflated). 32 MB fits
 roughly a 1080p 32bpp 2xMSAA target or a 720p 4xMSAA target; larger
 targets spill to DDR3. The Xbox One X dropped ESRAM entirely for
-unified memory; the Series X (GTA 6's target) has no embedded memory
+unified memory; the Series X has no embedded memory
 either — unified GDDR6 — so this section is ERA-specific.
 
 **The API surface.** An ERA title maps ESRAM through one entry
@@ -258,7 +257,7 @@ proves the routing exists; it does not fake the objects.
 Implementing a COM object with a guessed vtable would be faking it.
 The objects need either the XDK headers or a real ERA exe's WinRT
 class references to define — same class of blocker as the real GDK
-ordinals needing the GTA exe.
+ordinals needing a real title exe.
 
 **ERA caveat:** an ERA title that activates WinRT classes via
 vccorlib110 `GetActivationFactoryByPCWSTR` + `CoCreateInstance`

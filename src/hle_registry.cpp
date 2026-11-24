@@ -9,8 +9,10 @@
 #include "fixed_timestep.h"  // Fixed-timestep physics decoupling
 #include "xbox_shims.h"
 #include <mmsystem.h>  // timeBeginPeriod (frame pacing, phase 3)
+#include <dxgi.h>  // IDXGIDevice / IDXGIAdapter (device QI forwarding)
 #include <string.h>
 #include <vector>
+#include <intrin.h>  // _ReturnAddress (COM wrapper unimplemented-slot log)
 
 namespace sc {
 
@@ -52,6 +54,10 @@ extern "C" HRESULT ScNotImplementedStub() {
 // Device created by D3D12XboxCreateDevice (real desktop device, cached so
 // later steps — swapchain, pacing — can use it).
 static ID3D12Device* g_xsDevice = nullptr;
+
+// Whether the loaded guest is a real Xbox title (.xbld present), set
+// by the loader. The Xbox COM wrapper only applies to real titles.
+bool g_scGuestIsRealXboxTitle = false;
 
 // Frame pacing state (real, Sleep-based): the interval set by
 // SetFrameIntervalX (1 = 60 Hz) defines the period; ScheduleFrameEventX
@@ -137,16 +143,27 @@ extern "C" BOOL HleXMemIsToolsMemAvailable(void) {
     return FALSE;
 }
 
-// XMemAllocatePhysicalPages / XMemFreePhysicalPages — S_OK stubs.
+// XMemAllocatePhysicalPages / XMemFreePhysicalPages.
 // Xbox physical pages (GPU memory) have no desktop equivalent; the
 // game allocates them for GPU-side use and the layer has no pool to
 // hand out yet. The signatures are GDKX-gated; the stubs ignore args
 // (x64 caller cleans the stack, so arg count does not matter).
+//   Boot #27: the game's allocator wrapper (0x145eb2780) calls
+// XMemAllocatePhysicalPages and asserts the return is 1
+// (cmp eax,1; jne int3) — it treats the return as a BOOL-like success
+// (1), NOT as an HRESULT. Returning S_OK (0) reads as FALSE/failure
+// and trips the assert at 0x145eb27be. So this stub returns 1.
+// The caller pre-fills the out-param (*rdx) with the requested page
+// count and checks it is unchanged after the call, so the stub must
+// NOT touch the out-param — it returns 1 and leaves *rdx alone.
+// There is still no real physical-page pool behind this: the game
+// will hit XMemMapPhysicalPages later if it actually maps the pages,
+// and that is a separate (bigger) piece of work.
 extern "C" HRESULT HleXMemAllocatePhysicalPages(void) {
     Log("xmem",
-        "XMemAllocatePhysicalPages() -> S_OK (STUB: no desktop "
-        "physical-page pool)");
-    return S_OK;
+        "XMemAllocatePhysicalPages() -> 1 (STUB: no desktop "
+        "physical-page pool; game expects 1, not S_OK)");
+    return (HRESULT)1;
 }
 
 extern "C" HRESULT HleXMemFreePhysicalPages(void) {
@@ -220,6 +237,49 @@ extern "C" void HleXMemTransferMemory(void* pDst, const void* pSrc,
 // keeping the desktop-valid allocation-type set, and retries with a
 // system-chosen address when the requested address fails (the guest
 // uses the returned address, so any address works).
+//
+// Placeholder support (boot #43): the title reserves a ~185 MiB
+// placeholder (XMem type 0x42000 = MEM_RESERVE | MEM_RESERVE_PLACEHOLDER)
+// and carves five sub-ranges out of it with MEM_REPLACE_PLACEHOLDER
+// (type 0x20406000), splitting with VirtualFree(MEM_RELEASE |
+// MEM_PRESERVE_PLACEHOLDER) (0x8002). A plain MEM_RESERVE is NOT a
+// placeholder, so the real VirtualFree split fails with err 87 and
+// 0x141e86440 returns false, which makes 0x142478440 return false
+// before the setter — the global at 0x1475DF128 stays NULL and the next
+// function crashes on [NULL+0x18]. (Leonida's retail chain stops 10–11
+// describe the same two calls; this is a clean-room reimplementation
+// of the documented placeholder semantics, not copied code.)
+// Placeholder types are routed through VirtualAlloc2 (resolved via
+// GetProcAddress so no SDK _WIN32_WINNT bump is needed).
+using VirtualAlloc2Fn = LPVOID(WINAPI*)(HANDLE, LPVOID, SIZE_T, ULONG,
+                                        ULONG, void*, ULONG);
+static VirtualAlloc2Fn GetVirtualAlloc2() {
+    static VirtualAlloc2Fn fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        // VirtualAlloc2 lives in api-ms-win-core-memory-l1-1-2.dll.
+        // On this PC's Windows 11 (build 26300) kernel32.dll does NOT
+        // export it (GetProcAddress returns NULL — proven by a
+        // PowerShell probe 2026-11-23), so try the API-set DLL too.
+        // Boot #44 proved the kernel32-only lookup silently fell back
+        // to a plain MEM_RESERVE, which is not a placeholder.
+        static const char* kMods[] = {
+            "kernel32.dll",
+            "api-ms-win-core-memory-l1-1-2.dll",
+        };
+        for (const char* mod : kMods) {
+            HMODULE k = GetModuleHandleA(mod);
+            if (!k) k = LoadLibraryA(mod);
+            if (k) {
+                fn = (VirtualAlloc2Fn)GetProcAddress(k, "VirtualAlloc2");
+                if (fn) break;
+            }
+        }
+    }
+    return fn;
+}
+
 extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
                                   DWORD flAllocationType, DWORD flProtect) {
     // Desktop-valid flAllocationType bits. The Xbox bits 0x10000000 and
@@ -228,7 +288,59 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
     constexpr DWORD kDesktopAllocType =
         MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_RESET_UNDO |
         MEM_LARGE_PAGES | MEM_PHYSICAL | MEM_TOP_DOWN | MEM_WRITE_WATCH;
+    constexpr DWORD kReservePlaceholder = 0x40000;  // MEM_RESERVE_PLACEHOLDER
+    constexpr DWORD kReplacePlaceholder = 0x4000;   // MEM_REPLACE_PLACEHOLDER
     DWORD desktopType = flAllocationType & kDesktopAllocType;
+    if ((flAllocationType &
+         (kReservePlaceholder | kReplacePlaceholder)) != 0) {
+        VirtualAlloc2Fn va2 = GetVirtualAlloc2();
+        if (va2) {
+            if ((flAllocationType & kReservePlaceholder) != 0) {
+                // Placeholder reserve: protection MUST be PAGE_NOACCESS.
+                LPVOID p = va2(GetCurrentProcess(), lpAddress, dwSize,
+                               MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                               PAGE_NOACCESS, nullptr, 0);
+                Log("kernelx",
+                    "VirtualAlloc2 placeholder reserve(%p, %llu, "
+                    "0x%08x) -> %p (err %lu)",
+                    lpAddress, (unsigned long long)dwSize,
+                    flAllocationType, p, p ? 0 : GetLastError());
+                return p;
+            }
+            // Replace a placeholder range. The game passes an Xbox
+            // protect encoding (0x27), which VirtualAlloc2 rejects,
+            // so use PAGE_READWRITE. MEM_PHYSICAL / MEM_LARGE_PAGES
+            // are a backing hint on Xbox, not a correctness
+            // requirement on desktop: retry without them if the
+            // combined type is refused.
+            DWORD extra = desktopType & (MEM_PHYSICAL | MEM_LARGE_PAGES);
+            const DWORD tries[3] = {
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | extra,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER |
+                    (extra & MEM_PHYSICAL),
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+            };
+            for (int i = 0; i < 3; ++i) {
+                LPVOID p = va2(GetCurrentProcess(), lpAddress, dwSize,
+                               tries[i], PAGE_READWRITE, nullptr, 0);
+                if (p) {
+                    Log("kernelx",
+                        "VirtualAlloc2 placeholder replace(%p, %llu, "
+                        "0x%08x -> 0x%08x) -> %p",
+                        lpAddress, (unsigned long long)dwSize,
+                        flAllocationType, tries[i], p);
+                    return p;
+                }
+            }
+            Log("kernelx",
+                "VirtualAlloc2 placeholder replace(%p, %llu, 0x%08x) "
+                "-> NULL (err %lu)",
+                lpAddress, (unsigned long long)dwSize, flAllocationType,
+                GetLastError());
+            return nullptr;
+        }
+        // No VirtualAlloc2 (pre-1709): fall through to the plain path.
+    }
     LPVOID p = VirtualAlloc(lpAddress, dwSize, desktopType, flProtect);
     if (!p && lpAddress) {
         // Requested address unavailable — let the system choose.
@@ -252,6 +364,1009 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
         lpAddress, (unsigned long long)dwSize, flAllocationType,
         desktopType, flProtect, p, p ? 0 : GetLastError());
     return p;
+}
+
+// ---- Xbox D3D12 device COM wrapper (graphics milestone #1) ----
+// The game calls Xbox D3D12 device methods via the Xbox vtable layout
+// (192 slots). Returning the raw desktop ID3D12Device* lets the game
+// index the DESKTOP vtable at Xbox offsets, which AVs in D3D12Core
+// (boot #28: D3D12Core.dll+0x2430e, right after D3D12XboxCreateDevice
+// returned a real device). The wrapper presents an Xbox-layout vtable
+// and forwards each method to the real desktop device. NEVER return the
+// desktop ID3D12Device* to the title — the layer owns this guest-facing
+// Xbox interface, with the real device behind it.
+//   Slot map (retail chain, RETAIL-BOOT-CHAIN-PLAN.md):
+//     0/1/2  IUnknown (QueryInterface/AddRef/Release)
+//     8      CreateCommandQueue (same as PC)
+//     9      CreateCommandAllocator (same as PC)
+//     14     CreateDescriptorHeap (same as PC; riid may be Xbox, retry
+//            with the desktop IID on E_NOINTERFACE; raw heap returned)
+//     15     GetDescriptorHandleIncrementSize (same as PC)
+//     26     GetCustomHeapProperties — struct-return, args SWAPPED:
+//            (return buffer, this, node_mask, heap_type); the `this`
+//            register does NOT point at the proxy, the second arg does.
+//     48     CreateCommandQueue (desc = PC desc + Xbox words, riid =
+//            IID_ID3D12CommandQueue, out)
+//     73     CreateCommandList (16-byte desc, first word = type,
+//            allocator, pso, riid = console list IID, out)
+//     133    CreatePlacedResourceX (va, desc, state, clear, riid, out)
+//   The table is 192 slots (longer than the title's highest slot — a
+// shorter table leaves a null pointer, not E_NOTIMPL). Slots not yet
+// implemented point at XboxDevice_Unimplemented, which logs the
+// caller's return address (so the game call site — and therefore the
+// slot — can be identified from the disassembly) and returns
+// E_NOTIMPL.
+struct XboxDeviceWrapper {
+    void** vtable;       // points at g_xboxDeviceVtable
+    ID3D12Device* real;  // real desktop device (owned by the layer)
+    LONG refCount;
+    // Frame-pacing state from SetFrameIntervalX (slot 78): the vblank
+    // period in microseconds (16667 for 60 Hz) and the allowed frames
+    // in flight. The presenter uses these once a swapchain exists.
+    UINT32 frameIntervalUs;
+    UINT32 frameLatency;
+};
+
+static void* g_xboxDeviceVtable[192];
+static bool g_xboxDeviceVtableInit = false;
+
+// Forward declaration: the IDXGIDevice wrapper (defined below, after the
+// command-list wrapper) is used by XboxDevice_QueryInterface.
+struct DxgiDeviceWrapper;
+static DxgiDeviceWrapper* WrapDxgiDevice(ID3D12Device* dev);
+
+// Forward declaration: the descriptor-heap wrapper (defined below, after
+// the command-list wrapper) is used by XboxDevice_CreateDescriptorHeap.
+struct XboxDescriptorHeapWrapper;
+static XboxDescriptorHeapWrapper* WrapXboxDescriptorHeap(
+    ID3D12DescriptorHeap* real);
+static ID3D12DescriptorHeap* UnwrapXboxDescriptorHeap(void* p);
+
+// The Xbox device IID the game requests
+// ({5405C344-D457-444E-B4DD-2366E45AEE39}).
+static const GUID kXboxDeviceIID = {
+    0x5405C344, 0xD457, 0x444E,
+    {0xB4, 0xDD, 0x23, 0x66, 0xE4, 0x5A, 0xEE, 0x39}};
+
+static HRESULT WINAPI XboxDevice_QueryInterface(XboxDeviceWrapper* self,
+                                                REFIID riid,
+                                                void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (!self) return E_POINTER;
+    if (memcmp(&riid, &kXboxDeviceIID, sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(ID3D12Device), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(IUnknown), sizeof(GUID)) == 0) {
+        InterlockedIncrement(&self->refCount);
+        *ppvObject = self;
+        return S_OK;
+    }
+    // IID_IDXGIDevice: the real desktop D3D12 device does NOT expose
+    // IDXGIDevice through QueryInterface (boot #37: forwarding returns
+    // E_NOINTERFACE), so the layer provides its own IDXGIDevice wrapper
+    // (defined below) whose GetAdapter returns the real DXGI adapter.
+    // The wrapper itself is NOT returned as the Xbox device — only as
+    // the IDXGIDevice the game asked for.
+    static const GUID kIID_IDXGIDevice = {
+        0x54EC77FA, 0x1377, 0x44E6,
+        {0x8C, 0x32, 0x88, 0xFD, 0x5F, 0x44, 0xC8, 0x4C}};
+    if (self->real && memcmp(&riid, &kIID_IDXGIDevice, sizeof(GUID)) == 0) {
+        DxgiDeviceWrapper* w = WrapDxgiDevice(self->real);
+        if (w) {
+            *ppvObject = w;
+            Log("xboxdev", "QueryInterface: IID_IDXGIDevice -> wrapper %p",
+                (void*)w);
+            return S_OK;
+        }
+        Log("xboxdev", "QueryInterface: IID_IDXGIDevice wrapper failed");
+        return E_NOINTERFACE;
+    }
+    Log("xboxdev",
+        "QueryInterface: unknown IID {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}, E_NOINTERFACE",
+        (unsigned)riid.Data1, (unsigned)riid.Data2, (unsigned)riid.Data3,
+        riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
+        riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7]);
+    return E_NOINTERFACE;
+}
+
+// IID_IDXGIDevice ({54EC77FA-1377-44E6-8C32-88FD5F44C84C}) — the DXGI
+// device interface. The game QIs the D3D12 device for it (boot #36) to
+// reach the DXGI adapter (for swapchain creation / adapter info). The
+// real desktop D3D12 device does NOT expose IDXGIDevice through
+// QueryInterface (boot #37: forwarding returns E_NOINTERFACE), so the
+// layer provides its own wrapper (WrapDxgiDevice, below) whose GetAdapter
+// returns the real DXGI adapter. The wrapper is returned only as the
+// IDXGIDevice the game asked for — never as the Xbox device itself.
+
+static ULONG WINAPI XboxDevice_AddRef(XboxDeviceWrapper* self) {
+    if (!self) return 0;
+    return (ULONG)InterlockedIncrement(&self->refCount);
+}
+
+static ULONG WINAPI XboxDevice_Release(XboxDeviceWrapper* self) {
+    if (!self) return 0;
+    LONG rc = InterlockedDecrement(&self->refCount);
+    if (rc == 0) {
+        if (self->real) self->real->Release();
+        HeapFree(GetProcessHeap(), 0, self);
+    }
+    return (ULONG)rc;
+}
+
+// Generic stub for Xbox device slots not yet implemented. Logs the
+// caller's return address so the game call site (and the slot, from
+// the `call [rax+N]` offset at that site) can be identified. Returns
+// E_NOTIMPL. NOTE: this is only correct for HRESULT-returning
+// methods; a pointer/struct-returning method that hits this stub will
+// get a bogus value — but the log line names the site, so the slot
+// can then be implemented properly.
+static HRESULT WINAPI XboxDevice_Unimplemented(XboxDeviceWrapper* self) {
+    (void)self;
+    void* retAddr = _ReturnAddress();
+    Log("xboxdev",
+        "UNIMPLEMENTED Xbox device slot called from game %p -> "
+        "E_NOTIMPL (identify the slot from the call site, then "
+        "implement it)",
+        retAddr);
+    return E_NOTIMPL;
+}
+
+// Slot 26: GetCustomHeapProperties. Xbox struct-return convention with
+// SWAPPED args: (return buffer, this, node_mask, heap_type). The
+// desktop method returns the struct by value; copy it to the return
+// buffer and return the buffer pointer.
+static D3D12_HEAP_PROPERTIES* WINAPI XboxDevice_GetCustomHeapProperties(
+    D3D12_HEAP_PROPERTIES* retBuf, XboxDeviceWrapper* self, UINT nodeMask,
+    D3D12_HEAP_TYPE heapType) {
+    if (!self || !self->real || !retBuf) return retBuf;
+    D3D12_HEAP_PROPERTIES props =
+        self->real->GetCustomHeapProperties(nodeMask, heapType);
+    *retBuf = props;
+    Log("xboxdev",
+        "GetCustomHeapProperties this=%p real=%p nodeMask=%u heapType=%u -> type=%u cpuPage=%u memPool=%u",
+        (void*)self, (void*)(self ? self->real : nullptr),
+        nodeMask, (unsigned)heapType, (unsigned)props.Type,
+        (unsigned)props.CPUPageProperty, (unsigned)props.MemoryPoolPreference);
+    return retBuf;
+}
+
+// Slot 8 / 48: CreateCommandQueue. The Xbox desc starts with the PC
+// D3D12_COMMAND_QUEUE_DESC (16 bytes) + Xbox words; pass the PC prefix
+// through. The riid is IID_ID3D12CommandQueue on the console path;
+// if the desktop driver rejects the requested IID, retry with the
+// desktop IID_ID3D12CommandQueue.
+// Slot 36: CreateFence. Xbox form matches the desktop form:
+// (this, InitialValue, Flags, riid, ppFence). Proven by the boot #30
+// call site 0x141d0b2fa: rdx=0 (InitialValue), r8d=1 (SHARED flag),
+// r9=IID, [rsp+0x20]=ppFence. The game tolerates a failed fence
+// (it checks the out pointer and skips), but a real fence is cheap.
+// Slot 9: CreateCommandAllocator. Xbox form matches the desktop form:
+// (this, Type, riid, ppAllocator). Proven by the boot #32 call site
+// 0x142478b2d: rdx=0 (Type DIRECT), r8=IID, r9=ppAllocator, and the
+// game int3s on a failure HRESULT. Returns the raw desktop allocator
+// for now (the game only passes it to CreateCommandList); wrap it if
+// the game ever calls allocator methods through the Xbox vtable.
+static HRESULT WINAPI XboxDevice_CreateCommandAllocator(
+    XboxDeviceWrapper* self, D3D12_COMMAND_LIST_TYPE type,
+    REFIID riid, void** ppCommandAllocator) {
+    if (!self || !self->real) return E_POINTER;
+    HRESULT hr = self->real->CreateCommandAllocator(type, riid,
+                                                     ppCommandAllocator);
+    if (hr == E_NOINTERFACE && ppCommandAllocator) {
+        hr = self->real->CreateCommandAllocator(
+            type, __uuidof(ID3D12CommandAllocator), ppCommandAllocator);
+    }
+    Log("xboxdev", "CreateCommandAllocator type=%u -> hr=0x%08x alloc=%p",
+        (unsigned)type, (unsigned)hr,
+        ppCommandAllocator ? *ppCommandAllocator : nullptr);
+    return hr;
+}
+
+static HRESULT WINAPI XboxDevice_CreateFence(
+    XboxDeviceWrapper* self, UINT64 initialValue,
+    D3D12_FENCE_FLAGS flags, REFIID riid, void** ppFence) {
+    if (!self || !self->real) return E_POINTER;
+    HRESULT hr = self->real->CreateFence(initialValue, flags, riid, ppFence);
+    if (hr == E_NOINTERFACE && ppFence) {
+        hr = self->real->CreateFence(initialValue, flags,
+                                     __uuidof(ID3D12Fence), ppFence);
+    }
+    Log("xboxdev", "CreateFence init=%llu flags=%u -> hr=0x%08x fence=%p",
+        (unsigned long long)initialValue, (unsigned)flags, (unsigned)hr,
+        ppFence ? *ppFence : nullptr);
+    return hr;
+}
+
+static HRESULT WINAPI XboxDevice_CreateCommandQueue(
+    XboxDeviceWrapper* self, const D3D12_COMMAND_QUEUE_DESC* pDesc,
+    REFIID riid, void** ppCommandQueue) {
+    if (!self || !self->real) return E_POINTER;
+    // Sanitize the Xbox desc to desktop-valid values. Boot #31 proved
+    // the third queue fails on flags alone: queue 2 (type=2/COPY,
+    // flags=0x1) succeeded, queue 3 (type=2/COPY, flags=0x2) returned
+    // E_INVALIDARG. The desktop only defines
+    // D3D12_COMMAND_QUEUE_FLAG_NONE (0) and
+    // D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT (0x1); 0x2 is an
+    // Xbox-only flag bit with no desktop meaning, so the desktop
+    // rejects it. Mask to the PC-valid bits and drop Xbox-only bits.
+    // (The Xbox extra words x[4]..x[7] are 0x1/0x0/0x40000000/0x1 on
+    // all three queues and are not passed to the desktop.)
+    D3D12_COMMAND_QUEUE_DESC pcDesc = {};
+    if (pDesc) {
+        pcDesc = *pDesc;
+        pcDesc.Flags = (D3D12_COMMAND_QUEUE_FLAGS)(
+            (UINT)pcDesc.Flags &
+            (UINT)D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
+    } else {
+        pcDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    }
+    if (pDesc) {
+        // Log the full Xbox desc (PC prefix + extra Xbox words) — the
+        // third queue in boot #30 returned E_INVALIDARG, so the desc
+        // contents are the diagnostic.
+        const UINT32* x = (const UINT32*)pDesc;
+        Log("xboxdev",
+            "CreateCommandQueue desc type=%u prio=%d flags=0x%x->0x%x nodeMask=0x%x x[4]=0x%x x[5]=0x%x x[6]=0x%x x[7]=0x%x",
+            (unsigned)pDesc->Type, (int)pDesc->Priority,
+            (unsigned)pDesc->Flags, (unsigned)pcDesc.Flags,
+            (unsigned)pDesc->NodeMask,
+            x[4], x[5], x[6], x[7]);
+    }
+    HRESULT hr = self->real->CreateCommandQueue(&pcDesc, riid, ppCommandQueue);
+    if (hr == E_NOINTERFACE && ppCommandQueue) {
+        hr = self->real->CreateCommandQueue(
+            &pcDesc, __uuidof(ID3D12CommandQueue), ppCommandQueue);
+    }
+    Log("xboxdev", "CreateCommandQueue -> hr=0x%08x queue=%p",
+        (unsigned)hr, ppCommandQueue ? *ppCommandQueue : nullptr);
+    return hr;
+}
+
+// Forward declaration: the command-list wrapper (defined below, after
+// WrapXboxDevice) is used by XboxDevice_CreateCommandList.
+struct XboxCommandListWrapper;
+static XboxCommandListWrapper* WrapXboxCommandList(
+    ID3D12GraphicsCommandList* real);
+
+// Slot 73: CreateCommandList. Xbox form: a 16-byte desc whose first
+// DWORD is the D3D12_COMMAND_LIST_TYPE, then allocator, pso, riid
+// (console list IID), out. Map to the desktop form with nodeMask 0.
+// The riid is a console IID the desktop driver does not know; retry
+// with IID_ID3D12GraphicsCommandList on E_NOINTERFACE.
+static HRESULT WINAPI XboxDevice_CreateCommandList(
+    XboxDeviceWrapper* self, const void* pDesc,
+    ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState,
+    REFIID riid, void** ppCommandList) {
+    if (!self || !self->real) return E_POINTER;
+    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (pDesc) type = (D3D12_COMMAND_LIST_TYPE)(*(const UINT32*)pDesc);
+    ID3D12GraphicsCommandList* realList = nullptr;
+    HRESULT hr = self->real->CreateCommandList(
+        0, type, pAllocator, pInitialState, riid, (void**)&realList);
+    if (hr == E_NOINTERFACE) {
+        hr = self->real->CreateCommandList(
+            0, type, pAllocator, pInitialState,
+            __uuidof(ID3D12GraphicsCommandList), (void**)&realList);
+    }
+    if (SUCCEEDED(hr) && realList && ppCommandList) {
+        // Return the Xbox-wrapped list, NOT the raw desktop list — the
+        // game calls Xbox list slots (131/132/9) on it, and the raw
+        // desktop vtable is too short for those (boot #33).
+        XboxCommandListWrapper* w = WrapXboxCommandList(realList);
+        if (w) {
+            realList->Release();  // the wrapper AddRef'd it
+            *ppCommandList = w;
+        } else {
+            // Wrapping failed (OOM) — hand the raw list to the game.
+            *ppCommandList = realList;
+        }
+    } else if (ppCommandList) {
+        *ppCommandList = realList;
+    }
+    Log("xboxdev", "CreateCommandList type=%u -> hr=0x%08x list=%p",
+        (unsigned)type, (unsigned)hr,
+        ppCommandList ? *ppCommandList : nullptr);
+    return hr;
+}
+
+// Slot 133: CreatePlacedResourceX. Xbox form: (va, desc, state, clear,
+// riid, out). The VA is an Xbox GPU address with no desktop meaning;
+// stand-in per the retail chain: a committed DEFAULT-heap buffer from
+// the desc (Flags limited to PC bits, state COMMON), not tied to the
+// VA. A real implementation needs the page mapper.
+static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
+    XboxDeviceWrapper* self, UINT64 va, const D3D12_RESOURCE_DESC* pDesc,
+    D3D12_RESOURCE_STATES initialState, const D3D12_CLEAR_VALUE* pClear,
+    REFIID riid, void** ppvResource) {
+    (void)va;
+    if (!self || !self->real || !pDesc) return E_POINTER;
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = *pDesc;
+    desc.Flags = (D3D12_RESOURCE_FLAGS)(
+        (UINT)desc.Flags &
+        (UINT)(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+               D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+               D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+               D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS));
+    D3D12_RESOURCE_STATES state = (initialState == (D3D12_RESOURCE_STATES)0xFFFFFFFF)
+        ? D3D12_RESOURCE_STATE_COMMON
+        : initialState;
+    HRESULT hr = self->real->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, pClear, riid,
+        ppvResource);
+    if (hr == E_NOINTERFACE && ppvResource) {
+        hr = self->real->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, pClear,
+            __uuidof(ID3D12Resource), ppvResource);
+    }
+    Log("xboxdev", "CreatePlacedResourceX va=0x%llx -> hr=0x%08x res=%p",
+        (unsigned long long)va, (unsigned)hr,
+        ppvResource ? *ppvResource : nullptr);
+    return hr;
+}
+
+// Slot 14: CreateDescriptorHeap. Desktop slot 14 is also
+// CreateDescriptorHeap: (pDesc, riid, ppHeap). The game calls it from
+// 0x141cf3280 to build the descriptor heaps behind the bump allocator
+// (0x14156c220); without it the create returns E_NOTIMPL, the init
+// returns early, the allocator struct's [0] is never set, and the game
+// crashes on [NULL+0x30] (boot #45). The Xbox riid may differ from the
+// desktop IID, so retry with __uuidof(ID3D12DescriptorHeap) on
+// E_NOINTERFACE. Returns a WRAPPED heap (WrapXboxDescriptorHeap), NOT
+// the raw desktop heap: the game calls slots 9/10 (CPU/GPU handle
+// getters) with rcx=heap and rdx garbage, expecting the handle in rax,
+// but the desktop D3D12Core getters write through rdx and fault on the
+// garbage value (boots #46/#47); the wrapper's slots 9/10 return the
+// handle as a UINT64 in rax and never touch rdx.
+static HRESULT WINAPI XboxDevice_CreateDescriptorHeap(
+    XboxDeviceWrapper* self, const D3D12_DESCRIPTOR_HEAP_DESC* pDesc,
+    REFIID riid, void** ppHeap) {
+    if (!self || !self->real || !pDesc || !ppHeap) return E_POINTER;
+    *ppHeap = nullptr;
+    ID3D12DescriptorHeap* realHeap = nullptr;
+    HRESULT hr = self->real->CreateDescriptorHeap(pDesc, riid,
+                                                   (void**)&realHeap);
+    if (hr == E_NOINTERFACE) {
+        hr = self->real->CreateDescriptorHeap(
+            pDesc, __uuidof(ID3D12DescriptorHeap), (void**)&realHeap);
+    }
+    if (SUCCEEDED(hr) && realHeap) {
+        // Diagnostic: record the raw heap's vtable slots 9/10, so the
+        // faulting D3D12Core function (boots #46/#47, +0x5c0c7) can be
+        // matched against the desktop heap vtable.
+        void** rawVt = *(void***)realHeap;
+        Log("xboxdev",
+            "CreateDescriptorHeap type=%u num=%u flags=0x%x -> hr=0x%08x "
+            "rawHeap=%p rawVtSlot9=%p rawVtSlot10=%p",
+            (unsigned)pDesc->Type, (unsigned)pDesc->NumDescriptors,
+            (unsigned)pDesc->Flags, (unsigned)hr, (void*)realHeap,
+            rawVt ? rawVt[9] : nullptr, rawVt ? rawVt[10] : nullptr);
+        XboxDescriptorHeapWrapper* w = WrapXboxDescriptorHeap(realHeap);
+        realHeap->Release();
+        if (!w) {
+            Log("xboxdev", "CreateDescriptorHeap: heap wrap failed");
+            return E_OUTOFMEMORY;
+        }
+        *ppHeap = w;
+        Log("xboxdev", "CreateDescriptorHeap -> wrapped heap=%p",
+            (void*)w);
+        return hr;
+    }
+    Log("xboxdev",
+        "CreateDescriptorHeap type=%u num=%u flags=0x%x -> hr=0x%08x "
+        "heap=%p",
+        (unsigned)pDesc->Type, (unsigned)pDesc->NumDescriptors,
+        (unsigned)pDesc->Flags, (unsigned)hr, *ppHeap);
+    return hr;
+}
+
+// Slot 15: GetDescriptorHandleIncrementSize. Desktop device slot 15 is
+// also GetDescriptorHandleIncrementSize, and the game calls it right
+// after the pacing slots (boot #34, 0x142478e42+) with rdx = 0..4 (each
+// descriptor-heap type) and stores the returned eax. Returns a UINT
+// (bytes), not an HRESULT. Forwards to the real device.
+static UINT WINAPI XboxDevice_GetDescriptorHandleIncrementSize(
+    XboxDeviceWrapper* self, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    if (!self || !self->real) return 0;
+    UINT n = self->real->GetDescriptorHandleIncrementSize(type);
+    Log("xboxdev", "GetDescriptorHandleIncrementSize type=%u -> %u",
+        (unsigned)type, n);
+    return n;
+}
+
+// Slot 78: SetFrameIntervalX(output, interval_us, latency, flags).
+// Xbox frame-pacing: the vblank period in microseconds (16667 for
+// 60 Hz) and the allowed frames in flight. Proven by the boot #34 call
+// site 0x14247abd8: rdx=0 (output), r8=interval, r9=latency (2 or 3),
+// [rsp+0x20]=0 (flags). The game tolerates a failure here, but the
+// correct answer is S_OK — a boot must not abort on pacing, and the
+// values are stored for the presenter. (Slot identity from Leonida's
+// d3d12_xs_device.cpp, which names 78/79/80 SetFrameIntervalX /
+// ScheduleFrameEventX / WaitFrameEventX — a public-HLE observation,
+// not Microsoft documentation.)
+static HRESULT WINAPI XboxDevice_SetFrameIntervalX(
+    XboxDeviceWrapper* self, UINT64 output, UINT64 intervalUs,
+    UINT64 latency, UINT64 flags) {
+    (void)output;
+    (void)flags;
+    if (!self) return E_POINTER;
+    self->frameIntervalUs = (UINT32)intervalUs;
+    self->frameLatency = (UINT32)(latency ? latency : 1);
+    Log("xboxdev", "SetFrameIntervalX interval=%llu us latency=%llu -> S_OK",
+        (unsigned long long)intervalUs, (unsigned long long)latency);
+    return S_OK;
+}
+
+// Slot 79: ScheduleFrameEventX(event, offset_us, reserved, flags).
+// Proven by the boot #34 call site 0x142478de4: rdx=2 (event), r8=0
+// (offset), r9=0 (reserved), [rsp+0x20]=0 (flags). The game int3s on a
+// failure here, so this must return S_OK. There is no vblank source
+// behind the device before a presenter exists, so the event is just
+// recorded as scheduled.
+static HRESULT WINAPI XboxDevice_ScheduleFrameEventX(
+    XboxDeviceWrapper* self, UINT64 event, UINT64 offsetUs, UINT64 reserved,
+    UINT64 flags) {
+    (void)event;
+    (void)offsetUs;
+    (void)reserved;
+    (void)flags;
+    if (!self) return E_POINTER;
+    Log("xboxdev", "ScheduleFrameEventX event=%llu offset=%llu us -> S_OK",
+        (unsigned long long)event, (unsigned long long)offsetUs);
+    return S_OK;
+}
+
+// Slot 80: WaitFrameEventX(event, timeout_ms, flags, token).
+// The natural next pacing call after ScheduleFrameEventX. Returns at
+// once with a fresh non-zero token: there is no vblank source behind
+// the device before a presenter, and a zero wait cannot stall the title.
+// A null token pointer is E_POINTER.
+static HRESULT WINAPI XboxDevice_WaitFrameEventX(
+    XboxDeviceWrapper* self, UINT64 event, UINT64 timeoutMs, UINT64 flags,
+    UINT64* token) {
+    (void)event;
+    (void)timeoutMs;
+    (void)flags;
+    if (!self) return E_POINTER;
+    if (!token) return E_POINTER;
+    static LONG s_frameToken = 1;
+    LONG t = InterlockedIncrement(&s_frameToken);
+    if (t == 0) t = InterlockedIncrement(&s_frameToken);
+    *token = (UINT64)t;
+    Log("xboxdev", "WaitFrameEventX -> S_OK token=%llu",
+        (unsigned long long)*token);
+    return S_OK;
+}
+
+// Build the 192-slot Xbox device vtable once. Unimplemented slots get
+// the logging stub; known slots get their handlers.
+static void InitXboxDeviceVtable() {
+    if (g_xboxDeviceVtableInit) return;
+    for (int i = 0; i < 192; ++i)
+        g_xboxDeviceVtable[i] = (void*)XboxDevice_Unimplemented;
+    g_xboxDeviceVtable[0] = (void*)XboxDevice_QueryInterface;
+    g_xboxDeviceVtable[1] = (void*)XboxDevice_AddRef;
+    g_xboxDeviceVtable[2] = (void*)XboxDevice_Release;
+    g_xboxDeviceVtable[8] = (void*)XboxDevice_CreateCommandQueue;
+    g_xboxDeviceVtable[9] = (void*)XboxDevice_CreateCommandAllocator;
+    g_xboxDeviceVtable[14] = (void*)XboxDevice_CreateDescriptorHeap;
+    g_xboxDeviceVtable[15] = (void*)XboxDevice_GetDescriptorHandleIncrementSize;
+    g_xboxDeviceVtable[26] = (void*)XboxDevice_GetCustomHeapProperties;
+    g_xboxDeviceVtable[36] = (void*)XboxDevice_CreateFence;
+    g_xboxDeviceVtable[48] = (void*)XboxDevice_CreateCommandQueue;
+    g_xboxDeviceVtable[73] = (void*)XboxDevice_CreateCommandList;
+    g_xboxDeviceVtable[78] = (void*)XboxDevice_SetFrameIntervalX;
+    g_xboxDeviceVtable[79] = (void*)XboxDevice_ScheduleFrameEventX;
+    g_xboxDeviceVtable[80] = (void*)XboxDevice_WaitFrameEventX;
+    g_xboxDeviceVtable[133] = (void*)XboxDevice_CreatePlacedResourceX;
+    g_xboxDeviceVtableInit = true;
+}
+
+// Wrap a real desktop device in a guest-facing Xbox device interface.
+// Returns the wrapper (the guest-facing pointer) or nullptr. The real
+// device's refcount is NOT changed here — the caller owns it; the
+// wrapper AddRefs it.
+static XboxDeviceWrapper* WrapXboxDevice(ID3D12Device* real) {
+    if (!real) return nullptr;
+    InitXboxDeviceVtable();
+    XboxDeviceWrapper* w = (XboxDeviceWrapper*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*w));
+    if (!w) return nullptr;
+    w->vtable = g_xboxDeviceVtable;
+    w->real = real;
+    w->refCount = 1;
+    real->AddRef();
+    return w;
+}
+
+// ------------------------------------------------------------------
+// Xbox command-list wrapper.
+//
+// The game calls Xbox command-list vtable slots on the list returned
+// by CreateCommandList. Returning the RAW desktop list is wrong: the
+// Xbox list vtable is larger/different (the game calls slots 131 and
+// 132, which are PAST the desktop ID3D12GraphicsCommandList vtable),
+// so those calls read garbage function pointers past the desktop
+// vtable and corrupt the list state — boot #33 proved it: slots 131/132
+// ran unchecked, then slot 9 (Close) failed and the game int3'd at
+// 0x142478bd4. So the list gets the same treatment as the device: a
+// guest-facing Xbox vtable with the real desktop list behind it.
+// ------------------------------------------------------------------
+struct XboxCommandListWrapper {
+    void** vtable;                    // points at g_xboxCommandListVtable
+    ID3D12GraphicsCommandList* real;  // real desktop list (owned)
+    LONG refCount;
+};
+
+static void* g_xboxCommandListVtable[192];
+static bool g_xboxCommandListVtableInit = false;
+
+static HRESULT WINAPI XboxList_QueryInterface(XboxCommandListWrapper* self,
+                                              REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (!self) return E_POINTER;
+    if (memcmp(&riid, &__uuidof(ID3D12GraphicsCommandList),
+               sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(ID3D12CommandList), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(IUnknown), sizeof(GUID)) == 0) {
+        InterlockedIncrement(&self->refCount);
+        *ppvObject = self;
+        return S_OK;
+    }
+    Log("xboxlist", "QueryInterface: unknown IID, E_NOINTERFACE");
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI XboxList_AddRef(XboxCommandListWrapper* self) {
+    if (!self) return 0;
+    return (ULONG)InterlockedIncrement(&self->refCount);
+}
+
+static ULONG WINAPI XboxList_Release(XboxCommandListWrapper* self) {
+    if (!self) return 0;
+    LONG rc = InterlockedDecrement(&self->refCount);
+    if (rc == 0) {
+        if (self->real) self->real->Release();
+        HeapFree(GetProcessHeap(), 0, self);
+    }
+    return (ULONG)rc;
+}
+
+// Generic stub for Xbox list slots not yet implemented. Logs the
+// caller's return address (so the game call site — and therefore the
+// slot — can be identified from the disassembly) and returns E_NOTIMPL.
+// NOTE: only correct for HRESULT-returning methods.
+static HRESULT WINAPI XboxList_Unimplemented(XboxCommandListWrapper* self) {
+    (void)self;
+    Log("xboxlist",
+        "UNIMPLEMENTED Xbox command-list slot called from game %p -> "
+        "E_NOTIMPL (identify the slot from the call site, then "
+        "implement it)",
+        _ReturnAddress());
+    return E_NOTIMPL;
+}
+
+// Slot 9: Close. Desktop ID3D12GraphicsCommandList slot 9 is also Close,
+// and the Xbox call at 0x142478bcd passes no args — matches. Forwards to
+// the real list's Close().
+static HRESULT WINAPI XboxList_Close(XboxCommandListWrapper* self) {
+    if (!self || !self->real) return E_POINTER;
+    HRESULT hr = self->real->Close();
+    Log("xboxlist", "Close -> hr=0x%08x", (unsigned)hr);
+    return hr;
+}
+
+// Slots 131/132: Xbox-specific command-list methods. Called by the game
+// right after CreateCommandList (boot #33, 0x142478b9e / 0x142478bbf)
+// with (0x700000, 0, 0, 0xffffffffff00) and (0xc3c0, 0x80020000, 0,
+// 0xffffffffff00); the game does NOT check their return values. Their
+// exact meaning is unknown — stub them to S_OK (no side effects) so the
+// list state stays clean for Close(). If the game later depends on
+// their effect, they will need a real implementation.
+static HRESULT WINAPI XboxList_Stub131(XboxCommandListWrapper* self,
+                                        UINT64 a, UINT64 b, UINT64 c,
+                                        UINT64 d) {
+    (void)self;
+    Log("xboxlist", "slot131 stub a=0x%llx b=0x%llx c=0x%llx d=0x%llx",
+        (unsigned long long)a, (unsigned long long)b,
+        (unsigned long long)c, (unsigned long long)d);
+    return S_OK;
+}
+
+static HRESULT WINAPI XboxList_Stub132(XboxCommandListWrapper* self,
+                                        UINT64 a, UINT64 b, UINT64 c,
+                                        UINT64 d) {
+    (void)self;
+    Log("xboxlist", "slot132 stub a=0x%llx b=0x%llx c=0x%llx d=0x%llx",
+        (unsigned long long)a, (unsigned long long)b,
+        (unsigned long long)c, (unsigned long long)d);
+    return S_OK;
+}
+
+// Build the 192-slot Xbox command-list vtable once.
+static void InitXboxCommandListVtable() {
+    if (g_xboxCommandListVtableInit) return;
+    for (int i = 0; i < 192; ++i)
+        g_xboxCommandListVtable[i] = (void*)XboxList_Unimplemented;
+    g_xboxCommandListVtable[0] = (void*)XboxList_QueryInterface;
+    g_xboxCommandListVtable[1] = (void*)XboxList_AddRef;
+    g_xboxCommandListVtable[2] = (void*)XboxList_Release;
+    g_xboxCommandListVtable[9] = (void*)XboxList_Close;
+    g_xboxCommandListVtable[131] = (void*)XboxList_Stub131;
+    g_xboxCommandListVtable[132] = (void*)XboxList_Stub132;
+    g_xboxCommandListVtableInit = true;
+}
+
+// Wrap a real desktop command list in a guest-facing Xbox list.
+static XboxCommandListWrapper* WrapXboxCommandList(
+    ID3D12GraphicsCommandList* real) {
+    if (!real) return nullptr;
+    InitXboxCommandListVtable();
+    XboxCommandListWrapper* w = (XboxCommandListWrapper*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*w));
+    if (!w) return nullptr;
+    w->vtable = g_xboxCommandListVtable;
+    w->real = real;
+    w->refCount = 1;
+    real->AddRef();
+    return w;
+}
+
+// Unwrap a guest-facing Xbox command list back to the real desktop list
+// (for passing to ExecuteCommandLists and other desktop calls that need
+// the real pointer). Returns the input unchanged if it is not a wrapper
+// (best-effort: a wrapper's vtable is g_xboxCommandListVtable).
+static ID3D12GraphicsCommandList* UnwrapXboxCommandList(void* p) {
+    if (!p) return nullptr;
+    void** vt = *(void***)p;
+    if (vt == g_xboxCommandListVtable) {
+        return ((XboxCommandListWrapper*)p)->real;
+    }
+    return (ID3D12GraphicsCommandList*)p;
+}
+
+// ------------------------------------------------------------------
+// Descriptor-heap wrapper.
+//
+// Boot #46/#47 crash: the game calls heap slot 9
+// (GetCPUDescriptorHandleForHeapStart) at 0x141cf3358 right after
+// CreateDescriptorHeap returns, with rcx=heap and rdx NOT set (garbage),
+// expecting the CPU handle in rax. The desktop D3D12Core implementation
+// writes the handle through rdx (hidden-pointer struct return) and
+// returns rdx — so it stores to the game's garbage rdx, which is
+// (thread_id<<32)|1, and faults inside D3D12Core.dll+0x5c0c7 writing
+// to that address (boot #46: 0x323800000001, thread 12856=0x3238;
+// boot #47: 0x589000000001, thread 22672=0x5890). The Xbox game expects
+// the 8-byte handle in rax, not through rdx. So the heap gets the same
+// treatment as the device/list: a guest-facing Xbox vtable whose
+// slots 9/10 return the handle as a UINT64 in rax (never touching
+// rdx), calling the real heap through the C++ API (where the compiler
+// sets up rdx correctly for the desktop struct return).
+// ------------------------------------------------------------------
+struct XboxDescriptorHeapWrapper {
+    void** vtable;                 // points at g_xboxDescriptorHeapVtable
+    ID3D12DescriptorHeap* real;   // real desktop heap (owned by the layer)
+    LONG refCount;
+};
+
+static void* g_xboxDescriptorHeapVtable[16];
+static bool g_xboxDescriptorHeapVtableInit = false;
+
+static HRESULT WINAPI XboxHeap_QueryInterface(XboxDescriptorHeapWrapper* self,
+                                              REFIID riid,
+                                              void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (!self) return E_POINTER;
+    if (memcmp(&riid, &__uuidof(ID3D12DescriptorHeap), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(IUnknown), sizeof(GUID)) == 0) {
+        InterlockedIncrement(&self->refCount);
+        *ppvObject = self;
+        return S_OK;
+    }
+    Log("xboxheap", "QueryInterface: unknown IID, E_NOINTERFACE");
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI XboxHeap_AddRef(XboxDescriptorHeapWrapper* self) {
+    if (!self) return 0;
+    return (ULONG)InterlockedIncrement(&self->refCount);
+}
+
+static ULONG WINAPI XboxHeap_Release(XboxDescriptorHeapWrapper* self) {
+    if (!self) return 0;
+    LONG rc = InterlockedDecrement(&self->refCount);
+    if (rc == 0) {
+        if (self->real) self->real->Release();
+        HeapFree(GetProcessHeap(), 0, self);
+    }
+    return (ULONG)rc;
+}
+
+// Generic stub for Xbox heap slots not yet implemented. Logs the
+// caller's return address (so the game call site — and therefore the
+// slot — can be identified from the disassembly) and returns E_NOTIMPL.
+// NOTE: only correct for HRESULT-returning methods.
+static HRESULT WINAPI XboxHeap_Unimplemented(XboxDescriptorHeapWrapper* self) {
+    (void)self;
+    Log("xboxheap",
+        "UNIMPLEMENTED Xbox descriptor-heap slot called from game %p -> "
+        "E_NOTIMPL (identify the slot from the call site, then "
+        "implement it)",
+        _ReturnAddress());
+    return E_NOTIMPL;
+}
+
+// Slot 8: GetDesc. Xbox struct-return convention (as with slot 26
+// GetCustomHeapProperties): (return buffer, this). Copy the real heap's
+// desc into the game's return buffer.
+static void WINAPI XboxHeap_GetDesc(D3D12_DESCRIPTOR_HEAP_DESC* retBuf,
+                                    XboxDescriptorHeapWrapper* self) {
+    if (!retBuf || !self || !self->real) return;
+    *retBuf = self->real->GetDesc();
+}
+
+// Slot 9: GetCPUDescriptorHandleForHeapStart. Returns the 8-byte CPU
+// handle as a UINT64 in rax (the game reads rax at 0x141cf335b and
+// stores it as the heap's CPU base); never touches rdx, which the
+// game leaves garbage — the desktop D3D12Core getter writes through
+// rdx and faults (boots #46/#47).
+static UINT64 WINAPI XboxHeap_GetCPUDescriptorHandleForHeapStart(
+    XboxDescriptorHeapWrapper* self) {
+    if (!self || !self->real) return 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE h =
+        self->real->GetCPUDescriptorHandleForHeapStart();
+    Log("xboxheap", "GetCPUDescriptorHandleForHeapStart -> 0x%llx",
+        (unsigned long long)h.ptr);
+    return (UINT64)h.ptr;
+}
+
+// Slot 10: GetGPUDescriptorHandleForHeapStart. Same rax convention:
+// the game reads rax at 0x141cf3395 and subtracts the CPU handle to
+// get the GPU-CPU delta for the allocator struct.
+static UINT64 WINAPI XboxHeap_GetGPUDescriptorHandleForHeapStart(
+    XboxDescriptorHeapWrapper* self) {
+    if (!self || !self->real) return 0;
+    D3D12_GPU_DESCRIPTOR_HANDLE h =
+        self->real->GetGPUDescriptorHandleForHeapStart();
+    Log("xboxheap", "GetGPUDescriptorHandleForHeapStart -> 0x%llx",
+        (unsigned long long)h.ptr);
+    return (UINT64)h.ptr;
+}
+
+// Build the 16-slot Xbox descriptor-heap vtable once.
+static void InitXboxDescriptorHeapVtable() {
+    if (g_xboxDescriptorHeapVtableInit) return;
+    for (int i = 0; i < 16; ++i)
+        g_xboxDescriptorHeapVtable[i] = (void*)XboxHeap_Unimplemented;
+    g_xboxDescriptorHeapVtable[0] = (void*)XboxHeap_QueryInterface;
+    g_xboxDescriptorHeapVtable[1] = (void*)XboxHeap_AddRef;
+    g_xboxDescriptorHeapVtable[2] = (void*)XboxHeap_Release;
+    g_xboxDescriptorHeapVtable[8] = (void*)XboxHeap_GetDesc;
+    g_xboxDescriptorHeapVtable[9] =
+        (void*)XboxHeap_GetCPUDescriptorHandleForHeapStart;
+    g_xboxDescriptorHeapVtable[10] =
+        (void*)XboxHeap_GetGPUDescriptorHandleForHeapStart;
+    g_xboxDescriptorHeapVtableInit = true;
+}
+
+// Wrap a real desktop descriptor heap in a guest-facing Xbox heap.
+static XboxDescriptorHeapWrapper* WrapXboxDescriptorHeap(
+    ID3D12DescriptorHeap* real) {
+    if (!real) return nullptr;
+    InitXboxDescriptorHeapVtable();
+    XboxDescriptorHeapWrapper* w = (XboxDescriptorHeapWrapper*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*w));
+    if (!w) return nullptr;
+    w->vtable = g_xboxDescriptorHeapVtable;
+    w->real = real;
+    w->refCount = 1;
+    real->AddRef();
+    return w;
+}
+
+// Unwrap a guest-facing Xbox descriptor heap back to the real desktop
+// heap (for passing to SetDescriptorHeaps and other desktop calls that
+// need the real pointer). Returns the input unchanged if it is not a
+// wrapper (best-effort: a wrapper's vtable is g_xboxDescriptorHeapVtable).
+static ID3D12DescriptorHeap* UnwrapXboxDescriptorHeap(void* p) {
+    if (!p) return nullptr;
+    void** vt = *(void***)p;
+    if (vt == g_xboxDescriptorHeapVtable) {
+        return ((XboxDescriptorHeapWrapper*)p)->real;
+    }
+    return (ID3D12DescriptorHeap*)p;
+}
+
+// ------------------------------------------------------------------
+// Minimal IDXGIDevice wrapper.
+//
+// The game QIs the D3D12 device for IID_IDXGIDevice (boot #36) to reach
+// the DXGI adapter (swapchain creation / adapter info). The real desktop
+// D3D12 device does NOT expose IDXGIDevice through QueryInterface
+// (boot #37: forwarding the QI to the real device returns E_NOINTERFACE),
+// so the layer provides its own. GetAdapter returns the real DXGI
+// adapter that backs the D3D12 device (matched by adapter LUID, falling
+// back to adapter 0). The rest is stubbed: the game only needs the
+// adapter from this interface in practice.
+// ------------------------------------------------------------------
+struct DxgiDeviceWrapper {
+    void** vtable;           // points at g_dxgiDeviceVtable
+    IDXGIAdapter* adapter;   // real DXGI adapter (owned by the layer)
+    LONG refCount;
+};
+
+static void* g_dxgiDeviceVtable[12];
+static bool g_dxgiDeviceVtableInit = false;
+
+static HRESULT WINAPI DxgiDevice_QueryInterface(DxgiDeviceWrapper* self,
+                                                REFIID riid,
+                                                void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (!self) return E_POINTER;
+    if (memcmp(&riid, &__uuidof(IDXGIDevice), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(IDXGIObject), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(IUnknown), sizeof(GUID)) == 0) {
+        InterlockedIncrement(&self->refCount);
+        *ppvObject = self;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI DxgiDevice_AddRef(DxgiDeviceWrapper* self) {
+    if (!self) return 0;
+    return (ULONG)InterlockedIncrement(&self->refCount);
+}
+
+static ULONG WINAPI DxgiDevice_Release(DxgiDeviceWrapper* self) {
+    if (!self) return 0;
+    LONG rc = InterlockedDecrement(&self->refCount);
+    if (rc == 0) {
+        if (self->adapter) self->adapter->Release();
+        HeapFree(GetProcessHeap(), 0, self);
+    }
+    return (ULONG)rc;
+}
+
+// IDXGIObject methods the game does not use — forward to the real
+// adapter where a real object exists, else E_NOTIMPL.
+static HRESULT WINAPI DxgiDevice_SetPrivateData(DxgiDeviceWrapper* self,
+                                                REFGUID guid, UINT size,
+                                                const void* data) {
+    (void)self; (void)guid; (void)size; (void)data;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI DxgiDevice_SetPrivateDataInterface(
+    DxgiDeviceWrapper* self, REFGUID guid, const IUnknown* obj) {
+    (void)self; (void)guid; (void)obj;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI DxgiDevice_GetPrivateData(DxgiDeviceWrapper* self,
+                                                REFGUID guid, UINT* size,
+                                                void* data) {
+    (void)self; (void)guid; (void)size; (void)data;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI DxgiDevice_GetParent(DxgiDeviceWrapper* self,
+                                           REFIID riid, void** parent) {
+    (void)self; (void)riid; (void)parent;
+    return E_NOINTERFACE;
+}
+
+// Slot 7: GetAdapter — the method the game actually wants. Returns the
+// real DXGI adapter (AddRef'd).
+static HRESULT WINAPI DxgiDevice_GetAdapter(DxgiDeviceWrapper* self,
+                                            IDXGIAdapter** adapter) {
+    if (!adapter) return E_POINTER;
+    *adapter = nullptr;
+    if (!self || !self->adapter) return E_NOINTERFACE;
+    self->adapter->AddRef();
+    *adapter = self->adapter;
+    Log("dxgidev", "GetAdapter -> adapter=%p", (void*)*adapter);
+    return S_OK;
+}
+
+static HRESULT WINAPI DxgiDevice_CreateSurface(DxgiDeviceWrapper* self,
+                                               const DXGI_SURFACE_DESC* desc,
+                                               UINT numSurfaces,
+                                               DXGI_USAGE usage,
+                                               const DXGI_SHARED_RESOURCE* shared,
+                                               IDXGISurface** surface) {
+    (void)self; (void)desc; (void)numSurfaces; (void)usage; (void)shared;
+    if (surface) *surface = nullptr;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI DxgiDevice_QueryResourceResidency(
+    DxgiDeviceWrapper* self, IUnknown* const* resources,
+    DXGI_RESIDENCY* status, UINT numResources) {
+    (void)self; (void)resources;
+    if (!status) return E_POINTER;
+    for (UINT i = 0; i < numResources; ++i)
+        status[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
+    return S_OK;
+}
+
+static HRESULT WINAPI DxgiDevice_SetGPUThreadPriority(
+    DxgiDeviceWrapper* self, INT priority) {
+    (void)self; (void)priority;
+    return S_OK;
+}
+
+static HRESULT WINAPI DxgiDevice_GetGPUThreadPriority(
+    DxgiDeviceWrapper* self, INT* priority) {
+    if (!priority) return E_POINTER;
+    *priority = 0;
+    return S_OK;
+}
+
+static void InitDxgiDeviceVtable() {
+    if (g_dxgiDeviceVtableInit) return;
+    g_dxgiDeviceVtable[0] = (void*)DxgiDevice_QueryInterface;
+    g_dxgiDeviceVtable[1] = (void*)DxgiDevice_AddRef;
+    g_dxgiDeviceVtable[2] = (void*)DxgiDevice_Release;
+    g_dxgiDeviceVtable[3] = (void*)DxgiDevice_SetPrivateData;
+    g_dxgiDeviceVtable[4] = (void*)DxgiDevice_SetPrivateDataInterface;
+    g_dxgiDeviceVtable[5] = (void*)DxgiDevice_GetPrivateData;
+    g_dxgiDeviceVtable[6] = (void*)DxgiDevice_GetParent;
+    g_dxgiDeviceVtable[7] = (void*)DxgiDevice_GetAdapter;
+    g_dxgiDeviceVtable[8] = (void*)DxgiDevice_CreateSurface;
+    g_dxgiDeviceVtable[9] = (void*)DxgiDevice_QueryResourceResidency;
+    g_dxgiDeviceVtable[10] = (void*)DxgiDevice_SetGPUThreadPriority;
+    g_dxgiDeviceVtable[11] = (void*)DxgiDevice_GetGPUThreadPriority;
+    g_dxgiDeviceVtableInit = true;
+}
+
+// Find the real DXGI adapter that backs a D3D12 device (matched by
+// adapter LUID; falls back to adapter 0). Returns a new reference.
+static IDXGIAdapter* FindDxgiAdapterForDevice(ID3D12Device* dev) {
+    if (!dev) return nullptr;
+    LUID luid = dev->GetAdapterLuid();
+    IDXGIFactory* factory = nullptr;
+    if (FAILED(CreateDXGIFactory(__uuidof(IDXGIFactory),
+                                 (void**)&factory)) || !factory)
+        return nullptr;
+    IDXGIAdapter* found = nullptr;
+    IDXGIAdapter* first = nullptr;
+    for (UINT i = 0;; ++i) {
+        IDXGIAdapter* a = nullptr;
+        if (factory->EnumAdapters(i, &a) != S_OK || !a) break;
+        if (!first) { first = a; a->AddRef(); }
+        DXGI_ADAPTER_DESC d = {};
+        if (SUCCEEDED(a->GetDesc(&d)) &&
+            d.AdapterLuid.LowPart == luid.LowPart &&
+            d.AdapterLuid.HighPart == luid.HighPart) {
+            found = a;
+            break;
+        }
+        a->Release();
+    }
+    factory->Release();
+    if (found) {
+        if (first) first->Release();
+        return found;
+    }
+    return first;  // fallback: adapter 0 (already AddRef'd)
+}
+
+// Build an IDXGIDevice wrapper for a D3D12 device.
+static DxgiDeviceWrapper* WrapDxgiDevice(ID3D12Device* dev) {
+    IDXGIAdapter* adapter = FindDxgiAdapterForDevice(dev);
+    if (!adapter) return nullptr;
+    InitDxgiDeviceVtable();
+    DxgiDeviceWrapper* w = (DxgiDeviceWrapper*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*w));
+    if (!w) { adapter->Release(); return nullptr; }
+    w->vtable = g_dxgiDeviceVtable;
+    w->adapter = adapter;
+    w->refCount = 1;
+    return w;
 }
 
 extern "C" HRESULT HleD3D12XboxCreateDevice(
@@ -287,54 +1402,84 @@ extern "C" HRESULT HleD3D12XboxCreateDevice(
     // desktop driver does not know it, so passing it through to
     // D3D12CreateDevice fails with E_NOINTERFACE and the game would
     // die at device creation. Log it when seen; the retry below maps
-    // it to the desktop base device.
-    static const GUID kXboxDeviceIID = {
-        0x5405C344, 0xD457, 0x444E,
-        {0xB4, 0xDD, 0x23, 0x66, 0xE4, 0x5A, 0xEE, 0x39}};
+    // it to the desktop base device. (kXboxDeviceIID is defined above,
+    // with the COM wrapper.)
     if (memcmp(&riid, &kXboxDeviceIID, sizeof(GUID)) == 0) {
         Log("d3d12xs",
             "D3D12XboxCreateDevice riid is the Xbox device IID "
             "{5405C344-D457-444E-B4DD-2366E45AEE39} (not desktop "
             "IID_ID3D12Device) — will map to the desktop base device");
     }
+    // Create the REAL desktop device into a local first. It is cached
+    // in g_xsDevice for the layer's own use, and the game gets the
+    // Xbox COM WRAPPER (WrapXboxDevice), never the raw desktop device
+    // — boot #28 proved the raw device AVs in D3D12Core because the
+    // game indexes the desktop vtable at Xbox offsets.
+    ID3D12Device* realDev = nullptr;
     HRESULT hr = E_FAIL;
     for (size_t i = 0; i < sizeof(kLevels) / sizeof(kLevels[0]); ++i) {
-        hr = D3D12CreateDevice(adapter, kLevels[i], riid, ppDevice);
+        hr = D3D12CreateDevice(adapter, kLevels[i], riid,
+                               (void**)&realDev);
         if (SUCCEEDED(hr)) {
             Log("d3d12xs",
                 "D3D12XboxCreateDevice -> REAL desktop device %p "
                 "(feature level 0x%x; Xbox fixed level is 12_2, best "
                 "available on this hardware)",
-                ppDevice ? *ppDevice : nullptr, (unsigned)kLevels[i]);
+                realDev, (unsigned)kLevels[i]);
             break;
         }
         if (hr == E_NOINTERFACE) {
             // Unknown IID (the Xbox device IID, or another Xbox
             // interface the desktop driver does not know) — retry
-            // with the desktop base IID_ID3D12Device. The Xbox device
-            // interface extends the desktop base, so the base methods
-            // are at the same vtable offsets; a base device is what
-            // the game can use at boot. (The game will QueryInterface
-            // for newer Xbox interfaces later — that needs the COM
-            // wrapper, which is future work; device creation itself
-            // must not fail here.)
+            // with the desktop base IID_ID3D12Device.
             hr = D3D12CreateDevice(adapter, kLevels[i],
-                                   __uuidof(ID3D12Device), ppDevice);
+                                   __uuidof(ID3D12Device),
+                                   (void**)&realDev);
             if (SUCCEEDED(hr)) {
                 Log("d3d12xs",
                     "D3D12XboxCreateDevice -> REAL desktop device %p "
                     "(feature level 0x%x; requested IID unknown to "
                     "the desktop driver, mapped to IID_ID3D12Device)",
-                    ppDevice ? *ppDevice : nullptr,
-                    (unsigned)kLevels[i]);
+                    realDev, (unsigned)kLevels[i]);
                 break;
             }
         }
     }
-    if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
+    if (SUCCEEDED(hr) && realDev) {
         if (g_xsDevice) g_xsDevice->Release();
-        g_xsDevice = (ID3D12Device*)*ppDevice;
+        g_xsDevice = realDev;
         g_xsDevice->AddRef();
+        if (g_scGuestIsRealXboxTitle) {
+            // Real Xbox title: hand the game the Xbox wrapper, not the
+            // raw device (boot #28 proved the raw device AVs in
+            // D3D12Core because the game indexes the desktop vtable
+            // at Xbox offsets).
+            XboxDeviceWrapper* wrapper = WrapXboxDevice(realDev);
+            if (wrapper) {
+                if (ppDevice) *ppDevice = wrapper;
+                // The wrapper AddRef'd the real device; drop this
+                // function's own reference (from D3D12CreateDevice).
+                realDev->Release();
+                Log("d3d12xs",
+                    "D3D12XboxCreateDevice -> Xbox wrapper %p (real %p)",
+                    wrapper, realDev);
+            } else {
+                if (ppDevice) *ppDevice = nullptr;
+                realDev->Release();
+                hr = E_OUTOFMEMORY;
+            }
+        } else {
+            // Synthetic guest: it uses the desktop D3D12 vtable
+            // layout, so it gets the raw desktop device (wrapping it
+            // breaks every gfx verify run — build 44). The
+            // D3D12CreateDevice reference is handed to the caller
+            // (do NOT Release here); g_xsDevice holds its own AddRef.
+            if (ppDevice) *ppDevice = realDev;
+            Log("d3d12xs",
+                "D3D12XboxCreateDevice -> raw desktop device %p "
+                "(synthetic guest, no Xbox wrapper)",
+                ppDevice ? *ppDevice : nullptr);
+        }
     } else {
         Log("d3d12xs",
             "D3D12XboxCreateDevice FAILED hr=0x%08x (no usable feature "
@@ -1763,17 +2908,16 @@ extern "C" BOOL HleXPackageIsPackagedProcess(void) {
 
 // ---- XPackage details (phase 3) ----
 // The layer presents a single synthetic package: the guest itself.
-// Identifier is synthetic (local-only, no store install); the TitleId
-// embedded in it is the GTA VI Scarlett TitleId from the package
-// file map, for traceability.
+// Identifier is synthetic (local-only, no store install) with a
+// placeholder TitleId; it identifies the guest to the layer only.
 
-static const char kPackageId[] = "ScarlettCompat-Guest-7952987A";
+static const char kPackageId[] = "ScarlettCompat-Guest-00000001";
 static const char kPackageDisplayName[] = "ScarlettCompat Guest";
 static const char kPackageDescription[] =
     "Synthetic package presented by the ScarlettCompat layer "
     "(local-only, no store install)";
 static const char kPackagePublisher[] = "ScarlettCompat";
-static const char kPackageTitleId[] = "7952987A";
+static const char kPackageTitleId[] = "00000001";
 
 struct XPackageMountImpl {
     char identifier[XPACKAGE_IDENTIFIER_MAX_LENGTH];
