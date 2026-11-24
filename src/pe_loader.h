@@ -42,6 +42,11 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize);
 // guest's return value or the exception code.
 bool RunXboxPe(LoadedPe* pe, DWORD* exitCode);
 
+// Guest image base (set by RunXboxPe before the entry runs). The HLE
+// layer reads guest globals / .data dispatch slots through it
+// (boot #58 pool-dispatcher invocation).
+void* ScGuestBase();
+
 void FreeXboxPe(LoadedPe* pe);
 
 }  // namespace sc

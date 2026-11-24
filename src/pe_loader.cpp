@@ -1771,6 +1771,12 @@ static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS* ep) {
 static void* g_guestBaseForVeh = nullptr;
 static LONG g_vehDumped = 0;
 
+// Boot #58: the HLE layer needs the guest image base to load the
+// Xbox pool-dispatcher pointer from the .data dispatch slot and to
+// read the arena globals (G/Gsize/cursor). Set by RunXboxPe before
+// the entry runs.
+void* ScGuestBase() { return g_guestBaseForVeh; }
+
 // Boot #13 diagnostic probe: reads the the title VFS mount-registry state
 // from the guest image at fixed RVAs (same convention as the existing
 // title-specific patches: pool vtable patch, F int3 NOP, Option A).
@@ -2061,8 +2067,154 @@ static void LogMountProbe() {
     }
 }
 
-static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {
-    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+// Boot #55 measurement (GPT follow-up, Seth-approved): operand
+// provenance for the 2 MB bounds check in the title's 0x14247AD10
+// (int3 at 0x14247AF2D). The check is 64-bit, unsigned (jbe):
+//   ([rsp+0x78] - [rsp+0x70] + [0x1475e6ff0]) <= 0x1FFFFF
+// [rsp+0x70]/[rsp+0x78] are the arena struct's two fields
+// (cursor, capacity) and [0x1475e6ff0] is the arena base written by
+// the bump-allocator callback (0x1456a2a60); the callback is the
+// ONLY writer of [rsp+0x70] after the zeroing mov, and [rsp+0x78]
+// is written ONLY by the capacity mov in 0x14247AD10. Log the
+// faulting frame's operands from the VEH context, plus the
+// neighbouring UAV-arg globals, the loop count, and the arena
+// registration node (its +8 field is the struct address — it must
+// equal RSP+0x70 if the callback ran against this frame's arena).
+// The faulting frame IS 0x14247AD10 (the int3 is in it), so the
+// crash-time slots are exactly the operands; no separate
+// first-write capture is needed. LOGGING ONLY: no behaviour change,
+// no NOP, the assert stays enabled.
+static void LogBoot55Probe(EXCEPTION_POINTERS* ep) {
+    uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+    if (!base || !ep || !ep->ExceptionRecord || !ep->ContextRecord)
+        return;
+    // Only meaningful when the fault IS the 2 MB assert.
+    if ((uintptr_t)ep->ExceptionRecord->ExceptionAddress !=
+        (uintptr_t)(base + 0x247AF2D)) {
+        return;
+    }
+    uint64_t rsp = (uint64_t)ep->ContextRecord->Rsp;
+    __try {
+        uint64_t s70 = *(uint64_t*)(rsp + 0x70);
+        uint64_t s78 = *(uint64_t*)(rsp + 0x78);
+        uint64_t g = *(uint64_t*)(base + 0x75E6FF0);
+        uint64_t total = s78 - s70 + g;  // same 64-bit wrap as the game
+        Log("loader",
+            "boot55-2mb: rsp=%llx [rsp+0x70]=%llx [rsp+0x78]=%llx "
+            "G=%llx total=%llx pass=%d",
+            (unsigned long long)rsp, (unsigned long long)s70,
+            (unsigned long long)s78, (unsigned long long)g,
+            (unsigned long long)total, (int)(total <= 0x1FFFFF));
+        Log("loader",
+            "boot55-2mb: regs rax=%llx rcx=%llx rdx=%llx r8=%llx "
+            "r9=%llx r10=%llx r11=%llx",
+            (unsigned long long)ep->ContextRecord->Rax,
+            (unsigned long long)ep->ContextRecord->Rcx,
+            (unsigned long long)ep->ContextRecord->Rdx,
+            (unsigned long long)ep->ContextRecord->R8,
+            (unsigned long long)ep->ContextRecord->R9,
+            (unsigned long long)ep->ContextRecord->R10,
+            (unsigned long long)ep->ContextRecord->R11);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "boot55-2mb: stack=<unreadable>");
+    }
+    __try {
+        uint32_t a0 = *(uint32_t*)(base + 0x75E6FE0);
+        uint32_t a1 = *(uint32_t*)(base + 0x75E6FE4);
+        uint8_t a2 = *(uint8_t*)(base + 0x75E6FE8);
+        uint64_t gs = *(uint64_t*)(base + 0x75E7A08);
+        uint32_t cnt = *(uint32_t*)(base + 0xA94390C);
+        Log("loader",
+            "boot55-2mb: arg0=%lu arg1=%lu arg2=%u Gsize=%llx "
+            "loopcount=%lu",
+            (unsigned long)a0, (unsigned long)a1, (unsigned)a2,
+            (unsigned long long)gs, (unsigned long)cnt);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "boot55-2mb: globals=<unreadable>");
+    }
+    __try {
+        // Arena registration: 0x145c8f990 pops a node from the free
+        // list (head RVA 0x146843360) and pushes it onto the active
+        // list (anchor RVA 0x146843758, first node at +0x18 =
+        // 0x146843770). Node: +0 callback, +8 &struct, +0x10 obj,
+        // +0x18 next. Walk up to 4 nodes.
+        void* node = *(void**)(base + 0x146843770);
+        for (int i = 0; i < 4 && node; ++i) {
+            uint64_t ncb = *(uint64_t*)((uint8_t*)node + 0x0);
+            uint64_t nstruct = *(uint64_t*)((uint8_t*)node + 0x8);
+            uint64_t nobj = *(uint64_t*)((uint8_t*)node + 0x10);
+            void* next = *(void**)((uint8_t*)node + 0x18);
+            Log("loader",
+                "boot55-2mb: arenanode[%d] node=%p callback=%llx "
+                "struct=%llx obj=%llx rsp70=%llx match=%d",
+                i, node, (unsigned long long)ncb,
+                (unsigned long long)nstruct, (unsigned long long)nobj,
+                (unsigned long long)(rsp + 0x70),
+                (int)(nstruct == rsp + 0x70));
+            node = next;
+        }
+        if (!node)
+            Log("loader", "boot55-2mb: arenanode: end of list");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "boot55-2mb: arenanode=<unreadable>");
+    }
+}
+
+// Boot #57 arena telemetry (GPT follow-up #7): the 2 MB assert may
+// PASS once slot 127 creates real resources, so the boot55 probe
+// (gated on the assert fault) may never fire. Log the arena state
+// (G, Gsize, UAV args, loop count, registration nodes) on EVERY VEH
+// fire, so whatever the next crash is, the log shows whether the
+// arena was consumed. LOGGING ONLY.
+// NOTE: the boot55 arenanode walk has a probe bug — it adds the full
+// VA 0x146843770 to the image base instead of the RVA 0x6843770, so
+// it reads garbage. This function uses the correct RVA.
+static void LogBoot57Arena() {
+    uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+    if (!base) return;
+    __try {
+        uint64_t g = *(uint64_t*)(base + 0x75E6FF0);
+        uint64_t gs = *(uint64_t*)(base + 0x75E7A08);
+        uint32_t a0 = *(uint32_t*)(base + 0x75E6FE0);
+        uint32_t a1 = *(uint32_t*)(base + 0x75E6FE4);
+        uint8_t a2 = *(uint8_t*)(base + 0x75E6FE8);
+        uint32_t cnt = *(uint32_t*)(base + 0xA94390C);
+        Log("loader",
+            "boot57-arena: G=%llx Gsize=%llx arg0=%lu arg1=%lu "
+            "arg2=%u loopcount=%lu",
+            (unsigned long long)g, (unsigned long long)gs,
+            (unsigned long)a0, (unsigned long)a1, (unsigned)a2,
+            (unsigned long)cnt);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "boot57-arena: globals=<unreadable>");
+    }
+    __try {
+        // Arena registration: 0x145c8f990 pushes nodes onto list A
+        // (anchor RVA 0x146843758, first node at +0x18, i.e. RVA
+        // 0x6843770). Node: +0 callback, +8 &struct, +0x10 obj,
+        // +0x18 next. Walk up to 4 nodes.
+        void* node = *(void**)(base + 0x6843770);
+        for (int i = 0; i < 4 && node; ++i) {
+            uint64_t ncb = *(uint64_t*)((uint8_t*)node + 0x0);
+            uint64_t nstruct = *(uint64_t*)((uint8_t*)node + 0x8);
+            uint64_t nobj = *(uint64_t*)((uint8_t*)node + 0x10);
+            void* next = *(void**)((uint8_t*)node + 0x18);
+            Log("loader",
+                "boot57-arena: arenanode[%d] node=%p callback=%llx "
+                "struct=%llx obj=%llx",
+                i, node, (unsigned long long)ncb,
+                (unsigned long long)nstruct,
+                (unsigned long long)nobj);
+            node = next;
+        }
+        if (!node)
+            Log("loader", "boot57-arena: arenanode: end of list");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "boot57-arena: arenanode=<unreadable>");
+    }
+}
+
+static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     // Boot #25: the fault moved from the pack assert (0x80000003) to an
     // access violation (0xc0000005, NULL-deref in the sibling pack fn).
     // Catch both so the mount probe + dump fire at the AV too — the
@@ -2101,6 +2253,8 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {
         }
     }
     LogMountProbe();
+    LogBoot55Probe(ep);
+    LogBoot57Arena();
     WriteCrashDump(ep, "veh-breakpoint");
     return EXCEPTION_CONTINUE_SEARCH;
 }

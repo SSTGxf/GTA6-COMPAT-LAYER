@@ -4,6 +4,7 @@
 // gets the E_NOTIMPL stub. Statuses are the project's tracking surface —
 // see docs/STATUS.md.
 #include "hle_registry.h"
+#include "pe_loader.h"  // ScGuestBase (boot #58 pool-dispatcher invocation)
 #include "era_to_gdk.h"  // ERA -> GDK translation (phase 5)
 #include "software_rt.h"  // Software ray tracing backend
 #include "fixed_timestep.h"  // Fixed-timestep physics decoupling
@@ -55,6 +56,17 @@ extern "C" HRESULT ScNotImplementedStub() {
 // later steps — swapchain, pacing — can use it).
 static ID3D12Device* g_xsDevice = nullptr;
 
+// Boot #58 XMemAllocDefault diagnostics: the arena callback's inner
+// allocator IS the layer's XMemAllocDefault shim, so its call count /
+// last size / last base are the corroborating evidence that the
+// dispatcher chain ran (first dispatch: +1 call, 64 MiB requested,
+// base returned; second dispatch: +0 — G is already set). Plain
+// stores + one interlocked increment — no locks, no allocation, no
+// I/O — so they are safe to update from inside the callback chain.
+static volatile LONG g_xmemAllocDefaultCalls = 0;
+static volatile SIZE_T g_xmemAllocDefaultLastSize = 0;
+static volatile void* g_xmemAllocDefaultLastBase = nullptr;
+
 // Whether the loaded guest is a real Xbox title (.xbld present), set
 // by the loader. The Xbox COM wrapper only applies to real titles.
 bool g_scGuestIsRealXboxTitle = false;
@@ -94,7 +106,22 @@ extern "C" void HleXMemFree(void* p) {
 // import table; XMemVirtualAlloc's 5-arg form from its call site at
 // 0x14193e220, which passes type 0x20003000 and attributes 0x2004) ----
 extern "C" void* HleXMemAllocDefault(SIZE_T size) {
-    return HleXMemAlloc(size, 0);
+    // Boot #58 (GPT consultation #8, safeguard B): MINIMAL — the
+    // allocation and nothing else. NO logging. This shim is called
+    // from inside the game's dispatcher chain (slot 127 ->
+    // dispatcher -> arena callback -> XMemAllocDefault), and Log()
+    // does file I/O + formatting, which must not run inside the
+    // callback chain. The diagnostic counters above are plain
+    // stores / one interlocked increment (safe in-chain). HleXMemAlloc
+    // (the attrs variant) keeps its logging — it is not on the
+    // dispatcher path. NOTE: direct game calls to XMemAllocDefault
+    // elsewhere in the boot are now silent too; the count delta
+    // around each dispatch call is what the boot #58 snapshot uses.
+    void* p = HeapAlloc(GetProcessHeap(), 0, size ? size : 1);
+    InterlockedIncrement(&g_xmemAllocDefaultCalls);
+    g_xmemAllocDefaultLastSize = size;
+    g_xmemAllocDefaultLastBase = p;
+    return p;
 }
 
 extern "C" void HleXMemFreeDefault(void* p) { HleXMemFree(p); }
@@ -280,6 +307,22 @@ static VirtualAlloc2Fn GetVirtualAlloc2() {
     return fn;
 }
 
+// ---- Heap-creation measurement (ChatGPT plan, boot #54) ----
+// Pure logging, no behaviour change. Tracks the large placeholder
+// reservation (the game's 185 MB descriptor backing store) so the
+// Xbox-facing CreateDescriptorHeap handler can report, per heap,
+// whether the reservation existed before that call and how many
+// layer-visible allocations happened between the reservation and the
+// heap creation. The game's VirtualFree placeholder splits bypass the
+// layer (real VirtualFree via IAT, not shimmed), so splits are NOT
+// counted here — the reservation base/size are, which is what the
+// heap-handle hypothesis turns on.
+static LPVOID g_measReserveBase = nullptr;   // base of the >=100 MB placeholder reserve
+static SIZE_T g_measReserveSize = 0;         // its size
+static unsigned long long g_measAllocSeq = 0;    // every HleVirtualAlloc call
+static unsigned long long g_measReserveSeq = 0;  // g_measAllocSeq at reservation time
+static unsigned long long g_measReplaceInRange = 0;  // placeholder replaces inside the reservation
+
 extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
                                   DWORD flAllocationType, DWORD flProtect) {
     // Desktop-valid flAllocationType bits. The Xbox bits 0x10000000 and
@@ -291,6 +334,7 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
     constexpr DWORD kReservePlaceholder = 0x40000;  // MEM_RESERVE_PLACEHOLDER
     constexpr DWORD kReplacePlaceholder = 0x4000;   // MEM_REPLACE_PLACEHOLDER
     DWORD desktopType = flAllocationType & kDesktopAllocType;
+    ++g_measAllocSeq;
     if ((flAllocationType &
          (kReservePlaceholder | kReplacePlaceholder)) != 0) {
         VirtualAlloc2Fn va2 = GetVirtualAlloc2();
@@ -305,6 +349,19 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
                     "0x%08x) -> %p (err %lu)",
                     lpAddress, (unsigned long long)dwSize,
                     flAllocationType, p, p ? 0 : GetLastError());
+                // Measurement: record the large (>=100 MB) reservation
+                // — the game's descriptor backing store.
+                if (p && dwSize >= 100 * 1024 * 1024) {
+                    g_measReserveBase = p;
+                    g_measReserveSize = dwSize;
+                    g_measReserveSeq = g_measAllocSeq;
+                    g_measReplaceInRange = 0;
+                    Log("kernelx",
+                        "meas: reservation base=%p size=%llu "
+                        "seq=%llu (thread %lu)",
+                        p, (unsigned long long)dwSize,
+                        g_measReserveSeq, GetCurrentThreadId());
+                }
                 return p;
             }
             // Replace a placeholder range. The game passes an Xbox
@@ -324,6 +381,13 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
                 LPVOID p = va2(GetCurrentProcess(), lpAddress, dwSize,
                                tries[i], PAGE_READWRITE, nullptr, 0);
                 if (p) {
+                    // Measurement: count replaces inside the reservation.
+                    if (g_measReserveBase &&
+                        (uintptr_t)lpAddress >=
+                            (uintptr_t)g_measReserveBase &&
+                        (uintptr_t)lpAddress <
+                            (uintptr_t)g_measReserveBase + g_measReserveSize)
+                        ++g_measReplaceInRange;
                     Log("kernelx",
                         "VirtualAlloc2 placeholder replace(%p, %llu, "
                         "0x%08x -> 0x%08x) -> %p",
@@ -421,6 +485,11 @@ struct XboxDescriptorHeapWrapper;
 static XboxDescriptorHeapWrapper* WrapXboxDescriptorHeap(
     ID3D12DescriptorHeap* real);
 static ID3D12DescriptorHeap* UnwrapXboxDescriptorHeap(void* p);
+
+// Forward declaration: the generic stub COM object (defined below, in
+// the "Generic stub COM object" section) is used by the XAudio2 /
+// GameInput / DStorage factory stubs.
+static void* MakeStubComObject(const char* tag);
 
 // The Xbox device IID the game requests
 // ({5405C344-D457-444E-B4DD-2366E45AEE39}).
@@ -528,6 +597,830 @@ static D3D12_HEAP_PROPERTIES* WINAPI XboxDevice_GetCustomHeapProperties(
         nodeMask, (unsigned)heapType, (unsigned)props.Type,
         (unsigned)props.CPUPageProperty, (unsigned)props.MemoryPoolPreference);
     return retBuf;
+}
+
+// Slot 17: CreateConstantBufferView. Desktop form matches:
+// (this, pDesc, DestDescriptor). The game calls it from the init tail
+// (0x14247927a) with rdx=&CBV desc and r8=DestDescriptor; returns
+// void, so the game does not check a result. Forwards to the real
+// device. The Xbox CBV desc is the PC prefix (BufferLocation +
+// SizeInBytes); pass it through.
+static void WINAPI XboxDevice_CreateConstantBufferView(
+    XboxDeviceWrapper* self,
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc,
+    D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!self || !self->real || !pDesc) return;
+    self->real->CreateConstantBufferView(pDesc, DestDescriptor);
+    Log("xboxdev",
+        "CreateConstantBufferView loc=0x%llx size=%u dest=0x%llx "
+        "ret=0x%llx thread=%lu",
+        (unsigned long long)pDesc->BufferLocation,
+        (unsigned)pDesc->SizeInBytes,
+        (unsigned long long)DestDescriptor.ptr,
+        (unsigned long long)_ReturnAddress(),
+        GetCurrentThreadId());
+}
+
+// Slot 18: CreateShaderResourceView. Desktop form matches:
+// (this, pResource, pDesc, DestDescriptor). The game calls it from
+// 0x140164efb (5x in boot #49); returns void. Forwards to the real
+// device. The resource is passed through as-is (the game has not
+// wrapped resources); the Xbox SRV desc is the PC prefix.
+static void WINAPI XboxDevice_CreateShaderResourceView(
+    XboxDeviceWrapper* self, ID3D12Resource* pResource,
+    const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc,
+    D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!self || !self->real) return;
+    self->real->CreateShaderResourceView(pResource, pDesc, DestDescriptor);
+    // Boot #56 instrumentation: dump the desc (Format/ViewDimension +
+    // raw union qwords) plus caller and thread — the boot #55 log
+    // showed SRV created with a NULL resource, so the desc contents
+    // are needed to see what the game thinks it is viewing.
+    const UINT64* srvQ = (const UINT64*)pDesc;
+    Log("xboxdev",
+        "CreateShaderResourceView res=%p desc=%p fmt=%u dim=%u "
+        "q=[0x%llx,0x%llx,0x%llx] dest=0x%llx ret=0x%llx thread=%lu",
+        (void*)pResource, (const void*)pDesc,
+        pDesc ? (unsigned)pDesc->Format : 0,
+        pDesc ? (unsigned)pDesc->ViewDimension : 0,
+        pDesc ? srvQ[0] : 0, pDesc ? srvQ[1] : 0, pDesc ? srvQ[2] : 0,
+        (unsigned long long)DestDescriptor.ptr,
+        (unsigned long long)_ReturnAddress(),
+        GetCurrentThreadId());
+}
+
+// Slot 19: CreateUnorderedAccessView. Desktop form matches:
+// (this, pResource, pCounterResource, pDesc, DestDescriptor). The game
+// calls it from 0x141647610 (6x in boot #49); returns void. Forwards
+// to the real device.
+static void WINAPI XboxDevice_CreateUnorderedAccessView(
+    XboxDeviceWrapper* self, ID3D12Resource* pResource,
+    ID3D12Resource* pCounterResource,
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc,
+    D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!self || !self->real) return;
+    self->real->CreateUnorderedAccessView(pResource, pCounterResource,
+                                          pDesc, DestDescriptor);
+    // Boot #56 instrumentation: same as SRV — desc contents plus
+    // caller and thread (boot #55 showed UAV created with NULL res).
+    const UINT64* uavQ = (const UINT64*)pDesc;
+    Log("xboxdev",
+        "CreateUnorderedAccessView res=%p counter=%p desc=%p "
+        "fmt=%u dim=%u q=[0x%llx,0x%llx,0x%llx] dest=0x%llx "
+        "ret=0x%llx thread=%lu",
+        (void*)pResource, (void*)pCounterResource,
+        (const void*)pDesc,
+        pDesc ? (unsigned)pDesc->Format : 0,
+        pDesc ? (unsigned)pDesc->ViewDimension : 0,
+        pDesc ? uavQ[0] : 0, pDesc ? uavQ[1] : 0, pDesc ? uavQ[2] : 0,
+        (unsigned long long)DestDescriptor.ptr,
+        (unsigned long long)_ReturnAddress(),
+        GetCurrentThreadId());
+}
+
+// Slot 25: GetResourceAllocationInfo. Xbox struct-return convention
+// (as with slot 26 GetCustomHeapProperties): (return buffer, this,
+// visibleMask, numDescs, pDescs). The game calls it from 0x140344182
+// with rcx=&stack retBuf, rdx=device, r8d=1, r9d=1, [rsp+0x20]=
+// pResourceDescs; it copies the 16-byte result to [rsi] and int3s
+// at 0x140344196 if [rsi+4] (SizeInBytes high dword) != 0. The
+// E_NOTIMPL stub never fills the struct, so the game int3s on stack
+// garbage (boot #49). Forwards to the real device and copies the
+// result into the game's return buffer.
+static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI
+XboxDevice_GetResourceAllocationInfo(
+    D3D12_RESOURCE_ALLOCATION_INFO* retBuf, XboxDeviceWrapper* self,
+    UINT visibleMask, UINT numResourceDescs,
+    const D3D12_RESOURCE_DESC* pResourceDescs) {
+    if (!retBuf || !self || !self->real) return retBuf;
+    // Diagnostic (boot #50): the desktop method returns
+    // SizeInBytes=UINT64_MAX for the game's desc, so the game int3s.
+    // Dump the desc fields (desktop layout) to see which field the
+    // desktop method rejects — the Xbox desc layout may differ.
+    if (pResourceDescs) {
+        Log("xboxdev",
+            "GetResourceAllocationInfo desc: dim=%u align=%llu "
+            "w=%llu h=%u depth=%u mips=%u fmt=%u sample=%u/%u "
+            "layout=%u flags=0x%x",
+            (unsigned)pResourceDescs->Dimension,
+            (unsigned long long)pResourceDescs->Alignment,
+            (unsigned long long)pResourceDescs->Width,
+            (unsigned)pResourceDescs->Height,
+            (unsigned)pResourceDescs->DepthOrArraySize,
+            (unsigned)pResourceDescs->MipLevels,
+            (unsigned)pResourceDescs->Format,
+            (unsigned)pResourceDescs->SampleDesc.Count,
+            (unsigned)pResourceDescs->SampleDesc.Quality,
+            (unsigned)pResourceDescs->Layout,
+            (unsigned)pResourceDescs->Flags);
+    } else {
+        Log("xboxdev", "GetResourceAllocationInfo desc: NULL");
+    }
+    // Boot #51: the game's desc is a 3840x2160 R8G8B8A8 render target
+    // (dim=3, fmt=28) but Flags=0x300005 carries Xbox-specific bits
+    // (0x300000) the desktop method rejects — it returns
+    // SizeInBytes=UINT64_MAX and the game int3s. Sanitize: copy the
+    // desc and mask Flags to the desktop-valid bits (0x7F:
+    // ALLOW_RENDER_TARGET | ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS
+    // | DENY_SHADER_RESOURCE | ALLOW_CROSS_ADAPTER |
+    // ALLOW_SIMULTANEOUS_ACCESS | VIDEO_DECODE_REFERENCE_ONLY).
+    // The Dimension is left as-is (the desktop method accepts the
+    // 3840x2160x1 shape once the flags are valid).
+    D3D12_RESOURCE_DESC cleanDesc;
+    const D3D12_RESOURCE_DESC* useDesc = pResourceDescs;
+    if (pResourceDescs) {
+        cleanDesc = *pResourceDescs;
+        cleanDesc.Flags = (D3D12_RESOURCE_FLAGS)(
+            (UINT)cleanDesc.Flags & 0x7F);
+        useDesc = &cleanDesc;
+        Log("xboxdev",
+            "GetResourceAllocationInfo: sanitized flags 0x%x -> 0x%x",
+            (unsigned)pResourceDescs->Flags, (unsigned)cleanDesc.Flags);
+    }
+    *retBuf = self->real->GetResourceAllocationInfo(
+        visibleMask, numResourceDescs, useDesc);
+    Log("xboxdev",
+        "GetResourceAllocationInfo mask=%u num=%u -> size=%llu "
+        "align=%llu ret=0x%llx thread=%lu",
+        visibleMask, numResourceDescs,
+        (unsigned long long)retBuf->SizeInBytes,
+        (unsigned long long)retBuf->Alignment,
+        (unsigned long long)_ReturnAddress(),
+        GetCurrentThreadId());
+    return retBuf;
+}
+
+// Slot 127: CreateCommittedResource3 (ID3D12Device10). VERIFIED
+// against the call site (0x14193e1b4, disassembled 2026-11-24, boot
+// #57): rcx=this, rdx=&D3D12_HEAP_PROPERTIES{1,0,0,1,1} (20 bytes,
+// built on the game stack from .rdata 0x14615c090), r8d=8 (heap
+// flags), r9=&D3D12_RESOURCE_DESC1 (built on the game stack by
+// 0x140abfad0), [rsp+0x20]=InitialLayout (D3D12_BARRIER_LAYOUT),
+// [rsp+0x28]=&D3D12_CLEAR_VALUE (built on the game stack),
+// [rsp+0x30]=NULL (protected session), [rsp+0x38]=0 (num castable),
+// [rsp+0x40]=NULL (castable formats), [rsp+0x48]=&IID_ID3D12Resource
+// (.rdata 0x1463fa690 — the STANDARD desktop IID, verified by
+// reading the 16 bytes: {696442BE-A72E-4059-BC79-5B5C98040FAD}),
+// [rsp+0x50]=&out. The argument layout matches desktop
+// CreateCommittedResource3 exactly (this + 10 params).
+//   CORRECTIONS to earlier notes: (a) the {96918C8C-ACA1-BFB8-B2A7-
+//   9E95908C8C8C} GUID in BOOT52/BOOT56 is a DIFFERENT .rdata GUID
+//   (VA 0x1461e7a90, used elsewhere); it is NOT the riid for this
+//   call site. (b) GPT consultation #7's register map was shifted
+//   by one — it forgot `this` occupies RCX; the map above is the
+//   disassembly ground truth. (c) GPT's claim that Leonida
+//   corroborates slot 127 = CreateCommittedResource3 is NOT
+//   supported by our Leonida clone: their slot table names
+//   27=CreateCommittedResource (PC slot 27), 76=Xbox resource
+//   creation, 127=forwarded (unnamed). The identification rests on
+//   this ABI match, not on Leonida.
+//   The old stub (boot #53) treated R9 as the out pointer and wrote
+//   the stub object into the first 8 bytes of the game's resource
+//   desc — that corruption is gone with the real signature.
+//   Returns the RAW native ID3D12Resource* (slot-133 pattern):
+//   the game passes the pointer straight to the device SRV/UAV/RTV
+//   methods, which forward to the real device; Leonida's slot 76
+//   does the same. A COM wrapper for the resource is future work
+//   if the game ever calls resource methods directly.
+//   NEVER return S_OK without a valid object: native/wrapping
+//   failures propagate. ALLOW_DISPLAY is kept on the first attempt;
+//   a failure retries WITHOUT it, LOGGED (not silent).
+static D3D12_RESOURCE_STATES BarrierLayoutToResourceState(
+    D3D12_BARRIER_LAYOUT layout) {
+    switch (layout) {
+        case D3D12_BARRIER_LAYOUT_COMMON:
+            return D3D12_RESOURCE_STATE_COMMON;
+        case D3D12_BARRIER_LAYOUT_GENERIC_READ:
+            return D3D12_RESOURCE_STATE_GENERIC_READ;
+        case D3D12_BARRIER_LAYOUT_RENDER_TARGET:
+            return D3D12_RESOURCE_STATE_RENDER_TARGET;
+        case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+            return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE:
+            return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ:
+            return D3D12_RESOURCE_STATE_DEPTH_READ;
+        case D3D12_BARRIER_LAYOUT_SHADER_RESOURCE:
+            return (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        case D3D12_BARRIER_LAYOUT_COPY_SOURCE:
+            return D3D12_RESOURCE_STATE_COPY_SOURCE;
+        case D3D12_BARRIER_LAYOUT_COPY_DEST:
+            return D3D12_RESOURCE_STATE_COPY_DEST;
+        case D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE:
+            return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+        case D3D12_BARRIER_LAYOUT_RESOLVE_DEST:
+            return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        case D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE:
+            return D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        case D3D12_BARRIER_LAYOUT_VIDEO_DECODE_READ:
+            return D3D12_RESOURCE_STATE_VIDEO_DECODE_READ;
+        case D3D12_BARRIER_LAYOUT_VIDEO_DECODE_WRITE:
+            return D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE;
+        case D3D12_BARRIER_LAYOUT_VIDEO_PROCESS_READ:
+            return D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ;
+        case D3D12_BARRIER_LAYOUT_VIDEO_PROCESS_WRITE:
+            return D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE;
+        case D3D12_BARRIER_LAYOUT_VIDEO_ENCODE_READ:
+            return D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ;
+        case D3D12_BARRIER_LAYOUT_VIDEO_ENCODE_WRITE:
+            return D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON:
+            return D3D12_RESOURCE_STATE_COMMON;
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ:
+            return D3D12_RESOURCE_STATE_GENERIC_READ;
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS:
+            return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE:
+            return (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE:
+            return D3D12_RESOURCE_STATE_COPY_SOURCE;
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST:
+            return D3D12_RESOURCE_STATE_COPY_DEST;
+        default:  // UNDEFINED (0xFFFFFFFF) + unknown
+            return D3D12_RESOURCE_STATE_COMMON;
+    }
+}
+
+// ---- Boot #58: Xbox pool-dispatcher invocation (Model A) ----
+// (GPT consultation #8.) The game's arena callback is registered in
+// handler registry A (list A, bucket 128) but nothing in the game
+// ever invokes the dispatcher that walks it. On a real Xbox the
+// d3d12_xs runtime consults the registered pool when a committed
+// resource is created; in this layer slot 127 IS the runtime's entry
+// point, so the layer invokes the dispatcher itself, once per
+// texture, AFTER the desktop resource exists (Model A: pool
+// accounting / compatibility emulation — the desktop resource stays
+// desktop-backed; the dispatcher call reproduces the pool-handler
+// state. It does NOT make the desktop resource use the arena
+// memory. Model B — pool-backed translation — is NOT attempted
+// here: a HeapAlloc address is not interchangeable with a D3D12
+// heap.)
+//
+// DISPATCHER SELECTION (resolved by disassembly, boot #58 — NOT by
+// proximity): the two dispatchers are instruction-identical EXCEPT
+// their table base. Dispatcher 1 (0x144deb430, via .data slot
+// 0x146844380 -> thunk 0x144deb420) walks table A (base
+// 0x146843370); dispatcher 2 (0x144e38ed0, via .data slot
+// 0x146844388 -> thunk 0x144e38ec0) walks table B (base
+// 0x146843b80). The arena callback is registered in list A (bucket
+// 128 of table A: head slot 0x146843770); dispatcher 2's bucket 128
+// is list B (0x146843f80), a different registry. The default tails
+// confirm the split: table A's default node (0x1461889b0) is
+// XMemAllocDefault — the arena callback's inner allocator (the
+// boot #57 runtime chain is [arena callback, XMemAllocDefault]);
+// table B's default node (0x1461889d0) is XMemFreeDefault. So the
+// two dispatchers are the alloc/free pair, and dispatcher 1 is the
+// allocation dispatcher. The layer loads the pointer from the .data
+// slot at runtime (never hardcodes the thunk, never treats the slot
+// address as a function) and gates on it equalling
+// guestBase+0x4DEB420.
+//   LOCK SCOPE (from disassembly): BOTH dispatchers release the
+//   registry spinlock (0x1471bf988, via 0x144deb500) BEFORE invoking
+//   the chain head — the lock covers traversal/selection ONLY, not
+//   the callback invocation. So the callback and its inner allocator
+//   run with the lock released, and the layer must NOT acquire it.
+//   RETURN CONVENTION (from disassembly): both dispatchers return
+//   the callback's return value untouched (call *0x20(%rsp), then
+//   epilogue + ret). The arena callback's bump path returns the old
+//   cursor — so the dispatcher returns the old cursor (0 on the
+//   first call, 33,423,360 on the second). Verification below judges
+//   by STATE (G/cursor/Gsize transitions), not by the return value
+//   alone.
+//   REENTRANCY (GPT #8 safeguards): (A) per-thread TLS depth
+//   counter around the dispatch; (B) XMemAllocDefault is minimal
+//   (allocation only, no logging — see above); (C) NO logging while
+//   inside the callback chain — fixed-size records are captured in
+//   preallocated (stack) storage and emitted AFTER the dispatcher
+//   returns; (D) no extra lock around the arena; (E) the VEH
+//   handler stays observational; (F) slot 127 holds no layer lock
+//   across the dispatch (it holds none at all).
+//   GATING: the dispatch runs only while the arena callback is
+//   actually registered AND the request fits the remaining capacity.
+//   If either gate fails, the dispatch is SKIPPED and the resource
+//   is returned normally (boot #57 behaviour) — a later resource
+//   created after the arena is unregistered, or one that does not
+//   fit, has no pool to consult, and skipping is the honest
+//   outcome. If the dispatch RUNS but the state does not advance as
+//   expected, slot 127 FAILS the creation cleanly (release the
+//   native resource, clear the out pointer, E_FAIL) — never a
+//   silent success into the drain check, never an automatic retry
+//   (a first attempt may have partially consumed arena space).
+
+// Guest RVAs (image base-relative; computed from the loader's
+// recorded base, so a relocated image still works).
+static const uint64_t kPoolDispatchSlotRva = 0x6844380;  // .data slot: dispatcher-1 thunk pointer
+static const uint64_t kPoolDispatchThunkRva = 0x4DEB420;  // expected slot value (thunk -> dispatcher 1)
+static const uint64_t kArenaCallbackRva = 0x56A2A60;       // arena bump callback (VA 0x1456a2a60)
+static const uint64_t kArenaListHeadRva = 0x6843770;      // table A bucket 128 head (list A)
+static const uint64_t kArenaBaseGlobalRva = 0x75E6FF0;    // G (arena base)
+static const uint64_t kArenaSizeGlobalRva = 0x75E7A08;    // Gsize (last kind stored by callback)
+static const uint64_t kPoolDispatchSize = 33423360ULL;    // raw allocation-info size (510 x 64 KiB)
+static const uint64_t kPoolDispatchKind = 0x8000ULL;      // kind 0x8000 -> bucket 128, bump path
+static const uint64_t kPoolArenaCapacity = 0x4000000ULL;  // 64 MiB (observed [rsp+0x78])
+
+struct PoolArenaState {
+    uint64_t g = 0;           // G global (arena base, 0 = not yet allocated)
+    uint64_t gsize = 0;       // Gsize global (last kind stored by callback)
+    uint64_t cursor = 0;      // arena struct [0] (current alloc pointer)
+    uint64_t capacity = 0;    // arena struct [8]
+    uint64_t arenaStruct = 0; // &arena struct (registration node [8])
+    bool registered = false;  // arena callback node found in list A
+    bool ok = false;          // every read succeeded
+};
+
+// SEH-guarded single-qword read from the guest image. POD locals
+// only, so __try is legal under /EHsc (same pattern as the
+// pe_loader VEH probes, which compile under these flags).
+static bool ReadGuestQword(uint8_t* base, uint64_t rva, uint64_t* out) {
+    if (!base || !out) return false;
+    __try {
+        *out = *(uint64_t*)(base + rva);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// SEH-guarded read of the arena state: G/Gsize globals + the list A
+// walk to the arena callback node (its [8] field is the &arena
+// struct; the struct's [0]/[8] are cursor/capacity). The list is
+// mutated only under the game's spinlock and the registration is
+// scoped to the arena function, so the walk is stable while slot 127
+// runs — but never fault the game thread for a diagnostic read.
+static bool ReadPoolArenaState(uint8_t* base, PoolArenaState* st) {
+    if (!base || !st) return false;
+    st->g = 0; st->gsize = 0; st->cursor = 0; st->capacity = 0;
+    st->arenaStruct = 0; st->registered = false; st->ok = false;
+    __try {
+        st->g = *(uint64_t*)(base + kArenaBaseGlobalRva);
+        st->gsize = *(uint64_t*)(base + kArenaSizeGlobalRva);
+        void* node = *(void**)(base + kArenaListHeadRva);
+        for (int i = 0; i < 8 && node; ++i) {
+            uint64_t cb = *(uint64_t*)((uint8_t*)node + 0x0);
+            uint64_t nstruct = *(uint64_t*)((uint8_t*)node + 0x8);
+            void* next = *(void**)((uint8_t*)node + 0x18);
+            if (cb == (uint64_t)(base + kArenaCallbackRva)) {
+                st->registered = true;
+                st->arenaStruct = nstruct;
+                st->cursor = *(uint64_t*)(nstruct + 0x0);
+                st->capacity = *(uint64_t*)(nstruct + 0x8);
+                break;
+            }
+            node = next;
+        }
+        st->ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        st->ok = false;
+    }
+    return st->ok;
+}
+
+// Per-thread reentrancy guard (GPT #8 safeguard A): a TLS depth
+// counter around the dispatcher invocation. Win32 TLS is used rather
+// than __declspec(thread) so the guard does not depend on the layer
+// DLL's TLS initialization order.
+static DWORD g_poolDispatchTls = TLS_OUT_OF_INDEXES;
+static LONG g_poolDispatchTlsInit = 0;
+
+static DWORD PoolDispatchTlsIndex() {
+    if (g_poolDispatchTlsInit != 2) {
+        if (InterlockedCompareExchange(&g_poolDispatchTlsInit, 1, 0) == 0) {
+            g_poolDispatchTls = TlsAlloc();
+            InterlockedExchange(&g_poolDispatchTlsInit, 2);
+        } else {
+            while (g_poolDispatchTlsInit != 2) YieldProcessor();
+        }
+    }
+    return g_poolDispatchTls;
+}
+
+// Guest dispatcher ABI: (rcx=size, rdx=kind) -> rax (the callback's
+// return value = old cursor for the arena bump path).
+typedef uint64_t (*GuestPoolDispatcherFn)(uint64_t size, uint64_t kind);
+
+// Per-slot-127-call snapshot, captured in preallocated (stack)
+// storage and emitted AFTER the dispatcher returns — never logged
+// inside the callback chain (GPT #8 safeguard C).
+struct PoolDispatchSnap {
+    int callIndex = -1;
+    uint64_t dispatcherPtr = 0;
+    uint64_t dispatcherRet = 0;
+    LONG xmemBefore = 0;
+    LONG xmemAfter = 0;
+    SIZE_T xmemLastSize = 0;
+    void* xmemLastBase = nullptr;
+    PoolArenaState pre;
+    PoolArenaState post;
+    int tlsDepthBefore = 0;
+    bool dispatched = false;  // the dispatcher was actually called
+    bool verified = false;    // state transitions matched expectation
+};
+
+static LONG g_poolDispatchCalls = 0;  // slot-127 dispatch attempts
+
+// Invoke the game's pool dispatcher for one committed resource
+// (Model A). Returns true iff the dispatch ran AND the arena state
+// advanced exactly as the two-resource hypothesis requires. Returns
+// false with snap->dispatched==false when the dispatch was SKIPPED
+// (arena not registered / bad pointer / does not fit / nested / no
+// TLS) — the caller then returns the resource normally. Returns
+// false with snap->dispatched==true when the dispatch RAN but the
+// state did not advance — the caller must then FAIL the creation
+// cleanly. Never calls the arena callback directly; never fabricates
+// allocations; never touches the 2 MB assert.
+static bool DispatchPoolForResource(PoolDispatchSnap* snap) {
+    uint8_t* base = (uint8_t*)ScGuestBase();
+    if (!base) {
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: no guest base");
+        return false;
+    }
+    DWORD tlsIdx = PoolDispatchTlsIndex();
+    if (tlsIdx == TLS_OUT_OF_INDEXES) {
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: TLS unavailable");
+        return false;
+    }
+    int depth = (int)(intptr_t)TlsGetValue(tlsIdx);
+    snap->tlsDepthBefore = depth;
+    if (depth != 0) {
+        // Unexpected nested entry — record, do not recurse.
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: nested dispatch "
+            "(tls depth=%d)",
+            depth);
+        return false;
+    }
+    // Pre-read (before the dispatch): G/Gsize/cursor + the
+    // registration walk. If the baseline cannot be read, skip —
+    // the state cannot be verified afterwards.
+    if (!ReadPoolArenaState(base, &snap->pre) || !snap->pre.ok) {
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: arena state "
+            "unreadable");
+        return false;
+    }
+    if (!snap->pre.registered) {
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: arena callback "
+            "not registered (no pool to consult for this resource)");
+        return false;
+    }
+    // Fit gate: the request must fit the remaining capacity, or the
+    // callback's own over-capacity int3 would fire. Remaining =
+    // capacity - (cursor - G); G==0/cursor==0 before the first call.
+    uint64_t consumed = (snap->pre.g == 0)
+        ? 0
+        : (snap->pre.cursor - snap->pre.g);
+    uint64_t remaining = (snap->pre.capacity >= consumed)
+        ? (snap->pre.capacity - consumed)
+        : 0;
+    if (remaining < kPoolDispatchSize) {
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: request does not "
+            "fit (remaining=%llu need=%llu G=%llx cursor=%llx)",
+            (unsigned long long)remaining,
+            (unsigned long long)kPoolDispatchSize,
+            (unsigned long long)snap->pre.g,
+            (unsigned long long)snap->pre.cursor);
+        return false;
+    }
+    // Load the dispatcher pointer from the .data slot at runtime
+    // (GPT #8: call through the runtime-selected function pointer).
+    // Gate on it equalling the dispatcher-1 thunk — if the slot
+    // holds anything else, the premise is broken; do not call.
+    uint64_t disp = 0;
+    if (!ReadGuestQword(base, kPoolDispatchSlotRva, &disp)) {
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: dispatcher slot "
+            "unreadable");
+        return false;
+    }
+    snap->dispatcherPtr = disp;
+    uint64_t expected = (uint64_t)base + kPoolDispatchThunkRva;
+    if (disp != expected) {
+        Log("xboxdev",
+            "Slot127 CCR3: pool dispatch SKIPPED: dispatcher slot "
+            "ptr=%p expected=%p (not dispatcher 1)",
+            (void*)disp, (void*)expected);
+        return false;
+    }
+    // All gates pass. Set the reentrancy guard, invoke the
+    // dispatcher synchronously on this (game) thread, reset the
+    // guard in __finally so a fault inside the chain cannot leave
+    // a stale depth behind. NO logging inside the chain — the
+    // snapshot below is emitted after the call returns.
+    snap->callIndex = (int)InterlockedIncrement(&g_poolDispatchCalls) - 1;
+    snap->xmemBefore = g_xmemAllocDefaultCalls;
+    snap->dispatched = true;
+    GuestPoolDispatcherFn fn = (GuestPoolDispatcherFn)(uintptr_t)disp;
+    TlsSetValue(tlsIdx, (void*)(intptr_t)1);
+    uint64_t ret = 0;
+    __try {
+        ret = fn(kPoolDispatchSize, kPoolDispatchKind);
+    } __finally {
+        TlsSetValue(tlsIdx, (void*)(intptr_t)0);
+    }
+    snap->dispatcherRet = ret;
+    snap->xmemAfter = g_xmemAllocDefaultCalls;
+    snap->xmemLastSize = g_xmemAllocDefaultLastSize;
+    snap->xmemLastBase = (void*)g_xmemAllocDefaultLastBase;
+    // Post-read + verification (state, not return value alone).
+    ReadPoolArenaState(base, &snap->post);
+    uint64_t postConsumed = 0;
+    uint64_t postRemaining = 0;
+    if (snap->post.ok && snap->post.g != 0) {
+        postConsumed = snap->post.cursor - snap->post.g;
+        postRemaining = (snap->post.capacity >= postConsumed)
+            ? (snap->post.capacity - postConsumed)
+            : 0;
+    }
+    uint64_t expectConsumed =
+        (uint64_t)(snap->callIndex + 1) * kPoolDispatchSize;
+    bool baseOk = (snap->callIndex == 0)
+        ? (snap->pre.g == 0)
+        : (snap->post.g == snap->pre.g);
+    snap->verified = snap->post.ok && snap->post.registered &&
+        snap->post.g != 0 && baseOk &&
+        snap->post.gsize == kPoolDispatchKind &&
+        snap->post.capacity == kPoolArenaCapacity &&
+        postConsumed == expectConsumed;
+    // The callback ran iff the state moved exactly as its bump path
+    // moves it (G/Gsize/cursor are written ONLY by the callback —
+    // boot #55 provenance). Reported as an inference, not a hook
+    // count: the layer does not patch the callback to count it.
+    int callbackRan = snap->verified ? 1 : 0;
+    Log("xboxdev",
+        "slot127[%d]: native_create=S_OK dispatcher_selected=1 "
+        "dispatcher_ptr=%p dispatcher_arg0=%llu "
+        "dispatcher_arg1=0x%llx dispatcher_return=%llx "
+        "callback_ran(inferred)=%d xmem_alloc_delta=%ld "
+        "xmem_last_size=%llu xmem_last_base=%p G_before=%llx "
+        "G_after=%llx Gsize_before=%llx Gsize_after=%llx "
+        "cursor_before=%llx cursor_after=%llx capacity=%llx "
+        "remaining=%llu tls_depth=%d verified=%d",
+        snap->callIndex, (void*)snap->dispatcherPtr,
+        (unsigned long long)kPoolDispatchSize,
+        (unsigned long long)kPoolDispatchKind,
+        (unsigned long long)snap->dispatcherRet, callbackRan,
+        (long)(snap->xmemAfter - snap->xmemBefore),
+        (unsigned long long)snap->xmemLastSize, snap->xmemLastBase,
+        (unsigned long long)snap->pre.g,
+        (unsigned long long)snap->post.g,
+        (unsigned long long)snap->pre.gsize,
+        (unsigned long long)snap->post.gsize,
+        (unsigned long long)snap->pre.cursor,
+        (unsigned long long)snap->post.cursor,
+        (unsigned long long)snap->post.capacity,
+        (unsigned long long)postRemaining, snap->tlsDepthBefore,
+        snap->verified ? 1 : 0);
+    return snap->verified;
+}
+
+static HRESULT WINAPI XboxDevice_CreateCommittedResource3(
+    XboxDeviceWrapper* self,
+    const D3D12_HEAP_PROPERTIES* pHeapProperties,
+    D3D12_HEAP_FLAGS heapFlags,
+    const D3D12_RESOURCE_DESC1* pDesc,
+    D3D12_BARRIER_LAYOUT initialLayout,
+    const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+    ID3D12ProtectedResourceSession* pProtectedSession,
+    UINT32 numCastableFormats,
+    const DXGI_FORMAT* pCastableFormats,
+    REFIID riid,
+    void** ppvResource) {
+    if (!ppvResource) return E_POINTER;
+    *ppvResource = nullptr;
+    if (!self || !self->real || !pHeapProperties || !pDesc)
+        return E_POINTER;
+    // Boot #57 instrumentation: dump ALL 10 arguments. The heap
+    // props are the 20-byte struct (RDX); the real resource desc is
+    // R9 (D3D12_RESOURCE_DESC1, 64 bytes: the sampler-feedback
+    // mip-region is a 3-UINT struct at offset 52); the initial layout
+    // is the first stack arg; the clear value is a stack struct
+    const UINT* hp = (const UINT*)pHeapProperties;
+    Log("xboxdev",
+        "Slot127 CCR3: heapProps=[%u,%u,%u,%u,%u] heapFlags=0x%x "
+        "layout=%u clear=%p prot=%p numCast=%u cast=%p riid="
+        "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} "
+        "ppv=%p ret=0x%llx thread=%lu",
+        hp ? hp[0] : 0, hp ? hp[1] : 0, hp ? hp[2] : 0,
+        hp ? hp[3] : 0, hp ? hp[4] : 0,
+        (unsigned)heapFlags, (unsigned)initialLayout,
+        (const void*)pOptimizedClearValue,
+        (void*)pProtectedSession, (unsigned)numCastableFormats,
+        (const void*)pCastableFormats,
+        (unsigned)riid.Data1, (unsigned)riid.Data2,
+        (unsigned)riid.Data3, riid.Data4[0], riid.Data4[1],
+        riid.Data4[2], riid.Data4[3], riid.Data4[4], riid.Data4[5],
+        riid.Data4[6], riid.Data4[7], (void*)ppvResource,
+        (unsigned long long)_ReturnAddress(), GetCurrentThreadId());
+    Log("xboxdev",
+        "Slot127 CCR3 desc: dim=%u align=%llu w=%llu h=%u "
+        "depth=%u mips=%u fmt=%u sample=%u/%u layout=%u "
+        "flags=0x%x mipRegion=%ux%ux%u",
+        (unsigned)pDesc->Dimension,
+        (unsigned long long)pDesc->Alignment,
+        (unsigned long long)pDesc->Width, (unsigned)pDesc->Height,
+        (unsigned)pDesc->DepthOrArraySize,
+        (unsigned)pDesc->MipLevels, (unsigned)pDesc->Format,
+        (unsigned)pDesc->SampleDesc.Count,
+        (unsigned)pDesc->SampleDesc.Quality,
+        (unsigned)pDesc->Layout, (unsigned)pDesc->Flags,
+        (unsigned)pDesc->SamplerFeedbackMipRegion.Width,
+        (unsigned)pDesc->SamplerFeedbackMipRegion.Height,
+        (unsigned)pDesc->SamplerFeedbackMipRegion.Depth);
+    if (pOptimizedClearValue) {
+        Log("xboxdev",
+            "Slot127 CCR3 clear: fmt=%u color=[%f,%f,%f,%f] "
+            "depth=%f stencil=%u",
+            (unsigned)pOptimizedClearValue->Format,
+            pOptimizedClearValue->Color[0],
+            pOptimizedClearValue->Color[1],
+            pOptimizedClearValue->Color[2],
+            pOptimizedClearValue->Color[3],
+            pOptimizedClearValue->DepthStencil.Depth,
+            (unsigned)pOptimizedClearValue->DepthStencil.Stencil);
+    }
+    // Convert the game's desc: sanitize Flags to desktop-valid
+    // bits (same 0x7F mask as slot 25 — the game sets Xbox-only
+    // bits 0x300000) and map an out-of-range Xbox layout word
+    // (0x101 tiled / 0x1 row-major, per Leonida) to the desktop
+    // layout. SamplerFeedbackMipRegion passes through as-is.
+    D3D12_RESOURCE_DESC1 useDesc = *pDesc;
+    D3D12_RESOURCE_FLAGS origFlags = useDesc.Flags;
+    useDesc.Flags = (D3D12_RESOURCE_FLAGS)((UINT)useDesc.Flags & 0x7F);
+    if ((UINT)useDesc.Layout >
+        (UINT)D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
+        useDesc.Layout =
+            (useDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
+    if (origFlags != useDesc.Flags ||
+        pDesc->Layout != useDesc.Layout) {
+        Log("xboxdev",
+            "Slot127 CCR3: sanitized flags 0x%x -> 0x%x "
+            "layout %u -> %u",
+            (unsigned)origFlags, (unsigned)useDesc.Flags,
+            (unsigned)pDesc->Layout, (unsigned)useDesc.Layout);
+    }
+    // A clear value with Format UNKNOWN is not a real clear value
+    // (zeroed stack struct) — pass NULL instead of a Format-0
+    // struct, which desktop validation rejects.
+    const D3D12_CLEAR_VALUE* useClear = nullptr;
+    if (pOptimizedClearValue &&
+        pOptimizedClearValue->Format != DXGI_FORMAT_UNKNOWN) {
+        useClear = pOptimizedClearValue;
+    } else if (pOptimizedClearValue) {
+        Log("xboxdev",
+            "Slot127 CCR3: clear value Format UNKNOWN -> NULL");
+    }
+    // CreateCommittedResource3 needs ID3D12Device10 (Agility SDK
+    // 1.7+ runtime). Query it from the real device; if the runtime
+    // does not expose it, fall back to a properly translated
+    // CreateCommittedResource (barrier layout -> initial state) —
+    // NEVER a stub object.
+    ID3D12Device10* dev10 = nullptr;
+    HRESULT hrQI = self->real->QueryInterface(
+        __uuidof(ID3D12Device10), (void**)&dev10);
+    Log("xboxdev", "Slot127 CCR3: Device10 QI hr=0x%08x dev10=%p",
+        (unsigned)hrQI, (void*)dev10);
+    ID3D12Resource* native = nullptr;
+    HRESULT hr = E_FAIL;
+    if (dev10) {
+        hr = dev10->CreateCommittedResource3(
+            pHeapProperties, heapFlags, &useDesc, initialLayout,
+            useClear, pProtectedSession, numCastableFormats,
+            pCastableFormats, riid, (void**)&native);
+        Log("xboxdev",
+            "Slot127 CCR3: CreateCommittedResource3 flags=0x%x "
+            "-> hr=0x%08x native=%p",
+            (unsigned)heapFlags, (unsigned)hr, (void*)native);
+        if (FAILED(hr) &&
+            (heapFlags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)) {
+            // ALLOW_DISPLAY has extra desktop requirements (2D,
+            // alignment 0, single-sample). Retry WITHOUT it and
+            // log both attempts — the retry is evidence, not a
+            // silent strip.
+            D3D12_HEAP_FLAGS noDisplay =
+                (D3D12_HEAP_FLAGS)((UINT)heapFlags &
+                    ~(UINT)D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+            hr = dev10->CreateCommittedResource3(
+                pHeapProperties, noDisplay, &useDesc, initialLayout,
+                useClear, pProtectedSession, numCastableFormats,
+                pCastableFormats, riid, (void**)&native);
+            Log("xboxdev",
+                "Slot127 CCR3: retry flags=0x%x -> hr=0x%08x "
+                "native=%p",
+                (unsigned)noDisplay, (unsigned)hr, (void*)native);
+        }
+        if (hr == E_NOINTERFACE) {
+            hr = dev10->CreateCommittedResource3(
+                pHeapProperties, heapFlags, &useDesc, initialLayout,
+                useClear, pProtectedSession, numCastableFormats,
+                pCastableFormats, __uuidof(ID3D12Resource),
+                (void**)&native);
+            Log("xboxdev",
+                "Slot127 CCR3: IID retry -> hr=0x%08x native=%p",
+                (unsigned)hr, (void*)native);
+        }
+        dev10->Release();
+    } else {
+        // Fallback: desktop CreateCommittedResource. The first 56
+        // bytes of the DESC1 ARE a D3D12_RESOURCE_DESC (the
+        // mip-region struct's first word lands in the DESC's
+        // trailing padding, which the call ignores).
+        D3D12_RESOURCE_DESC desc0;
+        memcpy(&desc0, &useDesc, sizeof(desc0));
+        D3D12_RESOURCE_STATES state =
+            BarrierLayoutToResourceState(initialLayout);
+        Log("xboxdev",
+            "Slot127 CCR3: no Device10, fallback "
+            "CreateCommittedResource layout %u -> state 0x%x",
+            (unsigned)initialLayout, (unsigned)state);
+        hr = self->real->CreateCommittedResource(
+            pHeapProperties, heapFlags, &desc0, state, useClear,
+            riid, (void**)&native);
+        Log("xboxdev",
+            "Slot127 CCR3: fallback CreateCommittedResource "
+            "flags=0x%x -> hr=0x%08x native=%p",
+            (unsigned)heapFlags, (unsigned)hr, (void*)native);
+        if (hr == E_NOINTERFACE) {
+            hr = self->real->CreateCommittedResource(
+                pHeapProperties, heapFlags, &desc0, state, useClear,
+                __uuidof(ID3D12Resource), (void**)&native);
+            Log("xboxdev",
+                "Slot127 CCR3: fallback IID retry -> hr=0x%08x "
+                "native=%p",
+                (unsigned)hr, (void*)native);
+        }
+        if (FAILED(hr) &&
+            (heapFlags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)) {
+            D3D12_HEAP_FLAGS noDisplay =
+                (D3D12_HEAP_FLAGS)((UINT)heapFlags &
+                    ~(UINT)D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+            hr = self->real->CreateCommittedResource(
+                pHeapProperties, noDisplay, &desc0, state, useClear,
+                riid, (void**)&native);
+            Log("xboxdev",
+                "Slot127 CCR3: fallback retry flags=0x%x -> "
+                "hr=0x%08x native=%p",
+                (unsigned)noDisplay, (unsigned)hr, (void*)native);
+        }
+    }
+    if (SUCCEEDED(hr) && native) {
+        // Boot #58 (Model A): the desktop resource exists; now
+        // consult the game's pool dispatcher so its own handler
+        // chain runs and the arena is consumed. Three outcomes:
+        // (a) dispatch skipped (arena not registered / does not fit
+        // / bad pointer / nested) — return the resource normally
+        // (boot #57 behaviour); the snapshot log says which gate
+        // tripped. (b) dispatch ran and verified — publish the
+        // resource. (c) dispatch ran but the state did not advance
+        // — FAIL the creation cleanly (release the native resource,
+        // clear the out pointer, E_FAIL): a "successful" resource
+        // the game would then fail the drain check on is worse than
+        // an explicit failure, and an automatic retry could
+        // double-consume arena space.
+        PoolDispatchSnap snap;
+        bool ok = DispatchPoolForResource(&snap);
+        if (snap.dispatched && !ok) {
+            Log("xboxdev",
+                "Slot127 CCR3: pool dispatch FAILED verification "
+                "(see slot127 snapshot) — failing creation cleanly");
+            native->Release();
+            native = nullptr;
+            *ppvResource = nullptr;
+            hr = E_FAIL;
+        } else {
+            *ppvResource = native;
+        }
+    } else {
+        // Absolute: never S_OK without a valid object. Propagate
+        // the failure so the game (and the log) sees it.
+        if (native) {
+            native->Release();
+            native = nullptr;
+        }
+        *ppvResource = nullptr;
+        Log("xboxdev",
+            "Slot127 CCR3: FAILED hr=0x%08x (no resource "
+            "returned)",
+            (unsigned)hr);
+    }
+    Log("xboxdev",
+        "Slot127 CCR3 -> hr=0x%08x out=%p",
+        (unsigned)hr, *ppvResource);
+    return hr;
 }
 
 // Slot 8 / 48: CreateCommandQueue. The Xbox desc starts with the PC
@@ -702,8 +1595,31 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, pClear,
             __uuidof(ID3D12Resource), ppvResource);
     }
-    Log("xboxdev", "CreatePlacedResourceX va=0x%llx -> hr=0x%08x res=%p",
-        (unsigned long long)va, (unsigned)hr,
+    // Boot #56 instrumentation: dump the full desc (the boot #55 log
+    // showed only va/hr/res — the desc fields are needed to correlate
+    // this placed resource with the two GetResourceAllocationInfo
+    // queries), plus the caller return address and thread.
+    Log("xboxdev",
+        "CreatePlacedResourceX va=0x%llx desc: dim=%u align=%llu "
+        "w=%llu h=%u depth=%u mips=%u fmt=%u sample=%u/%u "
+        "layout=%u flags=0x%x state=0x%x ret=0x%llx thread=%lu -> "
+        "hr=0x%08x res=%p",
+        (unsigned long long)va,
+        (unsigned)pDesc->Dimension,
+        (unsigned long long)pDesc->Alignment,
+        (unsigned long long)pDesc->Width,
+        (unsigned)pDesc->Height,
+        (unsigned)pDesc->DepthOrArraySize,
+        (unsigned)pDesc->MipLevels,
+        (unsigned)pDesc->Format,
+        (unsigned)pDesc->SampleDesc.Count,
+        (unsigned)pDesc->SampleDesc.Quality,
+        (unsigned)pDesc->Layout,
+        (unsigned)pDesc->Flags,
+        (unsigned)initialState,
+        (unsigned long long)_ReturnAddress(),
+        GetCurrentThreadId(),
+        (unsigned)hr,
         ppvResource ? *ppvResource : nullptr);
     return hr;
 }
@@ -744,6 +1660,15 @@ static HRESULT WINAPI XboxDevice_CreateDescriptorHeap(
             (unsigned)pDesc->Type, (unsigned)pDesc->NumDescriptors,
             (unsigned)pDesc->Flags, (unsigned)hr, (void*)realHeap,
             rawVt ? rawVt[9] : nullptr, rawVt ? rawVt[10] : nullptr);
+        // Measurement (ChatGPT plan, boot #54): capture the full
+        // heap-creation record at the Xbox-facing boundary. The
+        // wrapper returns the REAL heap's handles, so guest == native
+        // by construction — both are logged to make that explicit.
+        // The GPU handle is 0 for non-shader-visible heaps.
+        D3D12_CPU_DESCRIPTOR_HANDLE nativeCpu =
+            realHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE nativeGpu =
+            realHeap->GetGPUDescriptorHandleForHeapStart();
         XboxDescriptorHeapWrapper* w = WrapXboxDescriptorHeap(realHeap);
         realHeap->Release();
         if (!w) {
@@ -753,6 +1678,24 @@ static HRESULT WINAPI XboxDevice_CreateDescriptorHeap(
         *ppHeap = w;
         Log("xboxdev", "CreateDescriptorHeap -> wrapped heap=%p",
             (void*)w);
+        Log("xboxdev",
+            "meas: heap type=%u num=%u flags=0x%x rawHeap=%p "
+            "wrapped=%p nativeCpu=0x%llx nativeGpu=0x%llx "
+            "guestCpu=0x%llx guestGpu=0x%llx thread=%lu ret=0x%llx "
+            "reserveExists=%d reserveBase=%p reserveSize=%llu "
+            "allocsSinceReserve=%llu replacesInRange=%llu",
+            (unsigned)pDesc->Type, (unsigned)pDesc->NumDescriptors,
+            (unsigned)pDesc->Flags, (void*)realHeap, (void*)w,
+            (unsigned long long)nativeCpu.ptr,
+            (unsigned long long)nativeGpu.ptr,
+            (unsigned long long)nativeCpu.ptr,
+            (unsigned long long)nativeGpu.ptr,
+            GetCurrentThreadId(),
+            (unsigned long long)_ReturnAddress(),
+            g_measReserveBase ? 1 : 0, g_measReserveBase,
+            (unsigned long long)g_measReserveSize,
+            g_measReserveBase ? (g_measAllocSeq - g_measReserveSeq) : 0,
+            g_measReplaceInRange);
         return hr;
     }
     Log("xboxdev",
@@ -854,6 +1797,10 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[9] = (void*)XboxDevice_CreateCommandAllocator;
     g_xboxDeviceVtable[14] = (void*)XboxDevice_CreateDescriptorHeap;
     g_xboxDeviceVtable[15] = (void*)XboxDevice_GetDescriptorHandleIncrementSize;
+    g_xboxDeviceVtable[17] = (void*)XboxDevice_CreateConstantBufferView;
+    g_xboxDeviceVtable[18] = (void*)XboxDevice_CreateShaderResourceView;
+    g_xboxDeviceVtable[19] = (void*)XboxDevice_CreateUnorderedAccessView;
+    g_xboxDeviceVtable[25] = (void*)XboxDevice_GetResourceAllocationInfo;
     g_xboxDeviceVtable[26] = (void*)XboxDevice_GetCustomHeapProperties;
     g_xboxDeviceVtable[36] = (void*)XboxDevice_CreateFence;
     g_xboxDeviceVtable[48] = (void*)XboxDevice_CreateCommandQueue;
@@ -861,6 +1808,8 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[78] = (void*)XboxDevice_SetFrameIntervalX;
     g_xboxDeviceVtable[79] = (void*)XboxDevice_ScheduleFrameEventX;
     g_xboxDeviceVtable[80] = (void*)XboxDevice_WaitFrameEventX;
+    g_xboxDeviceVtable[127] =
+        (void*)XboxDevice_CreateCommittedResource3;
     g_xboxDeviceVtable[133] = (void*)XboxDevice_CreatePlacedResourceX;
     g_xboxDeviceVtableInit = true;
 }
