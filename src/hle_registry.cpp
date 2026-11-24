@@ -3884,11 +3884,16 @@ extern "C" void DsqClose(void* self) {
 
 extern "C" HRESULT DsqUnsupported(void* self, uint64_t a1, uint64_t a2,
                                   uint64_t a3, uint64_t a4) {
+    // The slot is not passed to the stub, so record the guest's return
+    // address: disassembling the call site names the vtable slot. Boot #77
+    // showed two of these immediately before a VCRUNTIME140 fault, and
+    // without the call site they cannot be identified.
     Log("dstorage",
-        "queue %p unsupported method (this=%p %llx %llx %llx %llx) -> "
-        "E_NOTIMPL",
-        self, self, (unsigned long long)a1, (unsigned long long)a2,
-        (unsigned long long)a3, (unsigned long long)a4);
+        "queue %p unsupported method from %p (this=%p %llx %llx %llx %llx) "
+        "-> E_NOTIMPL",
+        self, _ReturnAddress(), self, (unsigned long long)a1,
+        (unsigned long long)a2, (unsigned long long)a3,
+        (unsigned long long)a4);
     return E_NOTIMPL;
 }
 
