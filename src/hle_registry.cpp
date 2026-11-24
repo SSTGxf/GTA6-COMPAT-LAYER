@@ -365,7 +365,18 @@ extern "C" BOOL HleXMemMapPhysicalPagesScatter(const uint64_t* pPages,
     // The mapping target is the guest's own address list. Reserve the
     // span only if it is still free; a span the layer arena already
     // reserved is committed page by page and left to its owner.
-    SIZE_T span = (SIZE_T)(last - first) + 0x1000;
+    //
+    // Each descriptor is one guest physical page, and the measured stride
+    // between descriptors is 0x10000 (64 KiB: d[0]=0x1abf94e0000,
+    // d[1]=0x1abf94f0000 in boot #83). Committing only 4 KiB per page left
+    // the rest of every page uncommitted, so the first guest write past
+    // +0x1000 inside a page faulted (write at 0x1abf94e0f20, AV at
+    // 0x1abf94e1000, inside VCRUNTIME140's memcpy). Use the measured stride.
+    SIZE_T pageSize = 0x10000;
+    if (dwPageCount > 1 && second > first) {
+        pageSize = (SIZE_T)(second - first);
+    }
+    SIZE_T span = (SIZE_T)(last - first) + pageSize;
     void* base = (void*)(uintptr_t)first;
     MEMORY_BASIC_INFORMATION mbi = {};
     VirtualQuery(base, &mbi, sizeof(mbi));
@@ -390,7 +401,7 @@ extern "C" BOOL HleXMemMapPhysicalPagesScatter(const uint64_t* pPages,
     uint32_t mapped = 0, failed = 0;
     for (uint32_t i = 0; i < dwPageCount; ++i) {
         void* va = (void*)(uintptr_t)pPages[i];
-        void* p = VirtualAlloc(va, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+        void* p = VirtualAlloc(va, pageSize, MEM_COMMIT, PAGE_READWRITE);
         if (p) {
             ++mapped;
             if (out) out[i] = (uint64_t)(uintptr_t)p;
