@@ -1028,6 +1028,40 @@ XboxDevice_GetResourceAllocationInfo(
     return retBuf;
 }
 
+// Slot 108 (+0x360): GetResourceAllocationInfo1-shaped entry.
+// Guest evidence (boot #86, the only caller is 0x140ABFE0D inside the
+// allocator at 0x140ABFAE0): the call is made with
+//   rcx = 16-byte out struct, rdx = device, r8 = 1, r9 = 1,
+//   [rsp+0x20] = const D3D12_RESOURCE_DESC*, [rsp+0x28] = extra out buffer.
+// Right before it, the caller stores 0x1000 into desc+8 (the descriptor's
+// Alignment field), then copies our 16 bytes out, requires Alignment ==
+// 0x1000 for its small-resource path, and int3s at 0x140ABFE1B when the
+// high dword of SizeInBytes is non-zero. That is the slot-25 contract
+// plus the extra info1 out pointer of the GetResourceAllocationInfo1
+// family, so the same layout engine answers it. The extra out buffer is
+// not read by this caller and its layout has no guest-side evidence, so
+// it is left untouched rather than filled by assumption.
+static D3D12_RESOURCE_ALLOCATION_INFO* WINAPI
+XboxDevice_GetResourceAllocationInfo1(
+    D3D12_RESOURCE_ALLOCATION_INFO* retBuf, XboxDeviceWrapper* self,
+    UINT visibleMask, UINT numResourceDescs,
+    const D3D12_RESOURCE_DESC* pResourceDescs, void* info1) {
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    D3D12_RESOURCE_ALLOCATION_INFO* r = XboxDevice_GetResourceAllocationInfo(
+        retBuf, self, visibleMask, numResourceDescs, pResourceDescs);
+    if (n <= 4) {
+        Log("xboxdev",
+            "slot108 alloc-info1: desc=%p visibleMask=%u numDescs=%u info1=%p "
+            "-> size=%llu align=%llu (call #%ld, info1 untouched: no guest "
+            "reader)",
+            (const void*)pResourceDescs, visibleMask, numResourceDescs, info1,
+            (unsigned long long)(r ? r->SizeInBytes : 0ull),
+            (unsigned long long)(r ? r->Alignment : 0ull), (long)n);
+    }
+    return r;
+}
+
 // Slot 127: CreateCommittedResource3 (ID3D12Device10). VERIFIED
 // against the call site (0x14193e1b4, disassembled 2026-11-24, boot
 // #57): rcx=this, rdx=&D3D12_HEAP_PROPERTIES{1,0,0,1,1} (20 bytes,
@@ -2506,6 +2540,7 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[18] = (void*)XboxDevice_CreateShaderResourceView;
     g_xboxDeviceVtable[19] = (void*)XboxDevice_CreateUnorderedAccessView;
     g_xboxDeviceVtable[25] = (void*)XboxDevice_GetResourceAllocationInfo;
+    g_xboxDeviceVtable[108] = (void*)XboxDevice_GetResourceAllocationInfo1;
     g_xboxDeviceVtable[26] = (void*)XboxDevice_GetCustomHeapProperties;
     g_xboxDeviceVtable[36] = (void*)XboxDevice_CreateFence;
     g_xboxDeviceVtable[48] = (void*)XboxDevice_CreateCommandQueue;
