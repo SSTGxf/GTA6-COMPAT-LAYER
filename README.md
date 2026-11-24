@@ -196,9 +196,9 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-24 (boots through #84, GitHub head `1a77247`)
+## Status — 2026-11-24 (boots through #86, GitHub head `b63fa9d`)
 
-**Progress: ~40% proven toward first menu, 45% when D1 closes (slots 4/6 done, overrun cause proven — hash gate remains; boot #84: layout 0x105 unmodeled → UINT64_MAX → int3).**
+**Progress: ~40% proven toward first menu, 45% when D1 closes (slots 4/6 done, overrun cause proven — hash gate remains; boot #86 cleared layout 261, new furthest point: assert at 0x140ABFE1B after slot 108).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -220,6 +220,7 @@ subsystem, not a dead harness.
 | Guest memcpy overrun cause proven | ✅ | Boot #82, copy 0x409, 0xE0 from uncommitted page |
 | Log rotation + caps | ✅ | Boots #80–#81, per-boot logs |
 | Slot 4 = EnqueueStatus (completion-object binding) | ✅ | Boot #83, bound fiDeviceDirectStorage as completion object (index=0) ×5 |
+| Layout 261 (0x105) as 4 KiB-tile layout | ✅ | Boot #86, path=tiled status=SUCCESS size=4096 align=4096 |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
 | Shader capture / translation | ❌ | Not started |
@@ -227,7 +228,7 @@ subsystem, not a dead harness.
 | BCPack decode | ❌ | B1 spec written, not implemented |
 | Mesh-as-compute | ❌ | CPU-only prototype |
 
-Full per-function status: `docs/STATUS.md` (current state at the top, boots through #84).
+Full per-function status: `docs/STATUS.md` (current state at the top, boots through #86).
 
 **What works now (verified on the build machine, all eight harness guests
 ALL PASS):**
