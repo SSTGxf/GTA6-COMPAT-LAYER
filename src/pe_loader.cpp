@@ -1672,6 +1672,7 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
 static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* where) {
     if (!ep || !ep->ExceptionRecord) {
         Log("loader", "guest crashed (%s): no exception record", where);
+        ScLogFlush();  // buffered logger (build 88): never lose the fault
         return;
     }
     EXCEPTION_RECORD* r = ep->ExceptionRecord;
@@ -1732,6 +1733,9 @@ static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* where) {
             GetLastError());
         return;
     }
+    // Flush the buffered logger before the dump is written: the crash
+    // lines above must survive even if the dump or the process dies.
+    ScLogFlush();
     MINIDUMP_EXCEPTION_INFORMATION mei = {};
     mei.ThreadId = GetCurrentThreadId();
     mei.ExceptionPointers = ep;

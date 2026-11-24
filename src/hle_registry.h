@@ -59,6 +59,10 @@ extern "C" void HleXMemFreeDefault(void* p);
 extern "C" void* HleXMemVirtualAlloc(void* lpAddress, SIZE_T dwSize,
                                      DWORD flAllocationType, DWORD flProtect,
                                      DWORD dwMemoryAttributes);
+// Buffered logger flush (build 88): called from the crash path so the
+// lines written before a fault are on disk before the minidump.
+void ScLogFlush();
+
 extern "C" HRESULT HleXMemGetWorkingSetStatistics(void* pStats);
 extern "C" BOOL HleXMemIsToolsMemAvailable(void);
 extern "C" HRESULT HleXMemAllocatePhysicalPages(void);

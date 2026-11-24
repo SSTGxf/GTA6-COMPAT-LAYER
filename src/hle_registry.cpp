@@ -23,18 +23,58 @@ namespace {
 
 // ---- logging ----
 
+// Build 88: logging must not charge the guest for disk I/O. The old
+// writer did an unbuffered fputs(stderr) plus fopen/fputs/fclose of
+// scarlett.log on *every* line, which costs 10-15 ms under disk load.
+// ScheduleFrameEventX stamps the frame QPC before logging, so that cost
+// landed inside the guest's frame period and made a 50 ms sleep measure
+// 64.5 ms (ft_hook: 15 steps instead of 12). stderr and the file are now
+// buffered and flushed on a 200 ms cadence, and ScLogFlush() is called
+// from the crash path before the minidump so nothing is lost on a fault.
+static FILE* g_logFile = nullptr;
+static bool g_logInit = false;
+static ULONGLONG g_lastLogFlush = 0;
+
+static void EnsureLogInit() {
+    if (g_logInit) return;
+    g_logInit = true;
+    static char errBuf[1 << 20];
+    setvbuf(stderr, errBuf, _IOFBF, sizeof(errBuf));
+    if (fopen_s(&g_logFile, "scarlett.log", "a") == 0 && g_logFile) {
+        static char fileBuf[1 << 20];
+        setvbuf(g_logFile, fileBuf, _IOFBF, sizeof(fileBuf));
+    } else {
+        g_logFile = nullptr;
+    }
+    g_lastLogFlush = GetTickCount64();
+}
+
 void WriteLogLine(const char* line) {
+    EnsureLogInit();
     fputs(line, stderr);
     fputc('\n', stderr);
-    FILE* f = nullptr;
-    if (fopen_s(&f, "scarlett.log", "a") == 0 && f) {
-        fputs(line, f);
-        fputc('\n', f);
-        fclose(f);
+    if (g_logFile) {
+        fputs(line, g_logFile);
+        fputc('\n', g_logFile);
+    }
+    ULONGLONG now = GetTickCount64();
+    if (now - g_lastLogFlush >= 200) {
+        fflush(stderr);
+        if (g_logFile) fflush(g_logFile);
+        g_lastLogFlush = now;
     }
 }
 
 }  // namespace
+
+// Flush every buffered log line. Called from the crash path (before the
+// minidump is written) and at process exit, so buffering never loses the
+// lines that matter.
+void ScLogFlush() {
+    fflush(stderr);
+    if (g_logFile) fflush(g_logFile);
+    g_lastLogFlush = GetTickCount64();
+}
 
 void Log(const char* subsystem, const char* fmt, ...) {
     char body[1024];
@@ -3800,9 +3840,73 @@ extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags) {
     // routinely; the resolution is process-wide.
     static bool timerResRaised = false;
     if (!timerResRaised) {
-        UINT rc = timeBeginPeriod(1);
-        Log("present", "timeBeginPeriod(1) -> %u (0 = raised to 1 ms)",
-            (unsigned)rc);
+        // Build 88: a background/eco-throttled process has its timer
+        // resolution requests ignored by Windows (timeBeginPeriod(1)
+        // returns 0 but Sleep still rounds to 15.625 ms), which made
+        // every guest frame 62.5 ms instead of 50 ms. Opt this process
+        // out of execution-speed power throttling before raising the
+        // resolution.
+#ifdef PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        PROCESS_POWER_THROTTLING_STATE pts = {};
+        pts.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        // EXECUTION_SPEED and IGNORE_TIMER_RESOLUTION both off: Windows
+        // applies the latter to background processes, which is why
+        // NtSetTimerResolution reported "granted 15.625 ms" here while a
+        // normal process gets 0.5 ms.
+        pts.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | 0x4;
+        pts.StateMask = 0;  // 0 = throttling off
+        BOOL pt = SetProcessInformation(GetCurrentProcess(),
+                                        ProcessPowerThrottling, &pts,
+                                        sizeof(pts));
+        Log("present", "power throttling off -> ok=%d err=%lu", (int)pt,
+            (unsigned long)(pt ? 0 : GetLastError()));
+#endif
+        // Call through winmm's export table rather than the linked
+        // import: the loader rewrites imports in this process, and a
+        // rewritten timeBeginPeriod would return success without ever
+        // reaching the OS.
+        typedef UINT(WINAPI * PfnTimeBeginPeriod)(UINT);
+        HMODULE winmm = LoadLibraryA("winmm.dll");
+        PfnTimeBeginPeriod beginPeriod =
+            winmm ? (PfnTimeBeginPeriod)(void*)GetProcAddress(
+                        winmm, "timeBeginPeriod")
+                  : nullptr;
+        UINT rc = beginPeriod ? beginPeriod(1) : 0xFFFFFFFFu;
+        Log("present",
+            "timeBeginPeriod(1) via %s -> %u (0 = raised to 1 ms)",
+            beginPeriod ? "GetProcAddress" : "unavailable", (unsigned)rc);
+        // Build 88 probe: read back the timer resolution the process
+        // actually has (100 ns units; 156250 = 15.625 ms tick).
+        typedef LONG(NTAPI * PfnQueryTimerRes)(ULONG*, ULONG*, ULONG*);
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        PfnQueryTimerRes q = ntdll ? (PfnQueryTimerRes)(void*)GetProcAddress(
+                                         ntdll, "NtQueryTimerResolution")
+                                   : nullptr;
+        // The Win32 wrapper can be a no-op in this process; the native
+        // call is the mechanism underneath. 5000 = 0.5 ms in 100 ns
+        // units (the finest the platform offers).
+        typedef LONG(NTAPI * PfnSetTimerRes)(ULONG, BOOLEAN, PULONG);
+        HMODULE nt2 = GetModuleHandleA("ntdll.dll");
+        PfnSetTimerRes setRes =
+            nt2 ? (PfnSetTimerRes)(void*)GetProcAddress(
+                      nt2, "NtSetTimerResolution")
+                : nullptr;
+        if (setRes) {
+            ULONG want = 5000, got = 0;
+            LONG s2 = setRes(want, TRUE, &got);
+            Log("present",
+                "NtSetTimerResolution(5000) -> 0x%lx, granted %lu (%.3f ms)",
+                (long)s2, (unsigned long)got, (double)got / 10000.0);
+        }
+        if (q) {
+            ULONG mn = 0, mx = 0, cur = 0;
+            LONG st = q(&mn, &mx, &cur);
+            Log("present",
+                "timer resolution now: status 0x%lx coarse %.3f ms fine "
+                "%.3f ms current %.3f ms",
+                (long)st, (double)mn / 10000.0, (double)mx / 10000.0,
+                (double)cur / 10000.0);
+        }
         if (rc == TIMERR_NOERROR) timerResRaised = true;
     }
     Log("present",
@@ -3815,8 +3919,26 @@ extern "C" HRESULT HleScheduleFrameEventX(UINT64 frameId) {
     g_lastFrameId = frameId;
     QueryPerformanceCounter(&g_lastFrameQpc);
     g_haveFrame = true;
+    // Build 88 probe: the frame QPC is stamped here, so any time this
+    // function spends after the stamp is charged to the guest's frame.
+    // Track the worst schedule cost and report it every 32 frames.
+    LARGE_INTEGER freq, after;
+    QueryPerformanceFrequency(&freq);
     Log("present", "ScheduleFrameEventX(%llu) -> S_OK", 
         (unsigned long long)frameId);
+    QueryPerformanceCounter(&after);
+    {
+        static double maxMs = 0.0;
+        static unsigned calls = 0;
+        double ms = (double)(after.QuadPart - g_lastFrameQpc.QuadPart) *
+                    1000.0 / (double)freq.QuadPart;
+        if (ms > maxMs) maxMs = ms;
+        if (++calls % 32 == 0) {
+            Log("present",
+                "ScheduleFrameEventX post-stamp cost: last %.2f ms, "
+                "max %.2f ms over %u frames", ms, maxMs, calls);
+        }
+    }
     return S_OK;
 }
 
