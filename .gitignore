@@ -11,11 +11,10 @@ out/
 *.tlog
 *.lastbuildstate
 .vs/
-# Local campaign scratch (boot drivers / per-boot notes), never build inputs
+# Local campaign boot drivers (scratch, never build inputs)
 build_ga*.bat
 run_boot_ga*.bat
 build_dump_read2.bat
-docs/BOOT6*.md
 # OS / editor
 Thumbs.db
 Desktop.ini

@@ -40,7 +40,13 @@ static void EnsureLogInit() {
     g_logInit = true;
     static char errBuf[1 << 20];
     setvbuf(stderr, errBuf, _IOFBF, sizeof(errBuf));
-    if (fopen_s(&g_logFile, "scarlett.log", "a") == 0 && g_logFile) {
+    wchar_t logPath[MAX_PATH] = {};
+    DWORD logPathLen = GetEnvironmentVariableW(
+        L"SCARLETT_LOG_PATH", logPath, MAX_PATH);
+    int openResult = (logPathLen > 0 && logPathLen < MAX_PATH)
+                         ? _wfopen_s(&g_logFile, logPath, L"a")
+                         : fopen_s(&g_logFile, "scarlett.log", "a");
+    if (openResult == 0 && g_logFile) {
         static char fileBuf[1 << 20];
         setvbuf(g_logFile, fileBuf, _IOFBF, sizeof(fileBuf));
     } else {

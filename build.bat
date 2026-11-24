@@ -13,7 +13,13 @@ REM calls GDI; it is the session-0 window station + graphics stack, not a
 REM layer bug. Proven: the same binaries pass ALL PASS in session 1 and in
 REM a foreground SSH run, and crash 100% in session 0. (Phase 4, 2026-11-23.)
 setlocal
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" (
+  call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" (
+  call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+) else (
+  echo vcvarsall not found in BuildTools or Community & exit /b 1
+)
 if errorlevel 1 (echo vcvarsall failed & exit /b 1)
 
 set ROOT=%~dp0
