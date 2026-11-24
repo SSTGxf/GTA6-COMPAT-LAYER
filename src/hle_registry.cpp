@@ -3932,10 +3932,19 @@ static const char* ScDsArgNote(const void* p) {
 // One stub per slot, each passing its own index. Boot #78's arguments could
 // not be named because the shared stub never learned which vtable entry the
 // guest had called; the slot is what decides the method.
-extern "C" HRESULT DsqUnsupportedSlot(int slot, void* self, uint64_t a1,
-                                      uint64_t a2, uint64_t a3, uint64_t a4) {
-    char caller[128] = {};
-    ScModuleOffset(_ReturnAddress(), caller, sizeof(caller));
+// `caller` is the thunk's own return address (the guest's call site),
+// captured in the thunk: taking _ReturnAddress() here would report the
+// thunk's call to this function instead (boot #79/#80 showed exactly that).
+extern "C" HRESULT DsqUnsupportedSlot(void* callerAddr, int slot, void* self,
+                                      uint64_t a1, uint64_t a2, uint64_t a3,
+                                      uint64_t a4) {
+    // The guest image is loaded by ScLoadXboxPe, not by the Windows loader, so
+    // GetModuleHandleExW cannot name it; keep the raw address as well.
+    char caller[192] = {};
+    char modName[160] = {};
+    ScModuleOffset(callerAddr, modName, sizeof(modName));
+    _snprintf_s(caller, sizeof(caller), _TRUNCATE, "%p[%s]", callerAddr,
+                modName);
     Log("dstorage",
         "queue %p SLOT %d from %s args=%llx%s %llx%s %llx%s %llx%s -> "
         "E_NOTIMPL",
@@ -3950,7 +3959,7 @@ extern "C" HRESULT DsqUnsupportedSlot(int slot, void* self, uint64_t a1,
 template <size_t N>
 static HRESULT DsqSlotThunk(void* self, uint64_t a1, uint64_t a2,
                             uint64_t a3, uint64_t a4) {
-    return DsqUnsupportedSlot((int)N, self, a1, a2, a3, a4);
+    return DsqUnsupportedSlot(_ReturnAddress(), (int)N, self, a1, a2, a3, a4);
 }
 
 template <size_t... I>
