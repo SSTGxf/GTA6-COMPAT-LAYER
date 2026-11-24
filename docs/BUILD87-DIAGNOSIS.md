@@ -293,21 +293,42 @@ older per-boot notes (`docs/BOOT6*.md`); they are not build inputs, so they
 are excluded by pattern in `.gitignore` and left on disk untouched rather
 than committed or deleted.
 
-Green gate from HEAD `439b257`, both trees, pre-build identity check
-`identical=yes` over `src include defs tests build.bat`:
+Green gate **at the final HEAD `82f9980`** (not an ancestor), both trees,
+pre-build identity check PASS over all 64 tracked `src include defs tests
+build.bat` files:
 
 ```
-local  build.bat -> 0   era 21/21   ft 7/7   verify 0
-F:     build.bat -> 0   era 21/21   ft 7/7   verify 0
-ft on F: x2 -> PASS 0.251 s / 12 steps, PASS 0.251 s / 12 steps
+HEAD=82f9980                pre_build_identity=PASS files=64     (local)
+F_HEAD_SOURCES=82f9980      F_pre_build_identity=PASS            (F:)
+local  build.bat -> exit 0   era stages: 21/21 pass   ft stages: 7/7 pass   verify exit code: 0
+F:     build.bat -> exit 0   era stages: 21/21 pass   ft stages: 7/7 pass   verify exit code: 0
+ft on F: x2 -> PASS 0.251 s / 12 steps (7/7), PASS 0.251 s / 12 steps (7/7)
 ```
+
+After the gate, at that HEAD:
+
+```
+$ git status --porcelain      -> (empty, 0 lines)
+inputs=48 mismatches=[] ignored=[] untracked=[]
+$ git ls-files .gitignore     -> .gitignore
+```
+
+That is the positive check the earlier note lacked: every one of the 48
+inputs was tested with `git check-ignore -v` (none matched, so no ignore
+rule hides a build input) and `git ls-files --error-unmatch` (all tracked),
+in addition to `git hash-object` == `git rev-parse HEAD:<path>`. The
+ignored paths in the tree are exactly the prior-campaign boot drivers
+(`build_ga31..ga60.bat`, `run_boot_ga65.bat`, `build_dump_read2.bat`),
+three old per-boot notes (`docs/BOOT60-XG-BUILD80.md`,
+`docs/BOOT61-DIAGNOSIS.md`, `docs/BOOT62-DIAGNOSIS.md`), plus build
+outputs and tool directories already covered by the pre-existing rules.
 
 Commits (local only, not pushed): `8c3103e` scoped `IDStorageFactory`
 slot-10 refusal + note + boot script; `934017b` `src/xg_texture.cpp`;
 `cef5c2a` note update; `38c8c7b` `include/xg_texture.h` + note;
 `a0029f4` `build.bat` (compile the tracked source); `439b257` `.gitignore`
-(local scratch only). No dump, log, binary or extra boot script is in any
-of them.
+(local scratch only); `82f9980` the blob-equality note. No dump, log,
+binary or extra boot script is in any of them.
 
 Still true and not claimed otherwise: the guest stops at its own `int3` at
 `0x1428c95ce` rather than faulting on the null it was told was valid, and
