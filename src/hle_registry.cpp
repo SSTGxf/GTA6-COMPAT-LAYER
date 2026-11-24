@@ -3651,17 +3651,229 @@ extern "C" HRESULT StubComGeneric() { return S_OK; }
 // interface/slot now refuses explicitly. The override is per-interface:
 // the factory gets its own vtable and every other stub-backed interface
 // (IGameInput, XAudio2, ...) keeps StubComGeneric's S_OK behaviour.
-static void* g_stubComVtableStorageFactory[64];
+
+// ---- Real DStorage queue (D1) ------------------------------------------
+//
+// Measured contract (guest image, no guessing):
+//   0x1428c95c7  call [rax+0x50]        factory slot 10 = CreateQueue(desc, riid, out)
+//   0x1428c9a0b  call [rax+0x18]        queue slot 3   = EnqueueRequest(const DSTORAGE_REQUEST*)
+//   0x1428c9637  call [rax+0x40]        queue slot 8   = Submit()  (no arguments)
+// The request is 0x38 bytes and is zeroed by the caller before use, so the
+// field layout can be read from the guest's stores:
+//   +0x00 options (0x400000 = source type memory, bit 0 = zlib)
+//   +0x08 destination pointer
+//   +0x18 destination size (dword decoded by the tiling helper 0x14550db40)
+//   +0x20 source pointer
+//   +0x28 source size
+// Any copy is gated on the OS confirming both ranges are committed and
+// accessible, so a misread field can never write into the 6.5 GB mapping.
+struct ScDsRequest {
+    uint64_t w[7];  // 0x38 bytes, captured verbatim
+};
+
+struct ScDsQueue {
+    void** vtable;
+    volatile LONG ref;
+    int count;
+    int submitted;
+    int copied;
+    int refused;
+    int fileSource;
+    ScDsRequest req[256];
+};
+
+static void* g_dsQueueVtable[64];
+static int g_dsDetailLogs = 0;   // detailed per-request lines, capped
+static int g_dsQueues = 0;
+
+static bool ScRangeCommitted(const void* p, size_t n) {
+    if (!p || n == 0) return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    const uint8_t* start = (const uint8_t*)p;
+    const uint8_t* regionEnd = (const uint8_t*)mbi.BaseAddress + mbi.RegionSize;
+    return start + n <= regionEnd;
+}
+
+extern "C" HRESULT DsqQueryInterface(void* self, void* iid, void** out) {
+    if (!out) return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+extern "C" ULONG DsqAddRef(void* self) {
+    return (ULONG)InterlockedIncrement(&((ScDsQueue*)self)->ref);
+}
+extern "C" ULONG DsqRelease(void* self) {
+    ScDsQueue* q = (ScDsQueue*)self;
+    LONG n = InterlockedDecrement(&q->ref);
+    if (n == 0) {
+        Log("dstorage", "queue %p destroyed (queues=%d)", self, --g_dsQueues);
+        HeapFree(GetProcessHeap(), 0, q);
+    }
+    return (ULONG)n;
+}
+
+extern "C" void DsqEnqueueRequest(void* self, const void* req) {
+    ScDsQueue* q = (ScDsQueue*)self;
+    if (!req) {
+        Log("dstorage", "queue %p EnqueueRequest(NULL) ignored", self);
+        return;
+    }
+    if (q->count >= 256) {
+        q->refused++;
+        Log("dstorage", "queue %p EnqueueRequest refused: queue full (%d)",
+            self, q->count);
+        return;
+    }
+    int i = q->count++;
+    memcpy(q->req[i].w, req, sizeof(q->req[i].w));
+    const uint64_t* w = q->req[i].w;
+    const void* dest = (const void*)w[1];
+    const uint32_t destSize = (uint32_t)w[3];
+    const void* src = (const void*)w[4];
+    const uint32_t srcSize = (uint32_t)w[5];
+    if (g_dsDetailLogs < 32) {
+        ++g_dsDetailLogs;
+        Log("dstorage",
+            "EnqueueRequest[%d] q=%p options=0x%016llx dest=%p destSize=%u "
+            "src=%p srcSize=%u raw=%016llx %016llx %016llx %016llx %016llx "
+            "%016llx %016llx",
+            i, self, (unsigned long long)w[0], dest, destSize, src, srcSize,
+            (unsigned long long)w[0], (unsigned long long)w[1],
+            (unsigned long long)w[2], (unsigned long long)w[3],
+            (unsigned long long)w[4], (unsigned long long)w[5],
+            (unsigned long long)w[6]);
+        Log("dstorage",
+            "EnqueueRequest[%d] validate dest_committed=%d src_committed=%d",
+            i, (int)ScRangeCommitted(dest, destSize),
+            (int)ScRangeCommitted(src, srcSize));
+    }
+}
+
+extern "C" void DsqSubmit(void* self) {
+    ScDsQueue* q = (ScDsQueue*)self;
+    int copied = 0, refused = 0, fileSource = 0;
+    for (int i = 0; i < q->count; ++i) {
+        const uint64_t* w = q->req[i].w;
+        const uint64_t options = w[0];
+        const void* dest = (const void*)w[1];
+        const uint32_t destSize = (uint32_t)w[3];
+        const void* src = (const void*)w[4];
+        const uint32_t srcSize = (uint32_t)w[5];
+        // bit 22 = DSTORAGE_REQUEST_SOURCE_TYPE memory
+        const bool memorySource = (options & 0x400000ull) != 0;
+        if (!memorySource) {
+            ++fileSource;
+            Log("dstorage",
+                "Submit[%d] refused: file-sourced request (options=0x%016llx "
+                "dest=%p destSize=%u source=%p srcSize=%u) -> E_NOTIMPL, "
+                "IDStorageFileX is not implemented",
+                i, (unsigned long long)options, dest, destSize, src, srcSize);
+            continue;
+        }
+        if (srcSize == 0 || destSize == 0 ||
+            !ScRangeCommitted(dest, destSize) ||
+            !ScRangeCommitted(src, srcSize)) {
+            ++refused;
+            Log("dstorage",
+                "Submit[%d] refused: unvalidated range (options=0x%016llx "
+                "dest=%p destSize=%u src=%p srcSize=%u)",
+                i, (unsigned long long)options, dest, destSize, src, srcSize);
+            continue;
+        }
+        const uint32_t n = destSize < srcSize ? destSize : srcSize;
+        memcpy((void*)dest, src, n);
+        ++copied;
+    }
+    q->submitted++;
+    q->copied += copied;
+    q->refused += refused;
+    q->fileSource += fileSource;
+    Log("dstorage",
+        "Submit q=%p batch=%d copied=%d refused=%d file=%d totals: batches=%d "
+        "copied=%d refused=%d file=%d",
+        self, q->count, copied, refused, fileSource, q->submitted, q->copied,
+        q->refused, q->fileSource);
+    q->count = 0;
+}
+
+extern "C" void DsqClose(void* self) {
+    Log("dstorage", "queue %p Close (pending=%d submitted=%d)", self,
+        ((ScDsQueue*)self)->count, ((ScDsQueue*)self)->submitted);
+}
+
+extern "C" HRESULT DsqUnsupported(void* self, uint64_t a1, uint64_t a2,
+                                  uint64_t a3, uint64_t a4) {
+    Log("dstorage",
+        "queue %p unsupported method (this=%p %llx %llx %llx %llx) -> "
+        "E_NOTIMPL",
+        self, self, (unsigned long long)a1, (unsigned long long)a2,
+        (unsigned long long)a3, (unsigned long long)a4);
+    return E_NOTIMPL;
+}
+
+struct DsQueueVtableInit {
+    DsQueueVtableInit() {
+        for (int i = 0; i < 64; ++i) g_dsQueueVtable[i] = (void*)DsqUnsupported;
+        g_dsQueueVtable[0] = (void*)DsqQueryInterface;
+        g_dsQueueVtable[1] = (void*)DsqAddRef;
+        g_dsQueueVtable[2] = (void*)DsqRelease;
+        g_dsQueueVtable[3] = (void*)DsqEnqueueRequest;   // measured 0x1428c9a0b
+        g_dsQueueVtable[8] = (void*)DsqSubmit;           // measured 0x1428c9637
+        g_dsQueueVtable[9] = (void*)DsqClose;
+    }
+};
+static DsQueueVtableInit g_dsQueueVtableInit;
+
+static ScDsQueue* ScDsCreateQueue(const char* why) {
+    ScDsQueue* q = (ScDsQueue*)HeapAlloc(GetProcessHeap(),
+                                         HEAP_ZERO_MEMORY, sizeof(ScDsQueue));
+    if (!q) {
+        Log("dstorage", "CreateQueue(%s): HeapAlloc failed -> E_OUTOFMEMORY",
+            why);
+        return nullptr;
+    }
+    q->vtable = g_dsQueueVtable;
+    q->ref = 1;
+    ++g_dsQueues;
+    Log("dstorage", "CreateQueue(%s) -> %p vtable=%p slot3=EnqueueRequest "
+        "slot8=Submit (queues=%d)",
+        why, (void*)q, (void*)q->vtable, g_dsQueues);
+    return q;
+}
 
 extern "C" HRESULT StubStorageFactorySlot10(void* self, void* desc,
                                             void* iid, void** out) {
-    Log("stub",
-        "IDStorageFactory slot 10 (create upload backend) this=%p desc=%p "
-        "iid=%p out=%p return-to=%p -> E_NOTIMPL (no DStorage queue "
-        "contract in the layer; refused instead of faking success)",
+    Log("dstorage",
+        "IDStorageFactory slot 10 CreateQueue this=%p desc=%p iid=%p out=%p "
+        "return-to=%p",
         self, desc, iid, (void*)out, _ReturnAddress());
-    return E_NOTIMPL;
+    if (desc) {
+        const uint64_t* d = (const uint64_t*)desc;
+        Log("dstorage", "  queue desc: %016llx %016llx %016llx %016llx",
+            (unsigned long long)d[0], (unsigned long long)d[1],
+            (unsigned long long)d[2], (unsigned long long)d[3]);
+    }
+    if (iid) {
+        const uint8_t* g = (const uint8_t*)iid;
+        Log("dstorage", "  riid: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+            "%02x%02x%02x%02x%02x%02x",
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10],
+            g[11], g[12], g[13], g[14], g[15]);
+    }
+    if (!out) return E_POINTER;
+    ScDsQueue* q = ScDsCreateQueue("factory slot 10");
+    if (!q) return E_OUTOFMEMORY;
+    *out = q;
+    Log("dstorage", "  wrote queue %p to out %p", (void*)q, (void*)out);
+    return S_OK;
 }
+
+// IDStorageFactory keeps its own vtable so slot 10 is the real CreateQueue
+// while every other stub-backed interface keeps StubComGeneric.
+static void* g_stubComVtableStorageFactory[64];
 
 struct StubComVtableInit {
     StubComVtableInit() {

@@ -363,6 +363,60 @@ Still true and not claimed otherwise: the guest stops at its own `int3` at
 `0x1428c95ce` rather than faulting on the null it was told was valid, and
 the streaming path does not complete.
 
+## Build 91 — D1: a real DStorage queue behind slot 10
+
+`IDStorageFactory` slot 10 (`0x1428c95c7`) now creates a **live queue
+object** instead of refusing. Measured contract, all from the guest image:
+slot 3 (`0x1428c9a0b`) is `EnqueueRequest(const DSTORAGE_REQUEST*)` and
+slot 8 (`0x1428c9637`) is `Submit()` with no arguments.
+
+### The 0x38-byte request, settled by boot #74's capture
+
+```
+EnqueueRequest[0] options=0x1 dest=0x1FC849E3660 destSize=65536
+                  src=0xACA58068328F107A srcSize=274192320
+   raw = 0000000000000001 000001fc849e3660 0000000000000000
+         0000000000010000 aca58068328f107a 000000001057d7c0 0000000000004594
+EnqueueRequest[1] dest=...F3660 (advances 0x10000 each request)
+                  raw[5] advances 0x4594..0x4770 per request
+```
+
+So: `+0x00` options = **1** (zlib decompress; `0x400000` is *not* set, so
+source type is file, not memory), `+0x08` destination (64 KiB pages,
+committed and validated), `+0x18` destination size = 0x10000, `+0x20` a
+constant source descriptor, `+0x28` a **file offset advancing ~18 KiB per
+page**, `+0x30` the compressed size of that page. This is a
+file-sourced, zlib-compressed page stream — the memory-copy reading was
+wrong, and the capture is what disproved it.
+
+The queue therefore refuses every one of those requests **by name**
+(`Submit[i] refused: file-sourced request … -> E_NOTIMPL, IDStorageFileX
+is not implemented`) rather than no-op'ing them, and no copy is ever made
+into an unvalidated address (`ScRangeCommitted` gates on `VirtualQuery`).
+
+### Boot #74: the assert is gone, a new blocker is named
+
+```
+[loader] ctx-probe: ctx=0x1fc8191b780 owner=0x1478f5e80 sub[+0x18]=0x209d7b21630
+[loader] ctx-probe: fault-kind=sub-object-present
+[loader] veh: exception 0xc0000005 at 0000000144F65844 thread 24640
+```
+
+`0x1428c95ce` no longer asserts: `[record+0x18]` holds the live queue and
+the guest ran 64 enqueues past it. The new fault is
+`0x144f65844: mov rax,[rcx] / call [rax+0x18]` with `[rsi+0x30] = 0` —
+**the same class one field over**: `[record+0x30]` is produced by factory
+slot 5 (`call [r10+0x28]` in the constructor), which is still the S_OK
+stub, and the guest then calls slot 3 on that null with `(0, 0)` expecting
+a boolean. That is the next producer to implement (an `IDStorageFileX`
+open/read object), and it is exactly the file-backed half of D1 that the
+queue now refuses by name.
+
+Gate for build 91, both trees, PR #2 probes present
+(`noop=3 logpath=1 logpath=1`): `build.bat` exit 0, era 21/21, ft 7/7,
+verify 0. Boot #74's 6.2 GB dump archived to
+`D:\scarlett-dumps\scarlett_crash_boot74.dmp` (MDMP header verified).
+
 **Open decision (not answered here):** either accept the guest-asserted stop
 at `0x1428c95ce` as the permanent behaviour of the refusal, or authorise a
 real DStorage queue behind `IDStorageFactory` slot 10 (slot 3 accepting the
