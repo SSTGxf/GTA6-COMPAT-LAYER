@@ -12,6 +12,7 @@
 #include <dbghelp.h>  // MiniDumpWriteDump (crash dumps)
 #include <intrin.h>  // __readgsqword
 #include <string>
+#include <tlhelp32.h>  // Build 84: thread enumeration for DR0 watchpoints
 #include <vector>
 
 #pragma comment(lib, "Dbghelp.lib")
@@ -1771,6 +1772,205 @@ static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS* ep) {
 static void* g_guestBaseForVeh = nullptr;
 static LONG g_vehDumped = 0;
 
+// Build 84: hardware write watchpoint on the streaming record's backend
+// field (the null sub-object of fault 0x1428C9A08). Two stages, both
+// observation-only -- no guest byte is patched:
+//   stage 1  DR0 = image global 0x79F6D70, catches the publish of a
+//            record whose +0x00 is the "sdms" magic
+//   stage 2  DR0 = record+0x18, catches every write to the backend
+// Every trapping thread logs its RIP (the instruction after the writer),
+// the value the field now holds, and the guest return addresses on its
+// stack; execution resumes with the watchpoint still armed so later
+// writers are named too. DR7 = local enable 0, RW0 = 01 (write),
+// LEN0 = 11 (8 bytes) => 0x000D0001.
+static volatile LONG g_wpStage = 0;  // 0 idle, 1 global, 2 field, 3 off
+static volatile LONG64 g_wpRecord = 0;
+static volatile LONG g_wpTrapCount = 0;
+static volatile LONG g_wpArmed = 0;
+static const uint64_t kWpDr7Write8 = 0x000D0001ull;
+// True on the watchdog thread only: its SEH-guarded reads must never be
+// mistaken for a guest crash by the VEH (boot #67's verify children died
+// that way when the watchdog probed a global the small test images do
+// not map).
+static thread_local bool t_wpThread = false;
+
+// Arm (or clear, when addr is 0) DR0 on every thread of this process.
+static void WpSetAllThreads(uint64_t addr) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+    const DWORD me = GetCurrentProcessId();
+    LONG armed = 0;
+    const DWORD self = GetCurrentThreadId();
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != me)
+                continue;
+            // Never suspend this thread: GetThreadContext on a thread
+            // that suspended itself hangs (boot #65 lost the watchdog
+            // that way before it logged anything).
+            if (te.th32ThreadID == self)
+                continue;
+            HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                       THREAD_SET_CONTEXT,
+                                   FALSE, te.th32ThreadID);
+            if (!th)
+                continue;
+            if (SuspendThread(th) != (DWORD)-1) {
+                CONTEXT c = {};
+                c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (GetThreadContext(th, &c)) {
+                    c.Dr0 = addr;
+                    c.Dr1 = 0;
+                    c.Dr2 = 0;
+                    c.Dr3 = 0;
+                    c.Dr6 = 0;
+                    c.Dr7 = addr ? kWpDr7Write8 : 0;
+                    if (SetThreadContext(th, &c))
+                        ++armed;
+                }
+                ResumeThread(th);
+            }
+            CloseHandle(th);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    g_wpArmed = armed;
+}
+
+// Guest return addresses sitting on the trapping thread's stack.
+static void WpLogStack(const CONTEXT* c) {
+    __try {
+        const uint64_t* sp = (const uint64_t*)(uintptr_t)c->Rsp;
+        char buf[320] = {};
+        size_t o = 0;
+        int found = 0;
+        for (int i = 0; i < 40; ++i) {
+            const uint64_t v = sp[i];
+            if (v < 0x140000000ull || v >= 0x147400000ull)
+                continue;
+            const int n = _snprintf_s(buf + o, sizeof(buf) - o, _TRUNCATE,
+                                      "%s0x%llx", found ? "," : "",
+                                      (unsigned long long)v);
+            if (n <= 0)
+                break;
+            o += (size_t)n;
+            ++found;
+            if (found >= 10)
+                break;
+        }
+        Log("loader", "[watch] stack: %s", found ? buf : "(no guest frames)");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "[watch] stack=<unreadable>");
+    }
+}
+
+// The watchpoint only makes sense for an image that actually maps the
+// record global. ERA/guest verify children are tiny (SizeOfImage 0xb000),
+// so arming there would only probe unmapped memory.
+static bool WpImageCoversGlobal(uint8_t* base) {
+    __try {
+        const uint32_t lfanew = *(uint32_t*)(base + 0x3C);
+        const uint32_t imageSize = *(uint32_t*)(base + lfanew + 0x50);
+        return imageSize > 0x79F6D78u;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static DWORD WINAPI WpThreadProc(void*) {
+    t_wpThread = true;
+    uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+    if (!base) {
+        Log("loader", "[watch] no guest base; watchpoint not armed");
+        return 0;
+    }
+    if (!WpImageCoversGlobal(base)) {
+        Log("loader",
+            "[watch] image does not map 0x79F6D70; watchpoint skipped");
+        g_wpStage = 3;
+        return 0;
+    }
+    const uint64_t gAddr = (uint64_t)(base + 0x79F6D70);
+    Log("loader",
+        "[watch] watchdog start base=0x%llx global=0x%llx",
+        (unsigned long long)(uintptr_t)base, (unsigned long long)gAddr);
+    g_wpStage = 1;
+    WpSetAllThreads(gAddr);
+    Log("loader",
+        "[watch] stage1: DR0=0x%llx (record global) write/8 on %ld threads",
+        (unsigned long long)gAddr, (long)g_wpArmed);
+    // Boot #66 armed stage 1 on the four threads that existed at entry;
+    // the publish ran on a thread the game created later, so no trap ever
+    // fired. Re-scan continuously: every new thread matters in both
+    // stages, and the publish-to-crash window is only milliseconds.
+    for (int i = 0; i < 60000; ++i) {  // ~120 s, one tick = 2 ms
+        Sleep(2);
+        const LONG st = g_wpStage;
+        if (st == 3)
+            return 0;
+        if (st == 2) {
+            if ((i % 25) == 0)
+                WpSetAllThreads((uint64_t)g_wpRecord + 0x18);
+            continue;
+        }
+        if ((i % 50) == 0)
+            WpSetAllThreads(gAddr);
+        uint64_t rec = 0, magic = 0;
+        __try {
+            rec = *(uint64_t*)gAddr;
+            magic = rec ? *(uint64_t*)rec : 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            continue;
+        }
+        if (!rec || magic != 0x6D736473ull)
+            continue;
+        uint64_t cur = 0, owner = 0;
+        __try {
+            owner = *(uint64_t*)(rec + 0x10);
+            cur = *(uint64_t*)(rec + 0x18);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        g_wpRecord = (LONG64)rec;
+        g_wpStage = 2;
+        WpSetAllThreads(rec + 0x18);
+        Log("loader",
+            "[watch] stage2: record 0x%llx magic=sdms owner=0x%llx -> "
+            "DR0=0x%llx, [+0x18] at arm time 0x%llx, %ld threads",
+            (unsigned long long)rec, (unsigned long long)owner,
+            (unsigned long long)(rec + 0x18), (unsigned long long)cur,
+            (long)g_wpArmed);
+    }
+    return 0;
+}
+
+void StartStreamWatchpoint() {
+    if (InterlockedCompareExchange(&g_wpStage, 0, 0) != 0)
+        return;
+    HANDLE h = CreateThread(nullptr, 0, WpThreadProc, nullptr, 0, nullptr);
+    if (h)
+        CloseHandle(h);
+    else
+        Log("loader", "[watch] CreateThread failed (%lu)",
+            (unsigned long)GetLastError());
+}
+
+// Current backend field of the watched record (0 when unknown). Logged
+// next to every device-slot stub so the value on both sides of any
+// diverted guest branch is recorded.
+uint64_t ScWatchRecordBackend() {
+    const LONG64 rec = g_wpRecord;
+    if (!rec)
+        return 0;
+    __try {
+        return *(uint64_t*)((uint64_t)rec + 0x18);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 // Boot #58: the HLE layer needs the guest image base to load the
 // Xbox pool-dispatcher pointer from the .data dispatch slot and to
 // read the arena globals (G/Gsize/cursor). Set by RunXboxPe before
@@ -2098,7 +2298,7 @@ static void LogBoot55Probe(EXCEPTION_POINTERS* ep) {
     uint8_t* base = (uint8_t*)g_guestBaseForVeh;
     if (!base || !ep || !ep->ExceptionRecord || !ep->ContextRecord)
         return;
-    // Only meaningful when the fault IS the 2 MB assert.
+    // Only meaningful when the fault IS the 2 MB assert (unchanged).
     if ((uintptr_t)ep->ExceptionRecord->ExceptionAddress !=
         (uintptr_t)(base + 0x247AF2D)) {
         return;
@@ -2289,11 +2489,72 @@ static void LogStreamContextProbe(EXCEPTION_POINTERS* ep) {
 }
 
 static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    // Our own watchdog's guarded probes are not guest faults.
+    if (t_wpThread) return EXCEPTION_CONTINUE_SEARCH;
     // Boot #25: the fault moved from the pack assert (0x80000003) to an
     // access violation (0xc0000005, NULL-deref in the sibling pack fn).
     // Catch both so the mount probe + dump fire at the AV too — the
     // 0x80000003-only gate is why boot #25 produced no probe.
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Build 84: hardware write-watchpoint traps (DR0). Logged and resumed
+    // in place; never treated as a crash.
+    if (code == 0x80000004) {
+        CONTEXT* c = ep->ContextRecord;
+        if (!c || g_wpStage == 0 || g_wpStage == 3)
+            return EXCEPTION_CONTINUE_SEARCH;
+        // Stage 1: this trap is the record publish. Re-arm THIS thread on
+        // record+0x18 inside the exception context, so the window between
+        // publish and first use cannot be missed by the poller.
+        if (g_wpStage == 1) {
+            uint64_t rec = 0, magic = 0, owner = 0;
+            __try {
+                rec = *(uint64_t*)((uint8_t*)g_guestBaseForVeh + 0x79F6D70);
+                magic = rec ? *(uint64_t*)rec : 0;
+                owner = rec ? *(uint64_t*)(rec + 0x10) : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            const long n1 = InterlockedIncrement(&g_wpTrapCount);
+            Log("loader",
+                "[watch] trap #%ld stage1 rip=0x%llx thread=%lu global "
+                "value=0x%llx magic=0x%llx",
+                n1, (unsigned long long)c->Rip,
+                (unsigned long)GetCurrentThreadId(),
+                (unsigned long long)rec, (unsigned long long)magic);
+            WpLogStack(c);
+            c->Dr6 = 0;
+            if (magic == 0x6D736473ull) {
+                g_wpRecord = (LONG64)rec;
+                g_wpStage = 2;
+                c->Dr0 = rec + 0x18;
+                c->Dr7 = kWpDr7Write8;
+                Log("loader",
+                    "[watch] stage2 (from trap): record 0x%llx owner=0x%llx "
+                    "-> DR0=0x%llx re-armed in-context",
+                    (unsigned long long)rec, (unsigned long long)owner,
+                    (unsigned long long)(rec + 0x18));
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        const LONG64 rec = g_wpRecord;
+        const uint64_t field = rec ? (uint64_t)rec + 0x18 : 0;
+        uint64_t val = 0;
+        __try {
+            val = field ? *(uint64_t*)field : 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        const long n = InterlockedIncrement(&g_wpTrapCount);
+        Log("loader",
+            "[watch] trap #%ld dr6=0x%llx rip=0x%llx thread=%lu stage=%ld "
+            "field=0x%llx value=0x%llx",
+            n, (unsigned long long)c->Dr6, (unsigned long long)c->Rip,
+            (unsigned long)GetCurrentThreadId(), (long)g_wpStage,
+            (unsigned long long)field, (unsigned long long)val);
+        WpLogStack(c);
+        c->Dr6 = 0;
+        if (n >= 64)
+            g_wpStage = 3;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (code != 0x80000003 && code != 0xc0000005)
         return EXCEPTION_CONTINUE_SEARCH;
     if (InterlockedExchange(&g_vehDumped, 1) != 0)
@@ -2572,6 +2833,10 @@ bool RunXboxPe(LoadedPe* pe, DWORD* exitCode) {
     // unhandled path. Lives until process exit (the harness child exits
     // after the run); g_vehDumped is reset per run.
     g_guestBaseForVeh = pe->base;
+    // Build 84: name the writer of the streaming record's backend field.
+    // Armed before the guest entry so the publish is caught on whichever
+    // thread performs it.
+    StartStreamWatchpoint();
     g_vehDumped = 0;
     AddVectoredExceptionHandler(1, ScarlettVehHandler);
     // App-manifest mount registration (the title pack-table blocker): read

@@ -591,11 +591,12 @@ static HRESULT WINAPI XboxDevice_SlotUnimplemented(
     if (n <= 4 || (n % 64) == 0) {
         Log("xboxdev",
             "UNIMPLEMENTED slot %d (vtable +0x%x) from game %p args=%llx %llx "
-            "%llx %llx %llx %llx (call #%ld) -> E_NOTIMPL",
+            "%llx %llx %llx %llx (call #%ld) bk=%llx -> E_NOTIMPL",
             Slot, Slot * 8, _ReturnAddress(),
             (unsigned long long)a1, (unsigned long long)a2,
             (unsigned long long)a3, (unsigned long long)a4,
-            (unsigned long long)a5, (unsigned long long)a6, (long)n);
+            (unsigned long long)a5, (unsigned long long)a6, (long)n,
+            ScWatchRecordBackend());
     }
     return E_NOTIMPL;
 }

@@ -47,6 +47,21 @@ bool RunXboxPe(LoadedPe* pe, DWORD* exitCode);
 // (boot #58 pool-dispatcher invocation).
 void* ScGuestBase();
 
+// Build 84: current value of the watched streaming record's backend field
+// ([record+0x18], the null sub-object of fault 0x1428C9A08), or 0 while
+// no record has been published. Read-only diagnostic for the DR0
+// watchpoint; the slot logs print it so the value on both sides of any
+// diverted guest branch is on record.
+unsigned long long ScWatchRecordBackend();
+
+// Calling thread's game TLS block as the guest's patched code sees
+// it (the /GA view's [0] entry), or nullptr if no view is
+// installed. Read-only diagnostic for the boot #59 obj-filter
+// capture (GPT #9) — the dispatcher's TLS helper reads its context
+// from the TLS block, and which block it reads (real array[0] vs
+// /GA view[0] vs real array[10]) is what the capture disambiguates.
+void* ScGuestGaViewBlock();
+
 void FreeXboxPe(LoadedPe* pe);
 
 }  // namespace sc
