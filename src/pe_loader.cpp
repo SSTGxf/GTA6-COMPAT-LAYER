@@ -339,6 +339,55 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
                 targetIsZero ? 1u : 0u);
         }
     }
+    // Diagnostic probe for the next startup fault. At RVA 0x1e1cfd2 the
+    // title directly calls zero-filled RVA 0x4da2350, then places the
+    // helper's return value into a 32-byte config passed to
+    // D3D12ConfigureVirtualMemoryX. ScarlettCompat currently treats that
+    // Xbox call as a no-op returning S_OK, so this opt-in probe supplies a
+    // neutral return only to determine whether startup advances. It does
+    // not establish the missing helper's semantics and is not a fix.
+    const uint32_t kVaHelperCallRva = 0x1e1cfd2;
+    const uint32_t kVaHelperTargetRva = 0x4da2350;
+    char vaHelperProbeEnv[2] = {};
+    DWORD vaHelperProbeEnvLen = GetEnvironmentVariableA(
+        "SCARLETT_DIAG_SKIP_VA_HELPER", vaHelperProbeEnv,
+        (DWORD)sizeof(vaHelperProbeEnv));
+    const bool vaHelperProbeEnabled =
+        vaHelperProbeEnvLen == 1 && vaHelperProbeEnv[0] == '1';
+    if (imageSize == 0x0b06d000 && vaHelperProbeEnabled &&
+        (SIZE_T)kVaHelperCallRva + 5 <= imageSize &&
+        (SIZE_T)kVaHelperTargetRva + 0x20 <= imageSize) {
+        static const uint8_t kExpectedCall[5] = {
+            0xe8, 0x79, 0x53, 0xf8, 0x02};
+        uint8_t* callSite = img + kVaHelperCallRva;
+        const uint8_t* target = img + kVaHelperTargetRva;
+        bool targetIsZero = true;
+        for (size_t i = 0; i < 0x20; ++i) {
+            if (target[i] != 0) {
+                targetIsZero = false;
+                break;
+            }
+        }
+        if (memcmp(callSite, kExpectedCall, sizeof(kExpectedCall)) == 0 &&
+            targetIsZero) {
+            // mov eax, 0; same five-byte length as call rel32.
+            static const uint8_t kReplacement[5] = {
+                0xb8, 0x00, 0x00, 0x00, 0x00};
+            memcpy(callSite, kReplacement, sizeof(kReplacement));
+            FlushInstructionCache(GetCurrentProcess(), callSite,
+                                  sizeof(kReplacement));
+            Log("loader",
+                "diagnostic VA helper bypass at RVA 0x1e1cfd2: "
+                "call to zero-filled RVA 0x4da2350 replaced with EAX=0");
+        } else {
+            Log("loader",
+                "diagnostic VA helper bypass fingerprint mismatch "
+                "(call-match %u, zero-target %u), skipped",
+                memcmp(callSite, kExpectedCall, sizeof(kExpectedCall)) == 0
+                    ? 1u : 0u,
+                targetIsZero ? 1u : 0u);
+        }
+    }
     // Boot #6 / H1 Option A (see the local boot #6 diagnosis):
     // grow the pool at construction so slot 0 returns a real block.
     // The pool is built as a 0x20-byte pool over a 0x60-byte BSS buffer;
