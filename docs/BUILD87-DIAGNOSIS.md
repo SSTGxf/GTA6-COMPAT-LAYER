@@ -171,10 +171,50 @@ out for the interface the streamer asks for:
   unknown, so the guest's own `jns`/`int3` at `0x1428c95ca` reports a named
   failure instead of dereferencing a null that our fake success created.
 
-Neither was landed this pass: the first needs the interface identity
-(which of `IGameInput`/`IDStorageFactory` the streamer caches at
-`0x1478F5E78`, in the crashing boot), and the second changes every stub
-COM call site and must be measured across the boot before it is safe.
+### The interface is identified: IDStorageFactory
+
+Boot #71's stub-creation lines name both objects the layer handed out:
+
+```
+[stub] IGameInput         stub COM object 000002ED7626C280   (line 207)
+[stub] IDStorageFactory    stub COM object 000002ED7626C1E0   (line 209)
+```
+
+and the global the record constructor reads holds **exactly the second
+one**: `[0x1478F5E78] = 0x2ED7626C1E0`. So the guest cached the layer's
+fake **IDStorageFactory** and uses its **slot 10** as the operation that
+creates the submission backend for the streaming record — i.e. it is the
+DStorage factory's queue-creation path, called with
+`(this, desc*, guid*, void** out)` where `out = &record[+0x18]`.
+
+Because `StubComGeneric` answers `S_OK` and writes nothing, the guest
+believes it created a queue, stores the returned null, and later submits
+through it at `0x1428C9A08` — the null dereference is directly caused by
+that false success.
+
+### Why no fix is landed here (needs a decision)
+
+The two compliant routes both need something this repository does not have:
+
+1. **Implement the real interface.** Slot 10 must return a genuine DStorage
+   queue object whose slot 3 accepts the submit request and whose slot 8
+   closes it. The GDK `IDStorageFactory`/`IDStorageQueue` layout is not in
+   the image (the guest only ever calls slot 10 once and slot 3/8 on the
+   result), and building it would mean synthesising the interface the
+   mission forbids. Our `opt_dstorage.cpp` implements file reads and
+   decompression (`ScOpt_DStorage*`), not queues.
+2. **Refuse at the factory.** Returning a failure from slot 10 is checked
+   by the guest at `0x1428c95ca` (`test eax,eax / jns`), which trips its own
+   `int3` at `0x1428c95ce`; and `DStorageGetFactory` itself cannot return
+   null or a sentinel — the layer's own note (src/hle_registry.cpp, "Boot
+   #9 / Leonida retail chain stop #5") records that the game faults when it
+   does. Both outcomes are crashes, not clean refusals.
+
+So the crash is fully explained and the responsible surface is named, but
+a compliant fix requires the DStorage queue contract (or a decision to
+accept the guest's `int3` as the refusal point). The dead texture-computer
+slot-10 experiment was removed again; `src/xg_texture.cpp` matches the
+state the green builds were produced from.
 
 ## Post-fix boot (green binaries)
 
