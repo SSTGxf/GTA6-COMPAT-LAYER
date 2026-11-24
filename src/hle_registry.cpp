@@ -195,10 +195,13 @@ extern "C" HRESULT HleXMemAllocatePhysicalPages(void) {
     return (HRESULT)1;
 }
 
+static void ScatterUnmapAll();
+
 extern "C" HRESULT HleXMemFreePhysicalPages(void) {
     Log("xmem",
-        "XMemFreePhysicalPages() -> S_OK (STUB: no desktop "
-        "physical-page pool)");
+        "XMemFreePhysicalPages() -> S_OK (releases tracked scatter "
+        "reservations; no desktop physical-page pool is emulated)");
+    ScatterUnmapAll();
     return S_OK;
 }
 
@@ -228,25 +231,140 @@ extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
 // XMemMapPhysicalPagesScatter — ABI measured from the guest, not assumed
 // (build 86). Sole vtable-thunk callers 0x140F2CC3E and 0x140B18DDE:
 //   rcx = page-descriptor array, edx = page count, r8 = second array.
-//   r9 is *not* an argument: it holds leftover register garbage
-//   (0x337E0000 in boot #67, 0xFD660000 in boot #68, 0x282E5310 for r8
-//   was likewise a truncated pointer under the old prototype).
-//   The result is a STATUS, not an address: both callers run
-//   `test eax,eax; jne ok; int3` (0x140F2CC47/0x140F2CC4B and
-//   0x140B18DE3/0x140B18DE7), i.e. zero means failure and trips the
-//   guest's own assert.
-// Desktop has no physical-page pool, so the guest's page descriptors
-// cannot be mapped. Report the documented failure instead of
-// fabricating a mapping.
+//   r9 is *not* an argument (leftover register garbage).
+//   The result is a STATUS: both callers run `test eax,eax; jne ok; int3`
+//   (0x140F2CC47/0x140F2CC4B and 0x140B18DE3/0x140B18DE7).
+//
+// Build 87 semantics — read off the guest, not guessed:
+//   * The descriptor array dumped at 0x140F2CC38 holds 64 KB-strided,
+//     4 KB-aligned addresses (0x27174480000, +0x10000, ...), i.e. the
+//     guest is asking for one page at each supplied address — the
+//     "scatter" layout (6720 pages spread over a 440 MB span).
+//   * The second array is zero-filled scratch: after the call the guest
+//     only frees it (0x140F2CCD8 -> 0x144D9C130) and never reads it, so
+//     per-page results are written there but nothing depends on them.
+//   * There is no layer-side pool to draw from: the mapping is performed
+//     at the guest's own addresses (reserve the span if free, commit one
+//     page at each descriptor) and the reservation is tracked so it is
+//     released exactly once.
+struct ScatterReservation {
+    void* base;
+    SIZE_T span;
+    uint32_t pages;
+    bool owned;  // true when this layer reserved the span
+};
+static ScatterReservation g_scatterMaps[8];
+static int g_scatterMapCount = 0;
+
+static void ScatterUnmapAll() {
+    for (int i = 0; i < g_scatterMapCount; ++i) {
+        ScatterReservation& r = g_scatterMaps[i];
+        if (!r.base) continue;
+        if (r.owned) {
+            BOOL ok = VirtualFree(r.base, 0, MEM_RELEASE);
+            Log("xmem",
+                "XMemMapPhysicalPagesScatter: released reservation "
+                "%p span %llu (%u pages) ok=%d",
+                r.base, (unsigned long long)r.span, r.pages, (int)ok);
+        } else {
+            Log("xmem",
+                "XMemMapPhysicalPagesScatter: reservation %p span %llu "
+                "(%u pages) belongs to the layer arena; not released",
+                r.base, (unsigned long long)r.span, r.pages);
+        }
+        r.base = nullptr;
+        r.span = 0;
+        r.pages = 0;
+    }
+    g_scatterMapCount = 0;
+}
+
 extern "C" BOOL HleXMemMapPhysicalPagesScatter(const uint64_t* pPages,
                                               uint32_t dwPageCount,
                                               void* pOutArray) {
     void* caller = _ReturnAddress();
+    if (!pPages || dwPageCount == 0) {
+        Log("xmem",
+            "XMemMapPhysicalPagesScatter(pages %p, count %u, out %p) from "
+            "%p -> FALSE (no descriptors)",
+            (const void*)pPages, dwPageCount, pOutArray, caller);
+        return FALSE;
+    }
+
+    uint64_t first = pPages[0];
+    uint64_t second = dwPageCount > 1 ? pPages[1] : 0;
+    uint64_t last = pPages[dwPageCount - 1];
+    uint64_t out0 = pOutArray ? ((const uint64_t*)pOutArray)[0] : 0;
     Log("xmem",
-        "XMemMapPhysicalPagesScatter(pages %p, count %u, out %p) from %p "
-        "-> FALSE (no physical-page pool; mapping not fabricated)",
-        (const void*)pPages, dwPageCount, pOutArray, caller);
-    return FALSE;
+        "XMemMapPhysicalPagesScatter(pages %p, count %u, out %p) from "
+        "%p: d[0]=0x%llx d[1]=0x%llx d[%u]=0x%llx out[0]=0x%llx",
+        (const void*)pPages, dwPageCount, pOutArray, caller,
+        (unsigned long long)first, (unsigned long long)second,
+        dwPageCount - 1, (unsigned long long)last,
+        (unsigned long long)out0);
+
+    // The mapping target is the guest's own address list. Reserve the
+    // span only if it is still free; a span the layer arena already
+    // reserved is committed page by page and left to its owner.
+    SIZE_T span = (SIZE_T)(last - first) + 0x1000;
+    void* base = (void*)(uintptr_t)first;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    VirtualQuery(base, &mbi, sizeof(mbi));
+    bool owned = false;
+    if (mbi.State == MEM_FREE) {
+        if (!VirtualAlloc(base, span, MEM_RESERVE, PAGE_NOACCESS)) {
+            Log("xmem",
+                "XMemMapPhysicalPagesScatter: reserve %p span %llu failed "
+                "err=%lu -> FALSE",
+                base, (unsigned long long)span, GetLastError());
+            return FALSE;
+        }
+        owned = true;
+    }
+    Log("xmem",
+        "XMemMapPhysicalPagesScatter: target %p span %llu state=%lx "
+        "type=%lx allocBase=%p reservedByLayer=%d",
+        base, (unsigned long long)span, (unsigned long)mbi.State,
+        (unsigned long)mbi.Type, mbi.AllocationBase, (int)owned);
+
+    uint64_t* out = (uint64_t*)pOutArray;
+    uint32_t mapped = 0, failed = 0;
+    for (uint32_t i = 0; i < dwPageCount; ++i) {
+        void* va = (void*)(uintptr_t)pPages[i];
+        void* p = VirtualAlloc(va, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+        if (p) {
+            ++mapped;
+            if (out) out[i] = (uint64_t)(uintptr_t)p;
+        } else {
+            ++failed;
+            if (out) out[i] = 0;
+            if (failed <= 4) {
+                Log("xmem",
+                    "XMemMapPhysicalPagesScatter: commit [%u] %p failed "
+                    "err=%lu",
+                    i, va, GetLastError());
+            }
+        }
+    }
+    Log("xmem",
+        "XMemMapPhysicalPagesScatter: mapped %u/%u pages, out[0]=0x%llx "
+        "out[last]=0x%llx",
+        mapped, dwPageCount,
+        (unsigned long long)(out ? out[0] : 0),
+        (unsigned long long)(out ? out[dwPageCount - 1] : 0));
+
+    if (failed != 0) {
+        Log("xmem",
+            "XMemMapPhysicalPagesScatter: %u page(s) could not be committed "
+            "-> FALSE (no partial success reported)",
+            failed);
+        return FALSE;
+    }
+    if (g_scatterMapCount < 8) {
+        g_scatterMaps[g_scatterMapCount++] =
+            ScatterReservation{base, span, dwPageCount, owned};
+    }
+    return TRUE;
 }
 
 // XMemTransferMemory — memcpy. First three args are (dst, src, size);
@@ -3682,7 +3800,10 @@ extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags) {
     // routinely; the resolution is process-wide.
     static bool timerResRaised = false;
     if (!timerResRaised) {
-        if (timeBeginPeriod(1) == TIMERR_NOERROR) timerResRaised = true;
+        UINT rc = timeBeginPeriod(1);
+        Log("present", "timeBeginPeriod(1) -> %u (0 = raised to 1 ms)",
+            (unsigned)rc);
+        if (rc == TIMERR_NOERROR) timerResRaised = true;
     }
     Log("present",
         "SetFrameIntervalX(%u, 0x%x) -> S_OK (real pacing: %.1f ms/frame)",
@@ -5093,8 +5214,8 @@ static const Export kExports[] = {
     {"xmem.dll", "XMemMapPhysicalPagesScatter", Status::kImplemented,
      (void*)HleXMemMapPhysicalPagesScatter,
      "IMPLEMENTED (real-exe). Measured ABI: (pages, count, out), status "
-     "return. FALSE — no desktop physical-page pool; mapping is not "
-     "fabricated."},
+     "return. Maps one page at each guest-supplied address, tracked so "
+     "the reservation is released once."},
     {"xmem.dll", "XMemTransferMemory", Status::kImplemented,
      (void*)HleXMemTransferMemory,
      "IMPLEMENTED (real-exe). memcpy(dst, src, size)."},
