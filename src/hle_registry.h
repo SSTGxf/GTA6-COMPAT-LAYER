@@ -67,10 +67,9 @@ extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
                                          uint32_t dwPageCount,
                                          DWORD dwMemoryAttributes,
                                          DWORD flProtect);
-extern "C" void* HleXMemMapPhysicalPagesScatter(const uint64_t* pPhysicalPages,
-                                                uint32_t dwPageCount,
-                                                DWORD dwMemoryAttributes,
-                                                DWORD flProtect);
+extern "C" BOOL HleXMemMapPhysicalPagesScatter(const uint64_t* pPages,
+                                               uint32_t dwPageCount,
+                                               void* pOutArray);
 extern "C" void HleXMemTransferMemory(void* pDst, const void* pSrc,
                                       SIZE_T cbSize);
 extern "C" HRESULT HleXAudio2Create(void** ppXAudio2, UINT32 flags, DWORD proc);

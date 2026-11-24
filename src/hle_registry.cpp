@@ -225,23 +225,28 @@ extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
     return p;
 }
 
-extern "C" void* HleXMemMapPhysicalPagesScatter(
-    const uint64_t* pPhysicalPages, uint32_t dwPageCount,
-    DWORD dwMemoryAttributes, DWORD flProtect) {
-    // Same guarded ordinary-memory mapping as XMemMapPhysicalPages
-    // (scatter layout is GDKX-gated; the VA returned is one contiguous
-    // block the game can write to).
-    SIZE_T bytes = (SIZE_T)dwPageCount * 4096;
-    if (bytes < 64 * 1024) bytes = 64 * 1024;
-    if (bytes > 256 * 1024 * 1024) bytes = 256 * 1024 * 1024;
-    void* p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
-                           PAGE_READWRITE);
+// XMemMapPhysicalPagesScatter — ABI measured from the guest, not assumed
+// (build 86). Sole vtable-thunk callers 0x140F2CC3E and 0x140B18DDE:
+//   rcx = page-descriptor array, edx = page count, r8 = second array.
+//   r9 is *not* an argument: it holds leftover register garbage
+//   (0x337E0000 in boot #67, 0xFD660000 in boot #68, 0x282E5310 for r8
+//   was likewise a truncated pointer under the old prototype).
+//   The result is a STATUS, not an address: both callers run
+//   `test eax,eax; jne ok; int3` (0x140F2CC47/0x140F2CC4B and
+//   0x140B18DE3/0x140B18DE7), i.e. zero means failure and trips the
+//   guest's own assert.
+// Desktop has no physical-page pool, so the guest's page descriptors
+// cannot be mapped. Report the documented failure instead of
+// fabricating a mapping.
+extern "C" BOOL HleXMemMapPhysicalPagesScatter(const uint64_t* pPages,
+                                              uint32_t dwPageCount,
+                                              void* pOutArray) {
+    void* caller = _ReturnAddress();
     Log("xmem",
-        "XMemMapPhysicalPagesScatter(pages %p, count %u, attrs 0x%x, "
-        "protect 0x%x) -> %p (%llu bytes, ordinary memory)",
-        (const void*)pPhysicalPages, dwPageCount, dwMemoryAttributes,
-        flProtect, p, (unsigned long long)bytes);
-    return p;
+        "XMemMapPhysicalPagesScatter(pages %p, count %u, out %p) from %p "
+        "-> FALSE (no physical-page pool; mapping not fabricated)",
+        (const void*)pPages, dwPageCount, pOutArray, caller);
+    return FALSE;
 }
 
 // XMemTransferMemory — memcpy. First three args are (dst, src, size);
@@ -5087,8 +5092,9 @@ static const Export kExports[] = {
      "mapped VA (guarded size)."},
     {"xmem.dll", "XMemMapPhysicalPagesScatter", Status::kImplemented,
      (void*)HleXMemMapPhysicalPagesScatter,
-     "IMPLEMENTED (real-exe). Ordinary committed memory returned as the "
-     "mapped VA (guarded size)."},
+     "IMPLEMENTED (real-exe). Measured ABI: (pages, count, out), status "
+     "return. FALSE — no desktop physical-page pool; mapping is not "
+     "fabricated."},
     {"xmem.dll", "XMemTransferMemory", Status::kImplemented,
      (void*)HleXMemTransferMemory,
      "IMPLEMENTED (real-exe). memcpy(dst, src, size)."},
