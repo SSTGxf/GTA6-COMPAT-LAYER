@@ -196,9 +196,9 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-24 (boots through #89, GitHub head `ae46626`)
+## Status — 2026-11-24 (boots through #97, GitHub head `9686f0d`)
 
-**Progress: ~42% proven toward first menu, 45% when D1 closes (slots 4/6 done, overrun cause proven — hash gate remains; boots #87–#89 past slot 108, new blocker: DXGI_ERROR_DEVICE_REMOVED on CreatePlacedResourceX).**
+**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, boots through #97 to a new furthest point; hash gate + memcpy overrun remain open).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -221,15 +221,16 @@ subsystem, not a dead harness.
 | Log rotation + caps | ✅ | Boots #80–#81, per-boot logs |
 | Slot 4 = EnqueueStatus (completion-object binding) | ✅ | Boot #83, bound fiDeviceDirectStorage as completion object (index=0) ×5 |
 | Layout 261 (0x105) as 4 KiB-tile layout | ✅ | Boot #86, path=tiled status=SUCCESS size=4096 align=4096 |
-| CreatePlacedResourceX without device removal | ❌ | Boots #88/#89 return DXGI_ERROR_DEVICE_REMOVED (0x887a0005) |
+| TEXTURE1D in texture computer | ✅ | Boot #97, dim 2 256x1 fmt 29 → supported, copy S_OK |
+| CreatePlacedResourceX without device removal | ✅ | Boot #96: no device removal after slot 17 rounds CBV size up to 256 (commit 2ffcb48) |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
-| Shader capture / translation | ❌ | Not started |
+| Shader capture / translation | ❌ | Phases 0–3 infrastructure built + harness-green (capture 128/128, DXIL backend 35/35, classifier 837/837); no corpus yet, no game shader translated |
 | First frame / menu on screen | ❌ | 0 presents (boot #78 segment) |
 | BCPack decode | ❌ | B1 spec written, not implemented |
 | Mesh-as-compute | ❌ | CPU-only prototype |
 
-Full per-function status: `docs/STATUS.md` (current state at the top, boots through #89).
+Full per-function status: `docs/STATUS.md` (current state at the top, boots through #97).
 
 **What works now (verified on the build machine, all eight harness guests
 ALL PASS):**
