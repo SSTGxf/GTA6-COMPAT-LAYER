@@ -293,16 +293,45 @@ older per-boot notes (`docs/BOOT6*.md`); they are not build inputs, so they
 are excluded by pattern in `.gitignore` and left on disk untouched rather
 than committed or deleted.
 
-Green gate **at the final HEAD `82f9980`** (not an ancestor), both trees,
-pre-build identity check PASS over all 64 tracked `src include defs tests
-build.bat` files:
+### PR #2 clobber, recovered
+
+A previous pass synced `F:\ScarlettCompat` from this repository and thereby
+removed the merged PR #2 work that only existed upstream: the
+`ScarlettNoopThreadInit` TLS probe in `src/pe_loader.cpp`, and the
+`SCARLETT_LOG_PATH` routing in `src/hle_registry.cpp` and `src/verify.cpp`.
+That is the same clobber that had already happened twice. Recovery used the
+remote rather than a local copy:
 
 ```
-HEAD=82f9980                pre_build_identity=PASS files=64     (local)
-F_HEAD_SOURCES=82f9980      F_pre_build_identity=PASS            (F:)
+$ git fetch origin main      -> cac446d..d3022e9  main -> origin/main
+$ git show origin/main:src/pe_loader.cpp   | grep -c ScarlettNoopThreadInit -> 3
+$ git show origin/main:src/hle_registry.cpp| grep -c SCARLETT_LOG_PATH      -> 1
+$ git show origin/main:src/verify.cpp      | grep -c SCARLETT_LOG_PATH      -> 1
+$ git checkout origin/main -- build.bat src/pe_loader.cpp \
+      src/hle_registry.cpp src/verify.cpp .gitignore
+```
+
+`origin/main` already contains the `IDStorageFactory` slot-10 refusal, so the
+take is additive: only the probes and the both-paths `vcvarsall` block
+change. `build.bat` from upstream still compiles `src/xg_texture.cpp`.
+Post-recovery source check, both trees:
+`pe_loader noop=3`, `hle_registry logpath=1`, `verify logpath=1`,
+`refusal_intact=2`. The three per-boot notes (`docs/BOOT60-XG-BUILD80.md`,
+`BOOT61-DIAGNOSIS.md`, `BOOT62-DIAGNOSIS.md`) are tracked upstream, so they
+are added to the commit rather than ignored; only the local boot drivers
+(`build_ga*.bat`, `run_boot_ga*.bat`, `build_dump_read2.bat`) stay ignored.
+
+### Green gate at HEAD `81564c6`
+
+Both trees, rebuilt **with the probes present**, pre-build identity check
+PASS over all 64 tracked `src include defs tests build.bat` files:
+
+```
+HEAD=81564c6                pre_build_identity=PASS files=64     (local)
+F_HEAD_SOURCES=81564c6      F_pre_build_identity=PASS            (F:)
 local  build.bat -> exit 0   era stages: 21/21 pass   ft stages: 7/7 pass   verify exit code: 0
 F:     build.bat -> exit 0   era stages: 21/21 pass   ft stages: 7/7 pass   verify exit code: 0
-ft on F: x2 -> PASS 0.251 s / 12 steps (7/7), PASS 0.251 s / 12 steps (7/7)
+ft on F: x2 -> PASS 0.252 s / 12 steps (7/7), PASS 0.251 s / 12 steps (7/7)
 ```
 
 After the gate, at that HEAD:
