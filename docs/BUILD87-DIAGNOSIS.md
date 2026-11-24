@@ -263,6 +263,56 @@ accept the guest's `int3` as the refusal point). The dead texture-computer
 slot-10 experiment was removed again; `src/xg_texture.cpp` matches the
 state the green builds were produced from.
 
+## Build inputs, HEAD equality and the final commit (HEAD `439b257`)
+
+Enumerated from `build.bat` itself (every `%ROOT%` path it passes to `cl`,
+`lib` or `/link`), then followed through every in-repo `#include "…"`:
+**48 build inputs** — 21 `src/*.cpp|.h`, 18 `include/*.h`, 8 `tests/*.cpp`,
+1 `defs/*.def`. For each, `git hash-object <path>` equals
+`git rev-parse HEAD:<path>`:
+
+```
+build_inputs=48
+by_dir={'defs': 1, 'include': 18, 'src': 21, 'tests': 8}
+all_equal=True checked=48
+$ git status --porcelain     -> (empty)
+```
+
+That is the evidence the previous note lacked. The `M` entries it explained
+away were **line endings, not content**: `git diff --ignore-cr-at-eol` was
+empty and the fix was to restore the files from HEAD (`git checkout -- .`),
+not to commit a renormalisation. One file did carry real content drift:
+**`build.bat`**, whose working copy passed `src\xg_texture.cpp` to `cl`
+while the HEAD blob did not — so a checkout of the old HEAD could not
+produce the green binaries even though the source was tracked. That
+one-line difference (saved as
+`D:\scarlett-dumps\buildbat-xg_texture-20261124.patch`) was committed.
+The remaining untracked entries were prior-campaign boot drivers
+(`build_ga*.bat`, `run_boot_ga*.bat`, `build_dump_read2.bat`) and three
+older per-boot notes (`docs/BOOT6*.md`); they are not build inputs, so they
+are excluded by pattern in `.gitignore` and left on disk untouched rather
+than committed or deleted.
+
+Green gate from HEAD `439b257`, both trees, pre-build identity check
+`identical=yes` over `src include defs tests build.bat`:
+
+```
+local  build.bat -> 0   era 21/21   ft 7/7   verify 0
+F:     build.bat -> 0   era 21/21   ft 7/7   verify 0
+ft on F: x2 -> PASS 0.251 s / 12 steps, PASS 0.251 s / 12 steps
+```
+
+Commits (local only, not pushed): `8c3103e` scoped `IDStorageFactory`
+slot-10 refusal + note + boot script; `934017b` `src/xg_texture.cpp`;
+`cef5c2a` note update; `38c8c7b` `include/xg_texture.h` + note;
+`a0029f4` `build.bat` (compile the tracked source); `439b257` `.gitignore`
+(local scratch only). No dump, log, binary or extra boot script is in any
+of them.
+
+Still true and not claimed otherwise: the guest stops at its own `int3` at
+`0x1428c95ce` rather than faulting on the null it was told was valid, and
+the streaming path does not complete.
+
 ## Commit contents and the `src/xg_texture.cpp` tracked-ness question
 
 `src/xg_texture.cpp` participates in the build (`build.bat` line 25 passes
