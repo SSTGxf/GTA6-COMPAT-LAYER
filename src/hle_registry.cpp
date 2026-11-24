@@ -14,6 +14,7 @@
 #include <dxgi.h>  // IDXGIDevice / IDXGIAdapter (device QI forwarding)
 #include <string.h>
 #include <vector>
+#include <utility>   // std::index_sequence (per-slot unimplemented stubs, build 82)
 #include <intrin.h>  // _ReturnAddress (COM wrapper unimplemented-slot log)
 
 namespace sc {
@@ -22,24 +23,64 @@ namespace {
 
 // ---- logging ----
 
-void WriteLogLine(const char* line) {
-    fputs(line, stderr);
-    fputc('\n', stderr);
-    FILE* f = nullptr;
+// Build 88: logging must not charge the guest for disk I/O. The old
+// writer did an unbuffered fputs(stderr) plus fopen/fputs/fclose of
+// scarlett.log on *every* line, which costs 10-15 ms under disk load.
+// ScheduleFrameEventX stamps the frame QPC before logging, so that cost
+// landed inside the guest's frame period and made a 50 ms sleep measure
+// 64.5 ms (ft_hook: 15 steps instead of 12). stderr and the file are now
+// buffered and flushed on a 200 ms cadence, and ScLogFlush() is called
+// from the crash path before the minidump so nothing is lost on a fault.
+static FILE* g_logFile = nullptr;
+static bool g_logInit = false;
+static ULONGLONG g_lastLogFlush = 0;
+
+static void EnsureLogInit() {
+    if (g_logInit) return;
+    g_logInit = true;
+    static char errBuf[1 << 20];
+    setvbuf(stderr, errBuf, _IOFBF, sizeof(errBuf));
     wchar_t logPath[MAX_PATH] = {};
     DWORD logPathLen = GetEnvironmentVariableW(
         L"SCARLETT_LOG_PATH", logPath, MAX_PATH);
     int openResult = (logPathLen > 0 && logPathLen < MAX_PATH)
-                         ? _wfopen_s(&f, logPath, L"a")
-                         : fopen_s(&f, "scarlett.log", "a");
-    if (openResult == 0 && f) {
-        fputs(line, f);
-        fputc('\n', f);
-        fclose(f);
+                         ? _wfopen_s(&g_logFile, logPath, L"a")
+                         : fopen_s(&g_logFile, "scarlett.log", "a");
+    if (openResult == 0 && g_logFile) {
+        static char fileBuf[1 << 20];
+        setvbuf(g_logFile, fileBuf, _IOFBF, sizeof(fileBuf));
+    } else {
+        g_logFile = nullptr;
+    }
+    g_lastLogFlush = GetTickCount64();
+}
+
+void WriteLogLine(const char* line) {
+    EnsureLogInit();
+    fputs(line, stderr);
+    fputc('\n', stderr);
+    if (g_logFile) {
+        fputs(line, g_logFile);
+        fputc('\n', g_logFile);
+    }
+    ULONGLONG now = GetTickCount64();
+    if (now - g_lastLogFlush >= 200) {
+        fflush(stderr);
+        if (g_logFile) fflush(g_logFile);
+        g_lastLogFlush = now;
     }
 }
 
 }  // namespace
+
+// Flush every buffered log line. Called from the crash path (before the
+// minidump is written) and at process exit, so buffering never loses the
+// lines that matter.
+void ScLogFlush() {
+    fflush(stderr);
+    if (g_logFile) fflush(g_logFile);
+    g_lastLogFlush = GetTickCount64();
+}
 
 void Log(const char* subsystem, const char* fmt, ...) {
     char body[1024];
@@ -200,10 +241,13 @@ extern "C" HRESULT HleXMemAllocatePhysicalPages(void) {
     return (HRESULT)1;
 }
 
+static void ScatterUnmapAll();
+
 extern "C" HRESULT HleXMemFreePhysicalPages(void) {
     Log("xmem",
-        "XMemFreePhysicalPages() -> S_OK (STUB: no desktop "
-        "physical-page pool)");
+        "XMemFreePhysicalPages() -> S_OK (releases tracked scatter "
+        "reservations; no desktop physical-page pool is emulated)");
+    ScatterUnmapAll();
     return S_OK;
 }
 
@@ -230,23 +274,143 @@ extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
     return p;
 }
 
-extern "C" void* HleXMemMapPhysicalPagesScatter(
-    const uint64_t* pPhysicalPages, uint32_t dwPageCount,
-    DWORD dwMemoryAttributes, DWORD flProtect) {
-    // Same guarded ordinary-memory mapping as XMemMapPhysicalPages
-    // (scatter layout is GDKX-gated; the VA returned is one contiguous
-    // block the game can write to).
-    SIZE_T bytes = (SIZE_T)dwPageCount * 4096;
-    if (bytes < 64 * 1024) bytes = 64 * 1024;
-    if (bytes > 256 * 1024 * 1024) bytes = 256 * 1024 * 1024;
-    void* p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
-                           PAGE_READWRITE);
+// XMemMapPhysicalPagesScatter — ABI measured from the guest, not assumed
+// (build 86). Sole vtable-thunk callers 0x140F2CC3E and 0x140B18DDE:
+//   rcx = page-descriptor array, edx = page count, r8 = second array.
+//   r9 is *not* an argument (leftover register garbage).
+//   The result is a STATUS: both callers run `test eax,eax; jne ok; int3`
+//   (0x140F2CC47/0x140F2CC4B and 0x140B18DE3/0x140B18DE7).
+//
+// Build 87 semantics — read off the guest, not guessed:
+//   * The descriptor array dumped at 0x140F2CC38 holds 64 KB-strided,
+//     4 KB-aligned addresses (0x27174480000, +0x10000, ...), i.e. the
+//     guest is asking for one page at each supplied address — the
+//     "scatter" layout (6720 pages spread over a 440 MB span).
+//   * The second array is zero-filled scratch: after the call the guest
+//     only frees it (0x140F2CCD8 -> 0x144D9C130) and never reads it, so
+//     per-page results are written there but nothing depends on them.
+//   * There is no layer-side pool to draw from: the mapping is performed
+//     at the guest's own addresses (reserve the span if free, commit one
+//     page at each descriptor) and the reservation is tracked so it is
+//     released exactly once.
+struct ScatterReservation {
+    void* base;
+    SIZE_T span;
+    uint32_t pages;
+    bool owned;  // true when this layer reserved the span
+};
+static ScatterReservation g_scatterMaps[8];
+static int g_scatterMapCount = 0;
+
+static void ScatterUnmapAll() {
+    for (int i = 0; i < g_scatterMapCount; ++i) {
+        ScatterReservation& r = g_scatterMaps[i];
+        if (!r.base) continue;
+        if (r.owned) {
+            BOOL ok = VirtualFree(r.base, 0, MEM_RELEASE);
+            Log("xmem",
+                "XMemMapPhysicalPagesScatter: released reservation "
+                "%p span %llu (%u pages) ok=%d",
+                r.base, (unsigned long long)r.span, r.pages, (int)ok);
+        } else {
+            Log("xmem",
+                "XMemMapPhysicalPagesScatter: reservation %p span %llu "
+                "(%u pages) belongs to the layer arena; not released",
+                r.base, (unsigned long long)r.span, r.pages);
+        }
+        r.base = nullptr;
+        r.span = 0;
+        r.pages = 0;
+    }
+    g_scatterMapCount = 0;
+}
+
+extern "C" BOOL HleXMemMapPhysicalPagesScatter(const uint64_t* pPages,
+                                              uint32_t dwPageCount,
+                                              void* pOutArray) {
+    void* caller = _ReturnAddress();
+    if (!pPages || dwPageCount == 0) {
+        Log("xmem",
+            "XMemMapPhysicalPagesScatter(pages %p, count %u, out %p) from "
+            "%p -> FALSE (no descriptors)",
+            (const void*)pPages, dwPageCount, pOutArray, caller);
+        return FALSE;
+    }
+
+    uint64_t first = pPages[0];
+    uint64_t second = dwPageCount > 1 ? pPages[1] : 0;
+    uint64_t last = pPages[dwPageCount - 1];
+    uint64_t out0 = pOutArray ? ((const uint64_t*)pOutArray)[0] : 0;
     Log("xmem",
-        "XMemMapPhysicalPagesScatter(pages %p, count %u, attrs 0x%x, "
-        "protect 0x%x) -> %p (%llu bytes, ordinary memory)",
-        (const void*)pPhysicalPages, dwPageCount, dwMemoryAttributes,
-        flProtect, p, (unsigned long long)bytes);
-    return p;
+        "XMemMapPhysicalPagesScatter(pages %p, count %u, out %p) from "
+        "%p: d[0]=0x%llx d[1]=0x%llx d[%u]=0x%llx out[0]=0x%llx",
+        (const void*)pPages, dwPageCount, pOutArray, caller,
+        (unsigned long long)first, (unsigned long long)second,
+        dwPageCount - 1, (unsigned long long)last,
+        (unsigned long long)out0);
+
+    // The mapping target is the guest's own address list. Reserve the
+    // span only if it is still free; a span the layer arena already
+    // reserved is committed page by page and left to its owner.
+    SIZE_T span = (SIZE_T)(last - first) + 0x1000;
+    void* base = (void*)(uintptr_t)first;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    VirtualQuery(base, &mbi, sizeof(mbi));
+    bool owned = false;
+    if (mbi.State == MEM_FREE) {
+        if (!VirtualAlloc(base, span, MEM_RESERVE, PAGE_NOACCESS)) {
+            Log("xmem",
+                "XMemMapPhysicalPagesScatter: reserve %p span %llu failed "
+                "err=%lu -> FALSE",
+                base, (unsigned long long)span, GetLastError());
+            return FALSE;
+        }
+        owned = true;
+    }
+    Log("xmem",
+        "XMemMapPhysicalPagesScatter: target %p span %llu state=%lx "
+        "type=%lx allocBase=%p reservedByLayer=%d",
+        base, (unsigned long long)span, (unsigned long)mbi.State,
+        (unsigned long)mbi.Type, mbi.AllocationBase, (int)owned);
+
+    uint64_t* out = (uint64_t*)pOutArray;
+    uint32_t mapped = 0, failed = 0;
+    for (uint32_t i = 0; i < dwPageCount; ++i) {
+        void* va = (void*)(uintptr_t)pPages[i];
+        void* p = VirtualAlloc(va, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+        if (p) {
+            ++mapped;
+            if (out) out[i] = (uint64_t)(uintptr_t)p;
+        } else {
+            ++failed;
+            if (out) out[i] = 0;
+            if (failed <= 4) {
+                Log("xmem",
+                    "XMemMapPhysicalPagesScatter: commit [%u] %p failed "
+                    "err=%lu",
+                    i, va, GetLastError());
+            }
+        }
+    }
+    Log("xmem",
+        "XMemMapPhysicalPagesScatter: mapped %u/%u pages, out[0]=0x%llx "
+        "out[last]=0x%llx",
+        mapped, dwPageCount,
+        (unsigned long long)(out ? out[0] : 0),
+        (unsigned long long)(out ? out[dwPageCount - 1] : 0));
+
+    if (failed != 0) {
+        Log("xmem",
+            "XMemMapPhysicalPagesScatter: %u page(s) could not be committed "
+            "-> FALSE (no partial success reported)",
+            failed);
+        return FALSE;
+    }
+    if (g_scatterMapCount < 8) {
+        g_scatterMaps[g_scatterMapCount++] =
+            ScatterReservation{base, span, dwPageCount, owned};
+    }
+    return TRUE;
 }
 
 // XMemTransferMemory — memcpy. First three args are (dst, src, size);
@@ -572,21 +736,37 @@ static ULONG WINAPI XboxDevice_Release(XboxDeviceWrapper* self) {
     return (ULONG)rc;
 }
 
-// Generic stub for Xbox device slots not yet implemented. Logs the
-// caller's return address so the game call site (and the slot, from
-// the `call [rax+N]` offset at that site) can be identified. Returns
-// E_NOTIMPL. NOTE: this is only correct for HRESULT-returning
-// methods; a pointer/struct-returning method that hits this stub will
-// get a bogus value — but the log line names the site, so the slot
-// can then be implemented properly.
-static HRESULT WINAPI XboxDevice_Unimplemented(XboxDeviceWrapper* self) {
+// Build 82: per-slot stub for Xbox device slots not yet implemented.
+// Before this, every unimplemented slot shared one function that could
+// only log the caller, so identifying the method meant disassembling the
+// call site by hand — and an indirect call through a saved vtable pointer
+// left even that ambiguous. Each slot now has its own instantiation, so
+// the log names the slot and its vtable byte offset outright, together
+// with the register arguments. That is what makes "which missing slot is
+// supposed to produce this object" answerable from a boot log.
+//
+// NOTE: still only correct for HRESULT-returning methods; a pointer or
+// struct-returning method that lands here gets E_NOTIMPL as its "pointer".
+// The log line is what makes the slot identifiable, then implementable.
+template <int Slot>
+static HRESULT WINAPI XboxDevice_SlotUnimplemented(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
     (void)self;
-    void* retAddr = _ReturnAddress();
-    Log("xboxdev",
-        "UNIMPLEMENTED Xbox device slot called from game %p -> "
-        "E_NOTIMPL (identify the slot from the call site, then "
-        "implement it)",
-        retAddr);
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    // First few calls in full (that is where a missing output object shows
+    // up), then a periodic reminder so a hot slot cannot drown the log.
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "UNIMPLEMENTED slot %d (vtable +0x%x) from game %p args=%llx %llx "
+            "%llx %llx %llx %llx (call #%ld) bk=%llx -> E_NOTIMPL",
+            Slot, Slot * 8, _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n,
+            ScWatchRecordBackend());
+    }
     return E_NOTIMPL;
 }
 
@@ -2274,12 +2454,23 @@ static HRESULT WINAPI XboxDevice_UnregisterPagePoolX(
     return S_OK;
 }
 
+// Fill the vtable's unimplemented entries with per-slot logging stubs.
+// One pack expansion instantiates all 192 (no recursion depth to worry
+// about), and every entry is a real function — never null.
+template <std::size_t... I>
+static void FillUnimplementedDeviceSlots(std::index_sequence<I...>,
+                                         void** vt) {
+    void* stubs[] = {(void*)&XboxDevice_SlotUnimplemented<(int)I>...,
+                     nullptr};
+    for (std::size_t i = 0; i < sizeof...(I); ++i) vt[i] = stubs[i];
+}
+
 // Build the 192-slot Xbox device vtable once. Unimplemented slots get
 // the logging stub; known slots get their handlers.
 static void InitXboxDeviceVtable() {
     if (g_xboxDeviceVtableInit) return;
-    for (int i = 0; i < 192; ++i)
-        g_xboxDeviceVtable[i] = (void*)XboxDevice_Unimplemented;
+    FillUnimplementedDeviceSlots(std::make_index_sequence<192>{},
+                                 g_xboxDeviceVtable);
     g_xboxDeviceVtable[0] = (void*)XboxDevice_QueryInterface;
     g_xboxDeviceVtable[1] = (void*)XboxDevice_AddRef;
     g_xboxDeviceVtable[2] = (void*)XboxDevice_Release;
@@ -3438,6 +3629,40 @@ extern "C" ULONG StubComRelease(void* self) {
     return (ULONG)r;
 }
 extern "C" HRESULT StubComGeneric() { return S_OK; }
+
+// Build 90: scoped refusal for one interface/slot only.
+//
+// The streaming record constructor (0x1428C9460) asks the interface cached
+// at guest global 0x1478F5E78 for the submission backend it stores at
+// record[+0x18]:
+//
+//   0x1428c95a6  add r9,0x18                 ; out = &record[+0x18]
+//   0x1428c95ad  mov rcx,[0x1478F5E78]       ; cached interface
+//   0x1428c95c7  call qword ptr [rax+0x50]   ; slot 10
+//   0x1428c95ca  test eax,eax / jns / int3   ; guest asserts on failure
+//
+// Boot #71 identifies that cached object as the layer's fake
+// IDStorageFactory stub (0x2ED7626C1E0, log line 209). StubComGeneric
+// answered S_OK and wrote nothing, so the guest stored a null it had been
+// told was a valid queue and later faulted on it at 0x1428C9A08.
+//
+// The layer has no DStorage queue contract to implement (the guest only
+// ever calls slot 10 once, then slots 3 and 8 on the result), so this
+// interface/slot now refuses explicitly. The override is per-interface:
+// the factory gets its own vtable and every other stub-backed interface
+// (IGameInput, XAudio2, ...) keeps StubComGeneric's S_OK behaviour.
+static void* g_stubComVtableStorageFactory[64];
+
+extern "C" HRESULT StubStorageFactorySlot10(void* self, void* desc,
+                                            void* iid, void** out) {
+    Log("stub",
+        "IDStorageFactory slot 10 (create upload backend) this=%p desc=%p "
+        "iid=%p out=%p return-to=%p -> E_NOTIMPL (no DStorage queue "
+        "contract in the layer; refused instead of faking success)",
+        self, desc, iid, (void*)out, _ReturnAddress());
+    return E_NOTIMPL;
+}
+
 struct StubComVtableInit {
     StubComVtableInit() {
         g_stubComVtable[0] = (void*)StubComQueryInterface;
@@ -3445,6 +3670,10 @@ struct StubComVtableInit {
         g_stubComVtable[2] = (void*)StubComRelease;
         for (int i = 3; i < 64; ++i)
             g_stubComVtable[i] = (void*)StubComGeneric;
+        for (int i = 0; i < 64; ++i)
+            g_stubComVtableStorageFactory[i] = g_stubComVtable[i];
+        g_stubComVtableStorageFactory[10] =
+            (void*)StubStorageFactorySlot10;
     }
 };
 static StubComVtableInit g_stubComVtableInit;
@@ -3452,9 +3681,12 @@ static void* MakeStubComObject(const char* tag) {
     StubComObject* obj = (StubComObject*)HeapAlloc(
         GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(StubComObject));
     if (!obj) return nullptr;
-    obj->vtable = g_stubComVtable;
+    obj->vtable = (strcmp(tag, "IDStorageFactory") == 0)
+                      ? g_stubComVtableStorageFactory
+                      : g_stubComVtable;
     obj->ref = 1;
-    Log("stub", "%s stub COM object %p", tag, (void*)obj);
+    Log("stub", "%s stub COM object %p (vtable %p)", tag, (void*)obj,
+        (void*)obj->vtable);
     return (void*)obj;
 }
 
@@ -3655,7 +3887,74 @@ extern "C" HRESULT HleSetFrameIntervalX(UINT32 interval, UINT32 flags) {
     // routinely; the resolution is process-wide.
     static bool timerResRaised = false;
     if (!timerResRaised) {
-        if (timeBeginPeriod(1) == TIMERR_NOERROR) timerResRaised = true;
+        // Build 88: a background/eco-throttled process has its timer
+        // resolution requests ignored by Windows (timeBeginPeriod(1)
+        // returns 0 but Sleep still rounds to 15.625 ms), which made
+        // every guest frame 62.5 ms instead of 50 ms. Opt this process
+        // out of execution-speed power throttling before raising the
+        // resolution.
+#ifdef PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        PROCESS_POWER_THROTTLING_STATE pts = {};
+        pts.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        // EXECUTION_SPEED and IGNORE_TIMER_RESOLUTION both off: Windows
+        // applies the latter to background processes, which is why
+        // NtSetTimerResolution reported "granted 15.625 ms" here while a
+        // normal process gets 0.5 ms.
+        pts.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | 0x4;
+        pts.StateMask = 0;  // 0 = throttling off
+        BOOL pt = SetProcessInformation(GetCurrentProcess(),
+                                        ProcessPowerThrottling, &pts,
+                                        sizeof(pts));
+        Log("present", "power throttling off -> ok=%d err=%lu", (int)pt,
+            (unsigned long)(pt ? 0 : GetLastError()));
+#endif
+        // Call through winmm's export table rather than the linked
+        // import: the loader rewrites imports in this process, and a
+        // rewritten timeBeginPeriod would return success without ever
+        // reaching the OS.
+        typedef UINT(WINAPI * PfnTimeBeginPeriod)(UINT);
+        HMODULE winmm = LoadLibraryA("winmm.dll");
+        PfnTimeBeginPeriod beginPeriod =
+            winmm ? (PfnTimeBeginPeriod)(void*)GetProcAddress(
+                        winmm, "timeBeginPeriod")
+                  : nullptr;
+        UINT rc = beginPeriod ? beginPeriod(1) : 0xFFFFFFFFu;
+        Log("present",
+            "timeBeginPeriod(1) via %s -> %u (0 = raised to 1 ms)",
+            beginPeriod ? "GetProcAddress" : "unavailable", (unsigned)rc);
+        // Build 88 probe: read back the timer resolution the process
+        // actually has (100 ns units; 156250 = 15.625 ms tick).
+        typedef LONG(NTAPI * PfnQueryTimerRes)(ULONG*, ULONG*, ULONG*);
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        PfnQueryTimerRes q = ntdll ? (PfnQueryTimerRes)(void*)GetProcAddress(
+                                         ntdll, "NtQueryTimerResolution")
+                                   : nullptr;
+        // The Win32 wrapper can be a no-op in this process; the native
+        // call is the mechanism underneath. 5000 = 0.5 ms in 100 ns
+        // units (the finest the platform offers).
+        typedef LONG(NTAPI * PfnSetTimerRes)(ULONG, BOOLEAN, PULONG);
+        HMODULE nt2 = GetModuleHandleA("ntdll.dll");
+        PfnSetTimerRes setRes =
+            nt2 ? (PfnSetTimerRes)(void*)GetProcAddress(
+                      nt2, "NtSetTimerResolution")
+                : nullptr;
+        if (setRes) {
+            ULONG want = 5000, got = 0;
+            LONG s2 = setRes(want, TRUE, &got);
+            Log("present",
+                "NtSetTimerResolution(5000) -> 0x%lx, granted %lu (%.3f ms)",
+                (long)s2, (unsigned long)got, (double)got / 10000.0);
+        }
+        if (q) {
+            ULONG mn = 0, mx = 0, cur = 0;
+            LONG st = q(&mn, &mx, &cur);
+            Log("present",
+                "timer resolution now: status 0x%lx coarse %.3f ms fine "
+                "%.3f ms current %.3f ms",
+                (long)st, (double)mn / 10000.0, (double)mx / 10000.0,
+                (double)cur / 10000.0);
+        }
+        if (rc == TIMERR_NOERROR) timerResRaised = true;
     }
     Log("present",
         "SetFrameIntervalX(%u, 0x%x) -> S_OK (real pacing: %.1f ms/frame)",
@@ -3667,8 +3966,26 @@ extern "C" HRESULT HleScheduleFrameEventX(UINT64 frameId) {
     g_lastFrameId = frameId;
     QueryPerformanceCounter(&g_lastFrameQpc);
     g_haveFrame = true;
+    // Build 88 probe: the frame QPC is stamped here, so any time this
+    // function spends after the stamp is charged to the guest's frame.
+    // Track the worst schedule cost and report it every 32 frames.
+    LARGE_INTEGER freq, after;
+    QueryPerformanceFrequency(&freq);
     Log("present", "ScheduleFrameEventX(%llu) -> S_OK", 
         (unsigned long long)frameId);
+    QueryPerformanceCounter(&after);
+    {
+        static double maxMs = 0.0;
+        static unsigned calls = 0;
+        double ms = (double)(after.QuadPart - g_lastFrameQpc.QuadPart) *
+                    1000.0 / (double)freq.QuadPart;
+        if (ms > maxMs) maxMs = ms;
+        if (++calls % 32 == 0) {
+            Log("present",
+                "ScheduleFrameEventX post-stamp cost: last %.2f ms, "
+                "max %.2f ms over %u frames", ms, maxMs, calls);
+        }
+    }
     return S_OK;
 }
 
@@ -5065,8 +5382,9 @@ static const Export kExports[] = {
      "mapped VA (guarded size)."},
     {"xmem.dll", "XMemMapPhysicalPagesScatter", Status::kImplemented,
      (void*)HleXMemMapPhysicalPagesScatter,
-     "IMPLEMENTED (real-exe). Ordinary committed memory returned as the "
-     "mapped VA (guarded size)."},
+     "IMPLEMENTED (real-exe). Measured ABI: (pages, count, out), status "
+     "return. Maps one page at each guest-supplied address, tracked so "
+     "the reservation is released once."},
     {"xmem.dll", "XMemTransferMemory", Status::kImplemented,
      (void*)HleXMemTransferMemory,
      "IMPLEMENTED (real-exe). memcpy(dst, src, size)."},

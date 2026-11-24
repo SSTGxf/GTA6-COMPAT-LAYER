@@ -59,6 +59,10 @@ extern "C" void HleXMemFreeDefault(void* p);
 extern "C" void* HleXMemVirtualAlloc(void* lpAddress, SIZE_T dwSize,
                                      DWORD flAllocationType, DWORD flProtect,
                                      DWORD dwMemoryAttributes);
+// Buffered logger flush (build 88): called from the crash path so the
+// lines written before a fault are on disk before the minidump.
+void ScLogFlush();
+
 extern "C" HRESULT HleXMemGetWorkingSetStatistics(void* pStats);
 extern "C" BOOL HleXMemIsToolsMemAvailable(void);
 extern "C" HRESULT HleXMemAllocatePhysicalPages(void);
@@ -67,10 +71,9 @@ extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
                                          uint32_t dwPageCount,
                                          DWORD dwMemoryAttributes,
                                          DWORD flProtect);
-extern "C" void* HleXMemMapPhysicalPagesScatter(const uint64_t* pPhysicalPages,
-                                                uint32_t dwPageCount,
-                                                DWORD dwMemoryAttributes,
-                                                DWORD flProtect);
+extern "C" BOOL HleXMemMapPhysicalPagesScatter(const uint64_t* pPages,
+                                               uint32_t dwPageCount,
+                                               void* pOutArray);
 extern "C" void HleXMemTransferMemory(void* pDst, const void* pSrc,
                                       SIZE_T cbSize);
 extern "C" HRESULT HleXAudio2Create(void** ppXAudio2, UINT32 flags, DWORD proc);

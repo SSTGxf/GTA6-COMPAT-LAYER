@@ -60,12 +60,10 @@ SC_API void* XMemMapPhysicalPages(const uint64_t* pPhysicalPages,
     return HleXMemMapPhysicalPages(pPhysicalPages, dwPageCount,
                                    dwMemoryAttributes, flProtect);
 }
-SC_API void* XMemMapPhysicalPagesScatter(const uint64_t* pPhysicalPages,
-                                         uint32_t dwPageCount,
-                                         DWORD dwMemoryAttributes,
-                                         DWORD flProtect) {
-    return HleXMemMapPhysicalPagesScatter(pPhysicalPages, dwPageCount,
-                                          dwMemoryAttributes, flProtect);
+SC_API BOOL XMemMapPhysicalPagesScatter(const uint64_t* pPages,
+                                       uint32_t dwPageCount,
+                                       void* pOutArray) {
+    return HleXMemMapPhysicalPagesScatter(pPages, dwPageCount, pOutArray);
 }
 SC_API void XMemTransferMemory(void* pDst, const void* pSrc, SIZE_T cbSize) {
     HleXMemTransferMemory(pDst, pSrc, cbSize);
