@@ -192,7 +192,54 @@ believes it created a queue, stores the returned null, and later submits
 through it at `0x1428C9A08` — the null dereference is directly caused by
 that false success.
 
-### Why no fix is landed here (needs a decision)
+### The landed fix: a scoped, honest refusal at that one site
+
+The stub layer now gives the `IDStorageFactory` object its **own vtable**
+(`g_stubComVtableStorageFactory`, a copy of the shared one with slot 10
+replaced). Slot 10 logs the call and returns `E_NOTIMPL` without touching
+the out-parameter. Every other stub-backed interface (`IGameInput`,
+`XAudio2`, everything else on `g_stubComVtable`) keeps `StubComGeneric`'s
+behaviour untouched — this is a per-interface override, not a change of
+the default. The factory object itself stays a valid non-null pointer, as
+the registry note requires.
+
+Boot #73 measures the result (binaries with the override, `BOOT_EXIT=1`):
+
+```
+[stub] IGameInput            stub COM object 000001DB9217D4B0 (vtable 00007FFBCF6A6DB0)
+[stub] IDStorageFactory      stub COM object 000001DB9217BCB0 (vtable 00007FFBCF6A6FB0)
+[stub] IDStorageFactory slot 10 (create upload backend)
+       this=000001DB9217BCB0 desc=0000006F5C9FF960 iid=00000001462FC7F8
+       out=000001E79964AE98 return-to=00000001428C95CA
+       -> E_NOTIMPL (no DStorage queue contract in the layer; refused instead of faking success)
+[loader] veh: exception 0x80000003 at 00000001428C95CE thread 9300
+[loader] ctx-probe: ctx=0x1e79964ae80 owner=0x1478f5e80 sub[+0x18]=0x0 arg8=2 argc=0
+[loader] ctx-probe: fault-kind=sub-object-null
+[loader] guest crashed (veh-breakpoint): exception 0x80000003 at 00000001428C95CE
+```
+
+`out = 0x1E79964AE98` is exactly `ctx + 0x18` (`ctx = 0x1E79964AE80`), so
+the refusal landed on the proven site. The exception is the guest's own
+`int3` at `0x1428c95ce` — the failure branch of the check at
+`0x1428c95ca` — and **there is no `0xc0000005` anywhere in the log**
+(`grep -c 0xc0000005 gta_boot73.log` → 0). The streamer never receives a
+backend it was told was valid.
+
+The only refusal in the whole boot is that one line, and the two stub
+objects carry different vtables (`…6DB0` vs `…6FB0`), which shows the
+override is scoped to this interface. This boot stops before the
+`XMemMapPhysicalPagesScatter` stage, so it has no 6720-page map line; the
+last mapping in it is
+`XMemMapPhysicalPages(pages 000001E8F1AE0000, count 99776, …) -> 000001EA776E0000`.
+
+What this does **not** do: the streaming path does not complete. The
+guest stops at an identified assertion instead of faulting on a null it
+was told was valid. Making it proceed needs a real DStorage queue
+(`IDStorageFactory` slot 10 must return a queue whose slot 3 accepts the
+submit request and whose slot 8 closes it), which is a contract the layer
+does not have.
+
+### Why no real implementation is landed here (needs a decision)
 
 The two compliant routes both need something this repository does not have:
 

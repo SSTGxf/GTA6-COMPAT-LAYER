@@ -3623,6 +3623,40 @@ extern "C" ULONG StubComRelease(void* self) {
     return (ULONG)r;
 }
 extern "C" HRESULT StubComGeneric() { return S_OK; }
+
+// Build 90: scoped refusal for one interface/slot only.
+//
+// The streaming record constructor (0x1428C9460) asks the interface cached
+// at guest global 0x1478F5E78 for the submission backend it stores at
+// record[+0x18]:
+//
+//   0x1428c95a6  add r9,0x18                 ; out = &record[+0x18]
+//   0x1428c95ad  mov rcx,[0x1478F5E78]       ; cached interface
+//   0x1428c95c7  call qword ptr [rax+0x50]   ; slot 10
+//   0x1428c95ca  test eax,eax / jns / int3   ; guest asserts on failure
+//
+// Boot #71 identifies that cached object as the layer's fake
+// IDStorageFactory stub (0x2ED7626C1E0, log line 209). StubComGeneric
+// answered S_OK and wrote nothing, so the guest stored a null it had been
+// told was a valid queue and later faulted on it at 0x1428C9A08.
+//
+// The layer has no DStorage queue contract to implement (the guest only
+// ever calls slot 10 once, then slots 3 and 8 on the result), so this
+// interface/slot now refuses explicitly. The override is per-interface:
+// the factory gets its own vtable and every other stub-backed interface
+// (IGameInput, XAudio2, ...) keeps StubComGeneric's S_OK behaviour.
+static void* g_stubComVtableStorageFactory[64];
+
+extern "C" HRESULT StubStorageFactorySlot10(void* self, void* desc,
+                                            void* iid, void** out) {
+    Log("stub",
+        "IDStorageFactory slot 10 (create upload backend) this=%p desc=%p "
+        "iid=%p out=%p return-to=%p -> E_NOTIMPL (no DStorage queue "
+        "contract in the layer; refused instead of faking success)",
+        self, desc, iid, (void*)out, _ReturnAddress());
+    return E_NOTIMPL;
+}
+
 struct StubComVtableInit {
     StubComVtableInit() {
         g_stubComVtable[0] = (void*)StubComQueryInterface;
@@ -3630,6 +3664,10 @@ struct StubComVtableInit {
         g_stubComVtable[2] = (void*)StubComRelease;
         for (int i = 3; i < 64; ++i)
             g_stubComVtable[i] = (void*)StubComGeneric;
+        for (int i = 0; i < 64; ++i)
+            g_stubComVtableStorageFactory[i] = g_stubComVtable[i];
+        g_stubComVtableStorageFactory[10] =
+            (void*)StubStorageFactorySlot10;
     }
 };
 static StubComVtableInit g_stubComVtableInit;
@@ -3637,9 +3675,12 @@ static void* MakeStubComObject(const char* tag) {
     StubComObject* obj = (StubComObject*)HeapAlloc(
         GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(StubComObject));
     if (!obj) return nullptr;
-    obj->vtable = g_stubComVtable;
+    obj->vtable = (strcmp(tag, "IDStorageFactory") == 0)
+                      ? g_stubComVtableStorageFactory
+                      : g_stubComVtable;
     obj->ref = 1;
-    Log("stub", "%s stub COM object %p", tag, (void*)obj);
+    Log("stub", "%s stub COM object %p (vtable %p)", tag, (void*)obj,
+        (void*)obj->vtable);
     return (void*)obj;
 }
 
