@@ -3844,6 +3844,118 @@ static ScDsQueue* ScDsCreateQueue(const char* why) {
     return q;
 }
 
+// ---- DStorage file/device object (factory slot 5) ----------------------
+//
+// Measured call site (record constructor 0x1428c9517..0x1428c9522):
+//   rcx = factory, rdx = 1, r8 = "fiDeviceDirectStorage", r9 = REFIID,
+//   [rsp+0x20] = &record+0x30  ->  object whose slot 3 the guest calls
+//   later at 0x144f65847 as (this, 0, 0) expecting a boolean.
+// The layer has no pack-file mapping for that device name yet, so this is a
+// real, refcounted, logging object with a real open state — and every read
+// it cannot serve is refused by name rather than faked.
+struct ScDsFile {
+    void** vtable;
+    volatile LONG ref;
+    int open;
+    char name[128];
+};
+
+static void* g_dsFileVtable[64];
+static int g_dsFiles = 0;
+
+extern "C" HRESULT DsfQueryInterface(void* self, void* iid, void** out) {
+    if (!out) return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+extern "C" ULONG DsfAddRef(void* self) {
+    return (ULONG)InterlockedIncrement(&((ScDsFile*)self)->ref);
+}
+extern "C" ULONG DsfRelease(void* self) {
+    ScDsFile* f = (ScDsFile*)self;
+    LONG n = InterlockedDecrement(&f->ref);
+    if (n == 0) {
+        Log("dstorage", "file object %p (%s) destroyed (files=%d)", self,
+            f->name, --g_dsFiles);
+        HeapFree(GetProcessHeap(), 0, f);
+    }
+    return (ULONG)n;
+}
+
+// Measured shape at 0x144f65847: (this, 0, 0) -> boolean.
+//
+// Boot #75 showed the guest polls this in a tight loop while it is FALSE
+// (46 M calls, 4.1 GB of log, F: filled). Logging is therefore capped and
+// the refusal is counted rather than printed per call; the boolean itself
+// is real (the object is not backed by a pack file), so it stays FALSE.
+static LONG g_dsfPolls = 0;
+static LONG g_dsfPollLogs = 0;
+extern "C" BOOL DsfReady(void* self, uint64_t a1, uint64_t a2) {
+    ScDsFile* f = (ScDsFile*)self;
+    const BOOL ok = f->open ? TRUE : FALSE;
+    LONG n = InterlockedIncrement(&g_dsfPolls);
+    if (ok || InterlockedIncrement(&g_dsfPollLogs) <= 16) {
+        Log("dstorage", "file %p (%s) slot3(a=%llx b=%llx) -> %d (poll %ld)",
+            self, f->name, (unsigned long long)a1,
+            (unsigned long long)a2, (int)ok, (long)n);
+    } else if ((n & 0xffff) == 0) {
+        Log("dstorage", "file %p (%s): %ld polls, still refusing (no pack "
+            "mapping for this device)", self, f->name, (long)n);
+    }
+    return ok;
+}
+
+extern "C" HRESULT DsfUnsupported(void* self, uint64_t a1, uint64_t a2,
+                                 uint64_t a3, uint64_t a4) {
+    Log("dstorage",
+        "file %p (%s) unsupported method (%llx %llx %llx %llx) -> E_NOTIMPL",
+        self, ((ScDsFile*)self)->name, (unsigned long long)a1,
+        (unsigned long long)a2, (unsigned long long)a3,
+        (unsigned long long)a4);
+    return E_NOTIMPL;
+}
+
+struct DsFileVtableInit {
+    DsFileVtableInit() {
+        for (int i = 0; i < 64; ++i) g_dsFileVtable[i] = (void*)DsfUnsupported;
+        g_dsFileVtable[0] = (void*)DsfQueryInterface;
+        g_dsFileVtable[1] = (void*)DsfAddRef;
+        g_dsFileVtable[2] = (void*)DsfRelease;
+        g_dsFileVtable[3] = (void*)DsfReady;   // measured 0x144f65847
+    }
+};
+static DsFileVtableInit g_dsFileVtableInit;
+
+// Factory slot 5: measured (this, flags=1, name, iid, void** out).
+extern "C" HRESULT StubStorageFactorySlot5(void* self, uint64_t flags,
+                                           const char* name, void* iid,
+                                           void** out) {
+    Log("dstorage",
+        "IDStorageFactory slot 5 OpenFile this=%p flags=%llu name=%p(%s) "
+        "iid=%p out=%p return-to=%p",
+        self, (unsigned long long)flags, (const void*)name,
+        name ? name : "(null)", iid, (void*)out, _ReturnAddress());
+    if (!out) return E_POINTER;
+    ScDsFile* f = (ScDsFile*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                       sizeof(ScDsFile));
+    if (!f) return E_OUTOFMEMORY;
+    f->vtable = g_dsFileVtable;
+    f->ref = 1;
+    if (name) {
+        strncpy_s(f->name, sizeof(f->name), name, _TRUNCATE);
+    }
+    // The device name is not a filesystem path, so the handle is real but
+    // its backing store is not resolvable yet: reads are refused by name.
+    f->open = 0;
+    ++g_dsFiles;
+    *out = f;
+    Log("dstorage",
+        "  opened file object %p (name=%s, open=%d, files=%d) -> S_OK; "
+        "no pack-file mapping for this device yet",
+        (void*)f, f->name, f->open, g_dsFiles);
+    return S_OK;
+}
+
 extern "C" HRESULT StubStorageFactorySlot10(void* self, void* desc,
                                             void* iid, void** out) {
     Log("dstorage",
@@ -3884,6 +3996,7 @@ struct StubComVtableInit {
             g_stubComVtable[i] = (void*)StubComGeneric;
         for (int i = 0; i < 64; ++i)
             g_stubComVtableStorageFactory[i] = g_stubComVtable[i];
+        g_stubComVtableStorageFactory[5] = (void*)StubStorageFactorySlot5;
         g_stubComVtableStorageFactory[10] =
             (void*)StubStorageFactorySlot10;
     }
