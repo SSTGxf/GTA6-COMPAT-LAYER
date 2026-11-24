@@ -198,8 +198,7 @@ subsystem, not a dead harness.
 
 ## Status — 2026-11-24 (boots through #82, GitHub head `26c12f5`)
 
-**Progress: ~40% proven toward first menu, 45% when D1 closes (slot 6 is Submit and the overrun cause is proven — only the hash gate remains).** (Seth: "not near but from 35% to about 45%.")
-
+**Progress: ~40% proven toward first menu, 45% when D1 closes (slot 6 is Submit and the overrun cause is proven — only the hash gate remains).** 
 | Milestone | Status | Evidence |
 |---|---|---|
 | Loader: real exe, 587/587 imports | ✅ | Boots #1–#2, loader PASS, 0 failed |
