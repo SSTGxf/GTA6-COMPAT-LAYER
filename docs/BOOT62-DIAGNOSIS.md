@@ -1,7 +1,7 @@
 # Boot 62 diagnosis — build 81 (slot 25 tiled allocation sizing)
 
 Boot #62 ran build 81 (`scarlett_verify.exe "D:\game\game\game_scarlett_master.exe" 300000`,
-log `F:\ScarlettCompat\gta_boot62.log`, 2040 lines, `BOOT_EXIT=1`).
+boot-62 log, 2040 lines, `BOOT_EXIT=1`).
 
 ## Result in one line
 

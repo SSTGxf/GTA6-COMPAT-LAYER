@@ -1,7 +1,7 @@
 # Boot 61 diagnosis — build 80 (real xg_xs texture computer)
 
 Boot #61 ran build 80 (`scarlett_verify.exe "D:\game\game\game_scarlett_master.exe" 300000`,
-log `F:\ScarlettCompat\gta_boot61.log`, 2041 lines, `BOOT_EXIT=1`).
+boot-61 log, 2041 lines, `BOOT_EXIT=1`).
 
 ## Result in one line
 

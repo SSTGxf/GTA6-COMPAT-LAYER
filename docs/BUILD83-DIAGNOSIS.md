@@ -98,7 +98,7 @@ refcounted COM object being released.
   `0x144f657b1/fc/f3` (owner slots 72/76/73), `0x145cd3f92` (publish).
 * Boot #63 dump census: **17/17 records have `+0x18 = 0`**. The field was
   never populated for any record, not only the crashing one.
-* `gta_boot63.log` contains **zero** occurrences of the record pointer or
+* The boot-63 log contains **zero** occurrences of the record pointer or
   of `ctx+0x18` as an argument to any layer call, so no HLE entry point
   in this boot was positioned to write it.
 

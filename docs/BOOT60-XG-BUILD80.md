@@ -1,7 +1,7 @@
 # Boot 60 → build 80: the XG texture-computer path
 
 Everything here is measured from `game_scarlett_master.exe` (image base
-`0x140000000`, 120,181,760 bytes) and from `gta_boot60.log`. Where a reading is
+`0x140000000`, 120,181,760 bytes) and from the boot-60 log. Where a reading is
 an inference it is marked **inference** and comes with the measurement that
 would disprove it.
 

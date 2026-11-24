@@ -1,6 +1,6 @@
 # Build 82 — the null sub-object at 0x1428C9A08 (steps 1–2, evidence)
 
-Boot #63 ran build 82 (`F:\ScarlettCompat\gta_boot63.log`, 2037 lines,
+Boot #63 ran build 82 (boot-63 log, 2037 lines,
 `BOOT_EXIT=1`). The crash is unchanged and unmodified: `0xC0000005` at
 `0x1428C9A08`, `params[0]=0x0`. What is new is that **every unimplemented
 device slot now reports its own number and its arguments**, which turns the two
