@@ -286,6 +286,59 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
                 (unsigned long long)*entry, targetIsZero ? 1u : 0u);
         }
     }
+    // A second opt-in probe for the next real-exe dump: initializer-table
+    // slot 12 points at a TLS accessor thunk whose relative jump lands at
+    // zero-filled RVA 0x4e72fd0 (no .pdata function entry). Let the caller
+    // bypass it only when both the thunk bytes and target match this build.
+    const uint32_t kTlsInitTableSlot12Rva = 0x67919c8;
+    const uint32_t kTlsInitThunkRva = 0x20cf840;
+    const uint32_t kTlsInitThunkTargetRva = 0x4e72fd0;
+    char tlsProbe12Env[2] = {};
+    DWORD tlsProbe12EnvLen = GetEnvironmentVariableA(
+        "SCARLETT_DIAG_SKIP_TLS_INIT12", tlsProbe12Env,
+        (DWORD)sizeof(tlsProbe12Env));
+    const bool tlsProbe12Enabled =
+        tlsProbe12EnvLen == 1 && tlsProbe12Env[0] == '1';
+    if (imageSize == 0x0b06d000 && tlsProbe12Enabled &&
+        (SIZE_T)kTlsInitTableSlot12Rva + sizeof(uint64_t) <= imageSize &&
+        (SIZE_T)kTlsInitThunkRva + 24 <= imageSize &&
+        (SIZE_T)kTlsInitThunkTargetRva + 0x20 <= imageSize) {
+        static const uint8_t kExpectedThunk[24] = {
+            0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0x00, 0x00,
+            0x00, 0x48, 0x8b, 0x00, 0x48, 0x8d, 0x88, 0x48,
+            0x11, 0x00, 0x00, 0xe9, 0x78, 0x37, 0xda, 0x02};
+        uint64_t* entry = (uint64_t*)(img + kTlsInitTableSlot12Rva);
+        const uint64_t expectedThunk = (uint64_t)img + kTlsInitThunkRva;
+        const uint8_t* thunk = img + kTlsInitThunkRva;
+        const uint8_t* target = img + kTlsInitThunkTargetRva;
+        bool targetIsZero = true;
+        for (size_t i = 0; i < 0x20; ++i) {
+            if (target[i] != 0) {
+                targetIsZero = false;
+                break;
+            }
+        }
+        if (*entry == expectedThunk &&
+            memcmp(thunk, kExpectedThunk, sizeof(kExpectedThunk)) == 0 &&
+            targetIsZero) {
+            const uint64_t replacement =
+                reinterpret_cast<uint64_t>(&ScarlettNoopThreadInit);
+            *entry = replacement;
+            Log("loader",
+                "diagnostic TLS initializer[12]: 0x%llx -> no-op 0x%llx "
+                "(thunk RVA 0x20cf840 -> zero-filled RVA 0x4e72fd0)",
+                (unsigned long long)expectedThunk,
+                (unsigned long long)replacement);
+        } else {
+            Log("loader",
+                "diagnostic TLS initializer[12] fingerprint mismatch "
+                "(entry 0x%llx, thunk-match %u, zero-target %u), skipped",
+                (unsigned long long)*entry,
+                memcmp(thunk, kExpectedThunk, sizeof(kExpectedThunk)) == 0
+                    ? 1u : 0u,
+                targetIsZero ? 1u : 0u);
+        }
+    }
     // Boot #6 / H1 Option A (see the local boot #6 diagnosis):
     // grow the pool at construction so slot 0 returns a real block.
     // The pool is built as a 0x20-byte pool over a 0x60-byte BSS buffer;
