@@ -246,7 +246,18 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
     // initializer and is not a semantic fix; the game file is never changed.
     const uint32_t kTlsInitTableSlot5Rva = 0x6791990;
     const uint32_t kTlsInitTargetRva = 0x28c8ea0;
-    if (imageSize == 0x0b06d000 &&
+    char tlsProbeEnv[2] = {};
+    DWORD tlsProbeEnvLen = GetEnvironmentVariableA(
+        "SCARLETT_DIAG_SKIP_TLS_INIT5", tlsProbeEnv,
+        (DWORD)sizeof(tlsProbeEnv));
+    const bool tlsProbeEnabled =
+        tlsProbeEnvLen == 1 && tlsProbeEnv[0] == '1';
+    if (imageSize == 0x0b06d000 && !tlsProbeEnabled) {
+        Log("loader",
+            "diagnostic TLS initializer[5] probe disabled; set "
+            "SCARLETT_DIAG_SKIP_TLS_INIT5=1 to enable");
+    }
+    if (imageSize == 0x0b06d000 && tlsProbeEnabled &&
         (SIZE_T)kTlsInitTableSlot5Rva + sizeof(uint64_t) <= imageSize &&
         (SIZE_T)kTlsInitTargetRva + 0x20 <= imageSize) {
         uint64_t* entry = (uint64_t*)(img + kTlsInitTableSlot5Rva);

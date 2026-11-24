@@ -26,7 +26,13 @@ void WriteLogLine(const char* line) {
     fputs(line, stderr);
     fputc('\n', stderr);
     FILE* f = nullptr;
-    if (fopen_s(&f, "scarlett.log", "a") == 0 && f) {
+    wchar_t logPath[MAX_PATH] = {};
+    DWORD logPathLen = GetEnvironmentVariableW(
+        L"SCARLETT_LOG_PATH", logPath, MAX_PATH);
+    int openResult = (logPathLen > 0 && logPathLen < MAX_PATH)
+                         ? _wfopen_s(&f, logPath, L"a")
+                         : fopen_s(&f, "scarlett.log", "a");
+    if (openResult == 0 && f) {
         fputs(line, f);
         fputc('\n', f);
         fclose(f);

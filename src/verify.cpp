@@ -58,6 +58,8 @@ static int ChildRun(const wchar_t* guestPath, DWORD timeoutMs) {
     (void)timeoutMs;
     std::wstring dir = ExeDir();
     // Keep the loader report beside the harness, never in the game folder.
+    std::wstring logPath = JoinDir(dir, L"scarlett.log");
+    SetEnvironmentVariableW(L"SCARLETT_LOG_PATH", logPath.c_str());
     std::wstring layerPath = JoinDir(dir, L"ScarlettCompat.dll");
     HMODULE layer = LoadLibraryW(layerPath.c_str());
     if (!layer) {
