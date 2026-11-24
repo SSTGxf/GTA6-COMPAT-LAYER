@@ -818,13 +818,35 @@ static D3D12_HEAP_PROPERTIES* WINAPI XboxDevice_GetCustomHeapProperties(
 // (0x14247927a) with rdx=&CBV desc and r8=DestDescriptor; returns
 // void, so the game does not check a result. Forwards to the real
 // device. The Xbox CBV desc is the PC prefix (BufferLocation +
-// SizeInBytes); pass it through.
+// SizeInBytes) with one desktop constraint that consoles do not have:
+// D3D12_CONSTANT_BUFFER_VIEW_DESC::SizeInBytes must be a multiple of
+// 256. Boot #94 proved the difference is fatal, not cosmetic: the
+// guest's first real CBV asked for 128 bytes (XMem 0x254d4090000 +
+// 0x1B00) and the desktop removed the device with reason 0x887A0001.
+// Measured on this adapter: size 128 removes the device at any aligned
+// location, size 256/512 is accepted, and even a guest-only VA is
+// accepted at creation when the size is legal. Round up, never down.
 static void WINAPI XboxDevice_CreateConstantBufferView(
     XboxDeviceWrapper* self,
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!self || !self->real || !pDesc) return;
-    self->real->CreateConstantBufferView(pDesc, DestDescriptor);
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = *pDesc;
+    if (cbv.SizeInBytes && (cbv.SizeInBytes & 255u)) {
+        UINT rounded = (cbv.SizeInBytes + 255u) & ~255u;
+        static int reported = 0;
+        if (reported < 8) {
+            ++reported;
+            Log("xboxdev",
+                "CreateConstantBufferView size %u not 256-aligned -> %u "
+                "(desktop constraint; guest loc=0x%llx ret=0x%llx)",
+                (unsigned)cbv.SizeInBytes, (unsigned)rounded,
+                (unsigned long long)cbv.BufferLocation,
+                (unsigned long long)_ReturnAddress());
+        }
+        cbv.SizeInBytes = rounded;
+    }
+    self->real->CreateConstantBufferView(&cbv, DestDescriptor);
     Log("xboxdev",
         "CreateConstantBufferView loc=0x%llx size=%u dest=0x%llx "
         "ret=0x%llx thread=%lu",
