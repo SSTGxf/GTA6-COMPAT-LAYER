@@ -263,6 +263,53 @@ accept the guest's `int3` as the refusal point). The dead texture-computer
 slot-10 experiment was removed again; `src/xg_texture.cpp` matches the
 state the green builds were produced from.
 
+## Commit contents and the `src/xg_texture.cpp` tracked-ness question
+
+`src/xg_texture.cpp` participates in the build (`build.bat` line 25 passes
+`%ROOT%src\xg_texture.cpp` to `cl`) but was never in the repository:
+
+```
+$ git ls-files | grep -i texture          -> (no output, rc=1)
+$ git log --oneline -- src/xg_texture.cpp -> (no output: never committed)
+$ git check-ignore -v src/xg_texture.cpp  -> (no output, rc=1: not ignored)
+$ ls src | wc -l  -> 21      $ git ls-files src | wc -l -> 20
+```
+
+So the green binaries were not reproducible from the commit: one compiled
+source existed only on disk. It is now committed as it stood — the dead
+slot-10 experiment is not in it (`grep -c 'VtblCreateSubmitBackend'` → 0)
+and its content hash equals the file the green build used. Commit
+`934017b` adds it, source only.
+
+**The two trees had also drifted.** Comparing them for this check found
+`F:\ScarlettCompat` carrying source differences that were never committed
+and were not in this campaign's work: a `SCARLETT_LOG_PATH` log-routing
+change in `hle_registry.cpp`, a diagnostic TLS-initialiser probe in
+`pe_loader.cpp`, and harness report paths in `verify.cpp` (198 diff lines
+total). Those F:-only versions are preserved as a patch at
+`D:\scarlett-dumps\f-drift-20261124.patch`, and F: was then synced to the
+committed sources. Every file `git ls-files src` lists now has an
+identical MD5 in both trees (`pre_build_src_identical=yes`), and both were
+rebuilt from them:
+
+```
+local build.bat -> 0   era 21/21   ft 7/7   verify 0
+F:    build.bat -> 0   era 21/21   ft 7/7   verify 0
+ft on F: x2 -> PASS 0.252 s / 12 steps, PASS 0.251 s / 12 steps
+```
+
+Delivered commits (local only, not pushed): `8c3103e` — the scoped
+`IDStorageFactory` slot-10 refusal, the note and the boot script;
+`934017b` — `src/xg_texture.cpp`, the compiled source that was missing
+from the repository. `git status --porcelain src/xg_texture.cpp` is now
+empty. The only remaining `src/` entries git reports as modified are
+CRLF-only differences (`git diff --ignore-cr-at-eol` is empty for them,
+with `core.autocrlf=true`), so their content equals `HEAD`.
+
+Note: `build.bat` itself and `defs/*` are tracked but carry pre-existing
+modifications from before this campaign and are deliberately not swept
+into these commits.
+
 ## Post-fix boot (green binaries)
 
 ```
