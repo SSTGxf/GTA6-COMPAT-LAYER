@@ -196,11 +196,11 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-24 (boots through #162, GitHub head `a88e5097`)
+## Status — 2026-11-25 (boots through #168, GitHub head `51d86fe9`)
 
-**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (162 boots). No game frame yet, no menu yet.**
+**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (168 boots). No game frame yet, no menu yet.**
 
-**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet).**
+**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet; current stop is a DEVICE_REMOVED assert at 0x142474606, and Freebuff's AI is probing every forwarded call to name the culprit).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -238,6 +238,12 @@ subsystem, not a dead harness.
 | Layout 258 (0x102) as 4 KiB-tile layout | ✅ | Boot #158, 1280x720 R32_UINT sizes to 3,768,320 / align 4096, places hr=0 |
 | BCPack B1: BC1 decoder (rANS + BC1 rebuilder) | ✅ | Commit 8b8511f, 128/128 model tables + 8/8 chunks identical to bcpack-decoder, harness 39/39 |
 | BCPack B2: entropy-only lane layouts BC3/4/5/BC6H/BC7 | ✅ | Commit a88e5097, 24/24 codec/block comparisons vs bcpack-decoder lanes, harness 149/149 |
+| Depth fix: typeless-depth allocation sized, not refused | ✅ | Boots #163/#164, commit e6588c45, fmt 19 sizes to 19,988,480 / align 65536 via slot-25 UAV-clearing retry |
+| Layout 256 (0x100) as 64 KiB-tile layout | ✅ | Boots #167/#168, commit b92f060, 2048x2048 fmt 65 → 4,194,304; 128x72 mips=7 fmt 41 → 131,072 shared-tail |
+| Shader Phase 6: pipeline binding (contract + oracle) | ✅ | Entry 29, commit 51d86fe9, synthetic PSO records, build gate green |
+| BC1–BC7 decode + BC6H GPU verification bit-exact | ✅ | Entry 29, commit 51d86fe9, 118/118 vs independent decoder; BC6H 0/64 max 0 on RX 5700 XT, BC7 all 8 modes bit-exact on silicon |
+| Shader Phase 8: mesh-as-compute (CPU reference model) | ✅ | Entry 29, commit 51d86fe9, 79 checks, order-independent validator |
+| Link contract (no-DXC link smoke test) | ✅ | Entry 29, commit 51d86fe9, LNK2019 without emitter, clean link + run with it |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
 | Real shader translation from corpus | ❌ | No corpus yet (slots 86/16 don't create PSOs), no game shader translated |
@@ -245,7 +251,7 @@ subsystem, not a dead harness.
 | BCPack: BC6H calibration + DirectStorage wiring (B3–B5) | ❌ | B1 + B2 done; real BC1 learned tables not published, game chunks undecodable until calibrated |
 | Mesh-as-compute | ❌ | CPU-only prototype |
 
-Full per-function status: `docs/STATUS.md` (current state at the top, boots through #97).
+Full per-function status: `docs/STATUS.md` (current state at the top, boots through #168).
 
 **What works now (verified on the build machine, all eight harness guests
 ALL PASS):**

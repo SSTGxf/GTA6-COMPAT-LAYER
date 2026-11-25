@@ -14,3 +14,10 @@ Third-party content included in this repository:
   this repository. See tests/shader/fixtures/README.md for the full
   provenance and regeneration instructions.
   Source: https://github.com/llvm/llvm-project
+
+- bcdec (third_party/bcdec.h)
+  The BC4/BC5/BC7 decode routines in the shader subsystem use bcdec,
+  released under the Unlicense (public domain dedication), vendored
+  unmodified in third_party/bcdec.h. The BC1–BC3 colour path is the
+  project's own code (bcdec's 5:6:5 interpolation was one unit off the
+  D3D decode). See docs/BC7-VERIFICATION.md.
