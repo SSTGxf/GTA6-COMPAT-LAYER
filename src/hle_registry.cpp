@@ -145,6 +145,18 @@ static LONG WINAPI ScarlettLayerVeh(EXCEPTION_POINTERS* ep) {
                            (void*)view0);
     }
     if (off > 0 && off < (int)sizeof(buf)) {
+        unsigned long long tebSelf = __readgsqword(0x30);
+        unsigned long long savedRbx = 0, retAddr = 0;
+        __try {
+            savedRbx = *(volatile unsigned long long*)(c->Rsp + 0x50);
+            retAddr = *(volatile unsigned long long*)(c->Rsp + 0x58);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        off += _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
+                           "=== teb=%p savedRbx=%p ret58=%p\n", (void*)tebSelf,
+                           (void*)savedRbx, (void*)retAddr);
+    }
+    if (off > 0 && off < (int)sizeof(buf)) {
         const unsigned char* r = (const unsigned char*)er->ExceptionAddress;
         off += _snprintf_s(
             buf + off, sizeof(buf) - off, _TRUNCATE,
