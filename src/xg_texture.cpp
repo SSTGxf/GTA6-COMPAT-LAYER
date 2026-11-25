@@ -167,6 +167,118 @@ static bool ValidLayout(uint32_t layout) {
            mode == kGuest4KBTileMode;
 }
 
+// ---- layout 0x102: the Gfx10 4 KiB chain --------------------------------
+//
+// Evidence: C:\Users\seths\Downloads\ttpf-viewer-reference (read-only),
+// src/layout.rs and src/tile.rs - a working viewer's model of the AMD Gfx10
+// (RDNA2) layout the console stores use. What it states, and what this
+// function takes from it:
+//   * levels are stored smallest first, each getting whole tiles of its own;
+//   * the mip tail: once a level is at most half a tile wide and at most one
+//     tile high, and it is among the last 8 levels (4 KiB tiles; 12 for
+//     64 KiB), it and every smaller level share ONE tile, stored first, each
+//     at its own spot inside that tile. A texture with a single level has no
+//     tail.
+//   * the k-th tail level (k = 0 the largest) uses slot m = max_in_tail - 1 -
+//     k, at byte (m > 6 ? 16 << m : m << 8) of the tail tile; that number is
+//     a Morton index of 256-byte micro blocks with y in even and x in odd
+//     bits.
+//   * src/tile.rs' 4 KiB tile patterns, in elements, are exactly the shapes
+//     TileGeometry already uses for this tile size (1 byte: 64x64, 2: 64x32,
+//     4: 32x32, 8: 32x16, 16: 16x16), so the tile shape is not a new number
+//     here - only the storage order and the tail are new.
+// What the evidence does NOT cover, and this function therefore leaves open
+// (reported in the layout log, not guessed):
+//   * where each array slice / cube face starts - layout.rs' chain() is one
+//     image, and cube_copies() describes cube packing but not the slice base;
+//     slices are therefore appended in descriptor order, as everywhere else
+//     in this engine;
+//   * the element order inside a tile - tile.rs orders elements by its bit
+//     pattern, which is not the Morton model this layer's copy path uses.
+//     The layout struct has no intra-tile offset field, so only level sizes
+//     and offsets are modelled, which is exactly what slot 25 asks for.
+//
+// Returns the tail level index (== mips when there is no tail), or UINT32_MAX
+// when it set an error status on *out.
+static uint32_t Build4KChain(const DescView& d, uint32_t tileW, uint32_t tileH,
+                             uint64_t tileBytes, ScXgLayoutInfo* out) {
+    const uint32_t kMaxTail = 8;  // layout.rs: max_in_tail for 4 KiB tiles
+    const uint32_t mips = d.mips;
+    const uint32_t bpe = out->bpe;
+    auto LevelW = [&](uint32_t i) {
+        uint32_t v = (uint32_t)(d.width >> i);
+        return v ? v : 1u;
+    };
+    auto LevelH = [&](uint32_t i) {
+        uint32_t v = d.height >> i;
+        return v ? v : 1u;
+    };
+    // Largest level that satisfies the tail rule; it and every smaller level
+    // then share one tile. A single level has no tail.
+    uint32_t tail = mips;
+    if (mips > 1) {
+        for (uint32_t i = 0; i < mips; ++i) {
+            if (LevelW(i) <= tileW / 2 && LevelH(i) <= tileH &&
+                mips - i <= kMaxTail) {
+                tail = i;
+                break;
+            }
+        }
+    }
+    uint64_t lvlOff[kMaxMips] = {0};
+    uint64_t lvlLen[kMaxMips] = {0};
+    uint64_t chain = 0, tiles = 0;
+    if (tail < mips) {
+        chain = tileBytes;  // the shared tail tile is stored first
+        tiles = 1;
+        for (uint32_t i = tail; i < mips; ++i) {
+            lvlOff[i] = 0;          // each level sits inside the shared tile
+            lvlLen[i] = tileBytes;  // at its own spot; size is the whole tile
+        }
+    }
+    for (uint32_t i = tail; i-- > 0;) {
+        uint64_t t = (uint64_t)CeilDiv(LevelW(i), tileW) *
+                     CeilDiv(LevelH(i), tileH);
+        uint64_t len = t * tileBytes;
+        lvlOff[i] = chain;
+        lvlLen[i] = len;
+        chain += len;
+        tiles += t;
+    }
+    if (chain == 0 || chain > (1ull << 40) || tiles > (1ull << 32)) {
+        out->status = SC_XG_OVERFLOW;
+        return UINT32_MAX;
+    }
+    uint64_t offset = 0, packed = 0;
+    uint32_t count = 0;
+    for (uint32_t s = 0; s < d.depthOrArray; ++s) {
+        for (uint32_t m = 0; m < mips; ++m) {
+            if (count >= SC_XG_MAX_SUBRESOURCES) {
+                out->status = SC_XG_TOO_MANY_SUBRESOURCES;
+                return UINT32_MAX;
+            }
+            uint64_t slicePitch =
+                (uint64_t)LevelW(m) * LevelH(m) * bpe;
+            if (packed > UINT64_MAX - slicePitch ||
+                offset > UINT64_MAX - chain) {
+                out->status = SC_XG_OVERFLOW;
+                return UINT32_MAX;
+            }
+            out->subOffset[count] = offset + lvlOff[m];
+            out->subBytes[count] = lvlLen[m];
+            ++count;
+            packed += slicePitch;
+        }
+        offset += chain;
+    }
+    out->subCount = count;
+    out->tileCount = (uint32_t)(tiles * d.depthOrArray);
+    out->totalBytes = offset;
+    out->packedBytes = packed;
+    out->status = SC_XG_OK;
+    return tail;
+}
+
 // Build the layout for a descriptor. Fills *out completely in every case.
 static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
     memset(out, 0, sizeof *out);
@@ -284,6 +396,30 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
     out->mipLevels = d.mips;
     out->slices = d.depthOrArray;
     out->baseAlign = tileBytes;
+
+    // Layout 0x102 is the console's 4 KiB Gfx10 chain, and the only mode whose
+    // storage order and mip tail are documented (see Build4KChain). The 4 KiB
+    // tile mode the guest tags 3D textures with (mode 5) keeps the established
+    // slab model that cleared boot #86 - it has no such evidence.
+    if (!linear && mode == kGuest4KBTileMode) {
+        const uint32_t tail = Build4KChain(d, tileW, tileH, tileBytes, out);
+        if (tail == UINT32_MAX) return;
+        static volatile LONG n4k = 0;
+        const LONG call = InterlockedIncrement(&n4k);
+        if (call <= 4 || (call % 64) == 0) {
+            Log("xg",
+                "layout 0x102 (4KiB chain): %llux%u mips=%u tail=%s "
+                "tile=%ux%u slabs=%u size=%llu align=%llu - order+tail from "
+                "the Gfx10 reference; open: array-slice base, intra-tile "
+                "element order",
+                (unsigned long long)d.width, (unsigned)d.height,
+                (unsigned)d.mips, tail < d.mips ? "shared-tile" : "none",
+                (unsigned)tileW, (unsigned)tileH, (unsigned)out->tileCount,
+                (unsigned long long)out->totalBytes,
+                (unsigned long long)out->baseAlign);
+        }
+        return;
+    }
 
     uint64_t offset = 0, packed = 0, tiles = 0;
     uint32_t count = 0;
