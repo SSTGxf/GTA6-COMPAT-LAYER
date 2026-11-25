@@ -5306,17 +5306,22 @@ static uint64_t ScDsPackSize(const char* path) {
     if (_stat64(path, &st) != 0) return 0;
     return (uint64_t)st.st_size;
 }
+static const char* ScDsPackByCoverage(uint64_t fileOffset, uint32_t compSize);
 static const char* ScDsContextPackForRaw(uint64_t hash, uint64_t fileOffset,
                                          uint32_t compSize, int index) {
-    const char* pack = g_dsLastResolvedPack;
+    // Determinism: a raw descriptor must resolve to the same pack on every
+    // boot, independent of the order descriptors arrive in. "The pack this
+    // boot resolved last" depended on thread scheduling, which is exactly the
+    // boot-to-boot variation this replaces. The rule is now a fixed scan of
+    // kDsPackCandidates (declared order) taking the first pack whose file
+    // actually covers the requested span.
+    const char* pack = ScDsPackByCoverage(fileOffset, compSize);
     if (!pack) return nullptr;
-    const uint64_t sz = ScDsPackSize(pack);
-    if (sz < fileOffset || sz - fileOffset < compSize) return nullptr;
     ScDsCachePack(hash, pack);
     Log("dstorage",
-        "Submit[%d] raw copy via context pack %s (id 0x%016llx unknown to "
-        "the zlib probe; offset=0x%llx compSize=%u fits inside that pack, "
-        "which is the one this boot resolved last)",
+        "Submit[%d] raw copy via deterministic pack %s (id 0x%016llx unknown "
+        "to the zlib probe; offset=0x%llx compSize=%u; first candidate in "
+        "declared order that covers the span)",
         index, pack, (unsigned long long)hash, (unsigned long long)fileOffset,
         compSize);
     return pack;
@@ -5335,6 +5340,18 @@ static const char* kDsPackCandidates[] = {
     "D:\\game\\game\\script.rpf",
     "D:\\game\\game\\appdata0.rpf",
 };
+// Deterministic raw-request attribution (see ScDsContextPackForRaw): the
+// first candidate in declared order whose file covers the requested span.
+static const char* ScDsPackByCoverage(uint64_t fileOffset, uint32_t compSize) {
+    for (size_t p = 0;
+         p < sizeof(kDsPackCandidates) / sizeof(kDsPackCandidates[0]); ++p) {
+        const uint64_t sz = ScDsPackSize(kDsPackCandidates[p]);
+        if (sz < fileOffset || sz - fileOffset < compSize) continue;
+        return kDsPackCandidates[p];
+    }
+    return nullptr;
+}
+
 static const char* ScDsResolvePack(uint64_t hash, uint64_t fileOffset,
                                    uint32_t compSize, uint32_t destSize) {
     if (hash == kDsMeasuredHash) return ScDsPackPath();

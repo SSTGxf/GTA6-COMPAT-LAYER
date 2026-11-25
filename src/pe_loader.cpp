@@ -871,6 +871,71 @@ static void* EnsureThreadTls() {
     return block;
 }
 
+// Boots #197/#198: a guest thread that was never created through our
+// CreateThread hook runs guest code with TEB->ThreadLocalStoragePointer == 0
+// and faults at 0x140004B5E (`mov rax,gs:[58h]; mov rax,[rax]`), because the
+// guest's own CRT TLS callback (which owns slot 0) never ran for it.
+//
+// The real mechanism is the one Windows itself uses: every module's TLS
+// callbacks run on every thread start (DLL_THREAD_ATTACH), including threads
+// the process never created through CreateThread (threadpool workers, timers,
+// APC/IO callbacks). This DLL therefore registers its own TLS callback and
+// bootstraps the guest's PE TLS directory from it, so no thread that can run
+// guest code is left without a TLS array and without its guest CRT slot.
+static volatile LONG g_guestTlsReady = 0;   // set once the guest image is loaded
+static volatile LONG g_guestTlsBusy = 0;
+static void CleanupThreadTls();  // defined below (detach path)
+
+extern "C" void ScGuestTlsThreadAttach() {
+    if (!g_guestTlsReady || !g_tlsInfo.valid) return;
+    // Re-entrancy guard: the guest TLS callbacks are guest code and may
+    // create threads themselves.
+    if (InterlockedExchange(&g_guestTlsBusy, 1) != 0) return;
+    // Already bootstrapped for this thread (our slot carries the block)?
+    PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
+    if (tlsArr && tlsArr[g_tlsInfo.index]) {
+        InterlockedExchange(&g_guestTlsBusy, 0);
+        return;
+    }
+    Log("loader",
+        "thread-attach: bootstrapping guest TLS for tid=%lu (tlsArray=%p)",
+        (unsigned long)GetCurrentThreadId(), (void*)tlsArr);
+    EnsureThreadTls();
+    InterlockedExchange(&g_guestTlsBusy, 0);
+}
+
+extern "C" void ScGuestTlsThreadDetach() {
+    if (!g_guestTlsReady || !g_tlsInfo.valid) return;
+    CleanupThreadTls();
+}
+
+static void NTAPI ScLayerTlsCallback(PVOID, DWORD reason, PVOID) {
+    if (reason == DLL_THREAD_ATTACH) {
+        __try {
+            ScGuestTlsThreadAttach();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("loader", "thread-attach: guest TLS bootstrap faulted 0x%08x",
+                GetExceptionCode());
+        }
+    }
+}
+
+// The .CRT$XLB entry is what the loader walks; the __declspec(thread) anchor
+// below forces the linker to emit a TLS directory for this DLL so the
+// callbacks are actually run for threads whose start never goes through us.
+// Without a reference to _tls_used the linker emits no TLS directory and the
+// loader never walks .CRT$XLB — boot #199 proved that (0 bootstraps logged).
+extern "C" int _tls_used;
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma section(".CRT$XLB", long, read)
+extern "C" __declspec(allocate(".CRT$XLB"))
+    PIMAGE_TLS_CALLBACK g_scLayerTlsCallback = ScLayerTlsCallback;
+// Thread-local anchor: forces the linker to emit a TLS directory for this
+// DLL, which is what makes the loader run g_scLayerTlsCallback on every
+// thread start (DLL_THREAD_ATTACH) — including threads created by Windows
+// internals that never pass through ScarlettCreateThread.
+__declspec(thread) volatile int g_scLayerTlsAnchor = 0;
+
 // Tear down TLS for the calling thread: DLL_THREAD_DETACH callbacks,
 // clear the slot, free the block.
 static void CleanupThreadTls() {
@@ -1352,6 +1417,9 @@ bool SetupTls(void* base, const IMAGE_NT_HEADERS64* nt, LoadedPe* out) {
     g_tlsInfo.index = index;
     g_tlsInfo.callbacks = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
     g_tlsInfo.valid = true;
+    // From this point any thread that starts (or is already running) may
+    // bootstrap guest TLS from the DLL's own thread-attach callback.
+    InterlockedExchange(&g_guestTlsReady, 1);
     if (tls->AddressOfCallBacks) {
         auto* callbacks = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
         for (size_t i = 0; callbacks[i]; ++i) {

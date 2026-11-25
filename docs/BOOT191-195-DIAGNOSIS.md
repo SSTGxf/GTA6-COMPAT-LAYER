@@ -369,3 +369,42 @@ thread wrapper does, instead of inventing a value.
 
 Status: no fix landed for this wall in this pass, and no reboot was spent —
 the two boots that agree on it are #197 and #198.
+
+## §10 Boots #199/#200 — TLS bootstrap does not fire yet; pack attribution made deterministic
+
+Measured, not inferred:
+
+| build | BUILD_EXIT | FAILED | B1 | verify | boot | stop |
+|---|---|---|---|---|---|---|
+| #199 | 0 | 0 | 149/149 PASS | 0 | #199 | `0xc0000005` at `0x140004B5E` (16,938 lines) |
+| #200 | 0 | 0 | 149/149 PASS | 0 | #200 | `0xc0000005` at `0x140004B5E` (16,962 lines) |
+
+`thread-attach: bootstrapping …` count = 0 in both; `raw copy via deterministic
+pack …` count = 1 in #200. So the TLS bootstrap code exists but never executes,
+while the deterministic attribution path does execute.
+
+Why the callback does not fire, measured from the built module: the DLL **does**
+have a TLS directory (`RVA 0x51B80`, 0x28 bytes) with a **non-null**
+`AddressOfCallBacks = 0x180038678`, so Windows does have a callback list to walk.
+The remaining explanation is ordering, not linkage: the thread that faults was
+created before the guest image's TLS directory had been parsed, so when the
+callback ran `g_guestTlsReady` was 0 and it returned without bootstrapping — and
+nothing runs it again for that thread.
+
+Landed changes in this build:
+
+- `src/pe_loader.cpp`: `ScGuestTlsThreadAttach/Detach` reuse the existing
+  `EnsureThreadTls()` (PE TLS template, `SizeOfZeroFill`, CRT index, `.CRT$XLB`
+  callback list) from the DLL's own `.CRT$XLB` entry, guarded by
+  `g_guestTlsReady` (set when the guest TLS directory is parsed) and a
+  re-entrancy flag.
+- `src/hle_registry.cpp`: `ScDsPackByCoverage` — raw descriptors resolve by a
+  fixed scan of `kDsPackCandidates` in declared order, first pack that covers
+  `offset+size`; the "last resolved pack" heuristic is gone, so attribution no
+  longer depends on descriptor arrival order.
+
+Next concrete fix (from the measured ordering): bootstrap lazily per thread on
+the first layer entry rather than only at thread attach — i.e. call
+`ScGuestTlsThreadAttach()` from the HLE dispatch path (and from the guest's
+thread-start trampolines), which covers threads that were already running when
+`g_guestTlsReady` became 1, including the one that dies at `0x140004B5E`.
