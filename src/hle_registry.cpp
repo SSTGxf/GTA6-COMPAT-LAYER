@@ -5581,8 +5581,8 @@ extern "C" void DsqSubmit(void* self) {
                     "compSize=%u destSize=%u dst=0x%llx..0x%llx pack=%s)",
                     i, (unsigned long long)hash,
                     (unsigned long long)fileOffset, compSize, destSize,
-                    (unsigned long long)dest,
-                    (unsigned long long)(dest + destSize), packPath);
+                    (unsigned long long)(uintptr_t)dest,
+                    (unsigned long long)((uintptr_t)dest + destSize), packPath);
                 ++copied;
                 continue;
             }

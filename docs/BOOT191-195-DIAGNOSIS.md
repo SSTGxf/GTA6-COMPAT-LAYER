@@ -766,3 +766,27 @@ Measured state at the end of this pass: build_ga210 built (see build log), boot
 0x140004B5E remains cleared. Next step: log the destination in the branch that
 actually executes (the one printing the old-format line), which is a distinct call
 site in the same submit loop.
+
+## §20 Tail writer located (boot #212): the full span IS written, from packs.rpf
+
+Boot #212 (build_ga212: `BUILD_EXIT=0`, `B1 result: 149 checks, 0 failed -> PASS`,
+`=== verify exit code: 0 ===`) with destination logging live (379 `dst=` lines):
+
+```
+Submit[137] raw copy (hash 0x307c02cc9eb90000 offset=0x106929510 compSize=65536 destSize=65536 dst=0x2098c402520..0x2098c412520 pack=D:\game\game\packs.rpf)
+Submit[138] raw copy (hash 0x307c02cc9eb90000 offset=0x106939510 compSize=58896 destSize=58896 dst=0x2098c412520..0x2098c420b30 pack=D:\game\game\packs.rpf)
+gate-probe walk size=9168400 framedEnd=9168284 chunks: [0]PSIN(len=0x3340c0) ... [9168284]<garbage>(0x56d61794,len=0xb4e073cd)
+```
+
+The writes are contiguous and cover the whole requested span, ending at
+`0x2098c420b30`, i.e. the last 116 bytes *are* written. So the defect is neither
+an under-copy nor a wrong destination offset: the bytes written there come from
+**`D:\game\game\packs.rpf`**, and that source extent does not contain the
+LGID/LRSC/CHKS chunks the stream declares.
+
+That points at the third case — wrong pack member / source extent — and it is the
+pack the deterministic attribution rule picks (first candidate in declared order
+that covers the span). The rule made attribution order-independent as required,
+but it is not yet evidence-correct for this id.
+
+No fix landed. 0x1409DFC18 still fires; 0x140004B5E remains cleared.
