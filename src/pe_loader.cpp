@@ -1017,6 +1017,22 @@ static void HookGuestImports(void* base) {
             (IMAGE_IMPORT_DESCRIPTOR*)(img + dir->VirtualAddress);
         unsigned hooked = 0;
         for (; imp->Name; ++imp) {
+            const char* mod = (const char*)(img + imp->Name);
+            Log("loader", "import-module %s oft=%lu ft=%lu", mod,
+                (unsigned long)imp->OriginalFirstThunk,
+                (unsigned long)imp->FirstThunk);
+            if (imp->OriginalFirstThunk) {
+                unsigned shown = 0;
+                IMAGE_THUNK_DATA* it = (IMAGE_THUNK_DATA*)(img + imp->OriginalFirstThunk);
+                for (; it->u1.Function && shown < 24; ++it, ++shown) {
+                    if (IMAGE_SNAP_BY_ORDINAL(it->u1.Ordinal))
+                        Log("loader", "import-name %s #%llu ord=%llu", mod, (unsigned long long)shown,
+                            (unsigned long long)IMAGE_ORDINAL(it->u1.Ordinal));
+                    else
+                        Log("loader", "import-name %s #%llu %s", mod, (unsigned long long)shown,
+                            (const char*)((IMAGE_IMPORT_BY_NAME*)(img + it->u1.AddressOfData))->Name);
+                }
+            }
             IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*)(img + imp->FirstThunk);
             for (; thunk->u1.Function; ++thunk) {
                 void** slot = (void**)&thunk->u1.Function;
