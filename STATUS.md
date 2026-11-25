@@ -23,3 +23,24 @@ Consequently the payload reaches the buffer neither by a hooked `ReadFile` desti
 (809 page-granular reads, none in range) nor by a mapped view. What remains is a guest-side
 copy from its own page reads into that buffer, which is invisible to our layer, plus the
 missing 116-byte terminator at offset 9,168,284.
+
+### Import-level evidence for the mapping verdict (boot #261, build_ga249)
+
+The `import-name` dump covers 68 modules / 453 thunks. Searching it for mapping APIs:
+
+```
+grep -icE "MapViewOfFile|CreateFileMapping" scarlett_boot261.log   -> 0
+matching import-name lines                                        -> 0
+```
+
+No guest module's dumped thunk table contains `MapViewOfFile`, `MapViewOfFileEx`,
+`CreateFileMappingA` or `CreateFileMappingW`. The only `Map*` symbols present are the
+HLE ones: `AcpHal.dll #7 ApuMapApuAddress`, `AcpHal.dll #8 ApuMapVirtualAddress`,
+`xmem.dll #8 XMemMapPhysicalPages`, `xmem.dll #9 XMemMapPhysicalPagesScatter`.
+
+Caveat recorded honestly: the inventory prints at most 24 names per module, so for modules
+with larger tables the absence is per-dump, not exhaustive; for file-holding modules the
+lists are short and complete.
+
+Verdict stands as **N** (no mapped view intersects
+`0x1c0da096bc0-0x1c0da9551d0`), now with import-level support rather than a bare count.
