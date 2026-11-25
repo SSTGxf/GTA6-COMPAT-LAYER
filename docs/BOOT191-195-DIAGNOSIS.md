@@ -744,3 +744,25 @@ fully 9,168,400 bytes and its final three chunks arrive as garbage: the defect i
 in what the read path wrote for that tail, not in the length handed to the gate.
 
 Open: which write leaves the last 116 bytes unwritten/garbage.
+
+## §19 Tail-writer probe (boot #210): this log site is NOT the one serving those requests
+
+Instrumented the raw-copy branch at `Submit[%d] raw copy ...` to print the
+destination range and pack. Boot #210's log still shows the requests in the OLD
+format:
+
+```
+Submit[137] raw copy (hash 0x307c02cc9eb90000 offset=0x106929510 compSize=65536 destSize=65536)
+Submit[138] raw copy (hash 0x307c02cc9eb90000 offset=0x106939510 compSize=58896 destSize=58896)
+gate-probe walk size=9168400 framedEnd=9168284 chunks: [0]PSIN(len=0x3340c0) ... [9168284]<garbage>(0x56d61794,len=0xb4e073cd)
+```
+
+so the executed copy path is a *different* site than the branch that was edited
+(the edited branch is not taken for this descriptor). Therefore the destination
+range of these copies is still unmeasured, and no fix is claimed.
+
+Measured state at the end of this pass: build_ga210 built (see build log), boot
+#210 stops at 0x1409DFC18 as before, the gate still returns 0 for the full stream,
+0x140004B5E remains cleared. Next step: log the destination in the branch that
+actually executes (the one printing the old-format line), which is a distinct call
+site in the same submit loop.

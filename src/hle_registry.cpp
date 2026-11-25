@@ -5578,9 +5578,11 @@ extern "C" void DsqSubmit(void* self) {
                 free(comp);
                 Log("dstorage",
                     "Submit[%d] raw copy (hash 0x%016llx offset=0x%llx "
-                    "compSize=%u destSize=%u)",
+                    "compSize=%u destSize=%u dst=0x%llx..0x%llx pack=%s)",
                     i, (unsigned long long)hash,
-                    (unsigned long long)fileOffset, compSize, destSize);
+                    (unsigned long long)fileOffset, compSize, destSize,
+                    (unsigned long long)dest,
+                    (unsigned long long)(dest + destSize), packPath);
                 ++copied;
                 continue;
             }
