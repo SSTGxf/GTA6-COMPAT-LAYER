@@ -345,3 +345,26 @@ booots never logged. So the emitted LGID length was one of the walk's real block
 
 Next: `0x144fc21f5` with `access=0x1e954ab78c5` and `stack[0]=0x144fc21d9` (a return address inside
 the same region) — the arena fault is now the stopping point.
+
+## 2026-11-25: why the VEH lazy-commit branch never fired on 0x144fc21f5
+
+Boot #270's fault is `code=0xc0000005 addr=0x144fc21f5 access=0x1e954ab78c5`. The lazy-commit
+branch in `src/pe_loader.cpp` (the unhandled-exception filter) is gated on three conditions:
+
+```
+if (q && mbi.State == MEM_RESERVE &&
+    ep->ExceptionRecord->ExceptionInformation[0] == 0) {     // 0 = read
+    void* page = (void*)(uintptr_t)(fa & ~(uint64_t)0xFFFF);
+    void* c = VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE);
+```
+
+Two of those cannot hold for this fault: `ExceptionInformation[1]` is `0x1e954ab78c5`, an address
+in the guest heap neighbourhood rather than inside the `0x2588b3c8000` arena reservation, so its
+`mbi.State` is not `MEM_RESERVE`; and the exception's first parameter is the access *type*, which
+for a write is 1. So the branch is not wrong — it is simply not addressed to this fault. The
+faulting instruction (`rip=0x144fc21f5`, inside the 0x14400-region code) is dereferencing a
+pointer derived from guest state, not an uncommitted arena page.
+
+Blocker stated concretely: clearing this needs the faulting instruction's operand decoded from
+the 0x144fc2100 region (same bounded-probe route as `ScDumpGateSlice`, offset `0xfc21f5`), which
+this pass had no room to add and boot.
