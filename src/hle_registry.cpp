@@ -845,6 +845,46 @@ extern "C" LPVOID HleVirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
     return p;
 }
 
+// ---- device-removal probe (boot #169) --------------------------------
+// The guest stops at 0x142474606 with its device already removed, yet no
+// forwarded call reports a failure, so the call that removed it is not in
+// the log. Every forwarder that reaches the real desktop API calls
+// ProbeDeviceRemoval first. While the device is alive the probe records
+// the operation and its caller per thread; the first probe to see a
+// non-S_OK GetDeviceRemovedReason reports the operation that was running
+// when the removal became observable (the previous forwarded call on that
+// thread), once, so a hot path cannot drown the answer.
+static thread_local char t_removalProbeLastOp[96] = "<none>";
+static thread_local void* t_removalProbeLastSite = nullptr;
+static volatile LONG g_removalProbeLogged = 0;
+
+static void ProbeDeviceRemoval(const char* op) {
+    ID3D12Device* dev = g_xsDevice;
+    if (!dev) return;
+    HRESULT reason = dev->GetDeviceRemovedReason();
+    if (reason != S_OK) {
+        if (InterlockedCompareExchange(&g_removalProbeLogged, 1, 0) == 0) {
+            Log("xboxdev",
+                "REMOVAL PROBE: device removed (reason=0x%08x) first seen "
+                "at '%s' from %p thread=%lu; the last forwarded call that "
+                "still saw it alive on this thread was '%s' from %p",
+                (unsigned)reason, op, _ReturnAddress(),
+                GetCurrentThreadId(), t_removalProbeLastOp,
+                t_removalProbeLastSite);
+        }
+        return;
+    }
+    strncpy_s(t_removalProbeLastOp, sizeof t_removalProbeLastOp, op,
+              _TRUNCATE);
+    t_removalProbeLastSite = _ReturnAddress();
+}
+
+static void ProbeDeviceRemovalSlot(const char* kind, int slot) {
+    char op[96];
+    _snprintf_s(op, sizeof op, _TRUNCATE, "%s slot %d", kind, slot);
+    ProbeDeviceRemoval(op);
+}
+
 // ---- Xbox D3D12 device COM wrapper (graphics milestone #1) ----
 // The game calls Xbox D3D12 device methods via the Xbox vtable layout
 // (192 slots). Returning the raw desktop ID3D12Device* lets the game
@@ -1021,6 +1061,7 @@ static HRESULT WINAPI XboxDevice_SlotUnimplemented(
 static D3D12_HEAP_PROPERTIES* WINAPI XboxDevice_GetCustomHeapProperties(
     D3D12_HEAP_PROPERTIES* retBuf, XboxDeviceWrapper* self, UINT nodeMask,
     D3D12_HEAP_TYPE heapType) {
+    ProbeDeviceRemoval("GetCustomHeapProperties");
     if (!self || !self->real || !retBuf) return retBuf;
     D3D12_HEAP_PROPERTIES props =
         self->real->GetCustomHeapProperties(nodeMask, heapType);
@@ -1051,6 +1092,7 @@ static void WINAPI XboxDevice_CreateConstantBufferView(
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!self || !self->real || !pDesc) return;
+    ProbeDeviceRemoval("CreateConstantBufferView");
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = *pDesc;
     if (cbv.SizeInBytes && (cbv.SizeInBytes & 255u)) {
         UINT rounded = (cbv.SizeInBytes + 255u) & ~255u;
@@ -1087,6 +1129,7 @@ static void WINAPI XboxDevice_CreateShaderResourceView(
     const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!self || !self->real) return;
+    ProbeDeviceRemoval("CreateShaderResourceView");
     self->real->CreateShaderResourceView(pResource, pDesc, DestDescriptor);
     // Boot #56 instrumentation: dump the desc (Format/ViewDimension +
     // raw union qwords) plus caller and thread — the boot #55 log
@@ -1115,6 +1158,7 @@ static void WINAPI XboxDevice_CreateUnorderedAccessView(
     const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!self || !self->real) return;
+    ProbeDeviceRemoval("CreateUnorderedAccessView");
     self->real->CreateUnorderedAccessView(pResource, pCounterResource,
                                           pDesc, DestDescriptor);
     // Boot #56 instrumentation: same as SRV — desc contents plus
@@ -1146,6 +1190,7 @@ static void WINAPI XboxDevice_CreateRenderTargetView(
     const D3D12_RENDER_TARGET_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!self || !self->real) return;
+    ProbeDeviceRemoval("CreateRenderTargetView");
     self->real->CreateRenderTargetView(pResource, pDesc, DestDescriptor);
     Log("xboxdev",
         "CreateRenderTargetView res=%p desc=%p fmt=%u dim=%u dest=0x%llx "
@@ -1164,6 +1209,7 @@ static void WINAPI XboxDevice_CreateDepthStencilView(
     const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     if (!self || !self->real) return;
+    ProbeDeviceRemoval("CreateDepthStencilView");
     self->real->CreateDepthStencilView(pResource, pDesc, DestDescriptor);
     Log("xboxdev",
         "CreateDepthStencilView res=%p desc=%p fmt=%u dim=%u flags=0x%x "
@@ -1247,6 +1293,7 @@ XboxDevice_GetResourceAllocationInfo(
     D3D12_RESOURCE_ALLOCATION_INFO* retBuf, XboxDeviceWrapper* self,
     UINT visibleMask, UINT numResourceDescs,
     const D3D12_RESOURCE_DESC* pResourceDescs) {
+    ProbeDeviceRemoval("GetResourceAllocationInfo");
     if (!retBuf || !self || !self->real) return retBuf;
     // Boot #51: the game's desc is a 3840x2160 R8G8B8A8 render target
     // (dim=3, fmt=28) but Flags=0x300005 carries Xbox-specific bits
@@ -2050,6 +2097,7 @@ static HRESULT WINAPI XboxDevice_CreateCommittedResource3(
     // does not expose it, fall back to a properly translated
     // CreateCommittedResource (barrier layout -> initial state) —
     // NEVER a stub object.
+    ProbeDeviceRemoval("CreateCommittedResource3");
     ID3D12Device10* dev10 = nullptr;
     HRESULT hrQI = self->real->QueryInterface(
         __uuidof(ID3D12Device10), (void**)&dev10);
@@ -2207,6 +2255,7 @@ static HRESULT WINAPI XboxDevice_CreateCommandAllocator(
     XboxDeviceWrapper* self, D3D12_COMMAND_LIST_TYPE type,
     REFIID riid, void** ppCommandAllocator) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("CreateCommandAllocator");
     HRESULT hr = self->real->CreateCommandAllocator(type, riid,
                                                      ppCommandAllocator);
     if (hr == E_NOINTERFACE && ppCommandAllocator) {
@@ -2223,6 +2272,7 @@ static HRESULT WINAPI XboxDevice_CreateFence(
     XboxDeviceWrapper* self, UINT64 initialValue,
     D3D12_FENCE_FLAGS flags, REFIID riid, void** ppFence) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("CreateFence");
     HRESULT hr = self->real->CreateFence(initialValue, flags, riid, ppFence);
     if (hr == E_NOINTERFACE && ppFence) {
         hr = self->real->CreateFence(initialValue, flags,
@@ -2247,6 +2297,7 @@ static HRESULT WINAPI XboxDevice_CreateCommittedResource(
     D3D12_RESOURCE_STATES InitialResourceState,
     const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource,
     void** ppvResource) {
+    ProbeDeviceRemoval("CreateCommittedResource");
     if (!self || !self->real) return E_POINTER;
     HRESULT hr = self->real->CreateCommittedResource(
         pHeapProperties, HeapFlags, pDesc, InitialResourceState,
@@ -2283,6 +2334,7 @@ static HRESULT WINAPI XboxDevice_CreateCommandSignature(
     ID3D12RootSignature* pRootSignature, REFIID riid,
     void** ppvCommandSignature) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("CreateCommandSignature");
     // Boot #108: the third signature is stride 12 with guest type code 0x69
     // (105), which is not a desktop D3D12_INDIRECT_ARGUMENT_TYPE. The same
     // guest builder prepares the standard DISPATCH (2) and DISPATCH_MESH (10)
@@ -2368,6 +2420,7 @@ static HRESULT WINAPI XboxDevice_CreateQueryHeap(
     XboxDeviceWrapper* self, const D3D12_QUERY_HEAP_DESC* pDesc, REFIID riid,
     void** ppQueryHeap) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("CreateQueryHeap");
     HRESULT hr = self->real->CreateQueryHeap(pDesc, riid, ppQueryHeap);
     if (hr == E_NOINTERFACE && ppQueryHeap) {
         hr = self->real->CreateQueryHeap(pDesc, __uuidof(ID3D12QueryHeap),
@@ -2458,6 +2511,7 @@ static uint64_t WINAPI XboxQueue_Forward(void* self, uint64_t a1, uint64_t a2,
                                          uint64_t a5, uint64_t a6) {
     XboxCommandQueueWrapper* w = (XboxCommandQueueWrapper*)self;
     if (!w || !w->real) return (uint64_t)E_POINTER;
+    ProbeDeviceRemovalSlot("queue", Slot);
     void** vt = *(void***)w->real;
     typedef uint64_t(WINAPI * Fn)(void*, uint64_t, uint64_t, uint64_t,
                                   uint64_t, uint64_t, uint64_t);
@@ -2469,6 +2523,7 @@ static uint64_t WINAPI XboxQueue_Forward(void* self, uint64_t a1, uint64_t a2,
 static HRESULT WINAPI XboxQueue_GetTimestampFrequency(
     XboxCommandQueueWrapper* self, UINT64* pFrequency) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("queue GetTimestampFrequency");
     HRESULT hr = self->real->GetTimestampFrequency(pFrequency);
     Log("xboxdev",
         "queue GetTimestampFrequency(slot18) -> hr=0x%08x value=%llu",
@@ -2570,6 +2625,7 @@ static HRESULT WINAPI XboxDevice_CreateCommandQueue(
     XboxDeviceWrapper* self, const D3D12_COMMAND_QUEUE_DESC* pDesc,
     REFIID riid, void** ppCommandQueue) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("CreateCommandQueue");
     // Sanitize the Xbox desc to desktop-valid values. Boot #31 proved
     // the third queue fails on flags alone: queue 2 (type=2/COPY,
     // flags=0x1) succeeded, queue 3 (type=2/COPY, flags=0x2) returned
@@ -2642,6 +2698,7 @@ static HRESULT WINAPI XboxDevice_CreateCommandList(
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState,
     REFIID riid, void** ppCommandList) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("CreateCommandList");
     static bool vehReArmed = false;
     if (!vehReArmed && getenv("SCARLETT_VEH_LOG")) {
         vehReArmed = true;
@@ -2690,6 +2747,7 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
     REFIID riid, void** ppvResource) {
     (void)va;
     if (!self || !self->real || !pDesc) return E_POINTER;
+    ProbeDeviceRemoval("CreatePlacedResourceX");
     D3D12_HEAP_PROPERTIES heapProps = {};
     heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc = *pDesc;
@@ -2808,6 +2866,7 @@ static HRESULT WINAPI XboxDevice_CreateDescriptorHeap(
     REFIID riid, void** ppHeap) {
     if (!self || !self->real || !pDesc || !ppHeap) return E_POINTER;
     *ppHeap = nullptr;
+    ProbeDeviceRemoval("CreateDescriptorHeap");
     ID3D12DescriptorHeap* realHeap = nullptr;
     HRESULT hr = self->real->CreateDescriptorHeap(pDesc, riid,
                                                    (void**)&realHeap);
@@ -2880,6 +2939,7 @@ static HRESULT WINAPI XboxDevice_CreateDescriptorHeap(
 static UINT WINAPI XboxDevice_GetDescriptorHandleIncrementSize(
     XboxDeviceWrapper* self, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     if (!self || !self->real) return 0;
+    ProbeDeviceRemoval("GetDescriptorHandleIncrementSize");
     UINT n = self->real->GetDescriptorHandleIncrementSize(type);
     Log("xboxdev", "GetDescriptorHandleIncrementSize type=%u -> %u",
         (unsigned)type, n);
@@ -2897,6 +2957,7 @@ static HRESULT WINAPI XboxDevice_CreateRootSignature(
     XboxDeviceWrapper* self, UINT nodeMask, const void* pBlob,
     SIZE_T blobLength, REFIID riid, void** ppRootSignature) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("CreateRootSignature");
     HRESULT hr = self->real->CreateRootSignature(
         nodeMask, pBlob, blobLength, riid, ppRootSignature);
     if (hr == E_NOINTERFACE && ppRootSignature) {
@@ -2922,6 +2983,7 @@ static void WINAPI XboxDevice_CopyDescriptorsSimple(
     D3D12_CPU_DESCRIPTOR_HANDLE srcRangeStart,
     D3D12_DESCRIPTOR_HEAP_TYPE type) {
     if (!self || !self->real) return;
+    ProbeDeviceRemoval("CopyDescriptorsSimple");
     self->real->CopyDescriptorsSimple(numDescriptors, destRangeStart,
                                      srcRangeStart, type);
     Log("xboxdev",
@@ -2992,6 +3054,7 @@ static HRESULT WINAPI XboxDevice_WaitFrameEventX(
     (void)flags;
     (void)reserved;
     if (!self) return E_POINTER;
+    ProbeDeviceRemoval("WaitFrameEventX");
     // Six-argument ABI is what the title uses; older synthetic guests (and
     // the verify harness) still call the five-argument form, where the
     // token pointer arrives in the fifth slot instead. Accept either: use
@@ -3437,6 +3500,7 @@ static HRESULT WINAPI XboxList_Unimplemented(XboxCommandListWrapper* self,
 // the real list's Close().
 static HRESULT WINAPI XboxList_Close(XboxCommandListWrapper* self) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("list Close");
     HRESULT hr = self->real->Close();
     Log("xboxlist", "Close -> hr=0x%08x", (unsigned)hr);
     return hr;
@@ -3471,6 +3535,7 @@ static HRESULT WINAPI XboxList_SetDescriptorHeaps(
     XboxCommandListWrapper* self, UINT count,
     ID3D12DescriptorHeap* const* heaps) {
     if (!self || !self->real) return E_POINTER;
+    ProbeDeviceRemoval("list SetDescriptorHeaps");
     if (count > 8 || (count && !heaps)) {
         Log("xboxlist",
             "SetDescriptorHeaps(slot32) rejected count=%u heaps=%p", count,
@@ -3556,6 +3621,7 @@ static HRESULT WINAPI XboxList_Reset(XboxCommandListWrapper* self,
                         PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
         allocVt = *(void***)allocator;
     }
+    ProbeDeviceRemoval("list Reset");
     Log("xboxlist",
         "Reset(slot139) ENTER real=%p allocator=%p avt=%p initialState=%p",
         self->real, allocator, allocVt, initialState);
