@@ -196,11 +196,11 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-25 (boots through #168, GitHub head `51d86fe9`)
+## Status — 2026-11-25 (boots through #172, GitHub head `82397032`)
 
-**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (168 boots). No game frame yet, no menu yet.**
+**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (172 boots). No game frame yet, no menu yet.**
 
-**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet; current stop is a DEVICE_REMOVED assert at 0x142474606, and Freebuff's AI is probing every forwarded call to name the culprit).**
+**Progress: ~44% proven toward first menu (CBV unaligned-location fix PROVEN in boot #172 — the game passed the DEVICE_REMOVED assert at 0x142474606 and ran 16,079 log lines, nearly 4x further than boots #169/#170; TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet; current stop is a read AV at 0x1425A087D in boot #172).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -244,6 +244,7 @@ subsystem, not a dead harness.
 | BC1–BC7 decode + BC6H GPU verification bit-exact | ✅ | Entry 29, commit 51d86fe9, 118/118 vs independent decoder; BC6H 0/64 max 0 on RX 5700 XT, BC7 all 8 modes bit-exact on silicon |
 | Shader Phase 8: mesh-as-compute (CPU reference model) | ✅ | Entry 29, commit 51d86fe9, 79 checks, order-independent validator |
 | Link contract (no-DXC link smoke test) | ✅ | Entry 29, commit 51d86fe9, LNK2019 without emitter, clean link + run with it |
+| CBV unaligned-location fix (slot 17 copies to aligned scratch) | ✅ | Boot #172, 8 unaligned CBVs repointed to aligned scratch buffers, 0x142474606 absent (0 occurrences in 16,079 lines), game runs ~4x further than #169/#170 |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
 | Real shader translation from corpus | ❌ | No corpus yet (slots 86/16 don't create PSOs), no game shader translated |
@@ -251,7 +252,7 @@ subsystem, not a dead harness.
 | BCPack: BC6H calibration + DirectStorage wiring (B3–B5) | ❌ | B1 + B2 done; real BC1 learned tables not published, game chunks undecodable until calibrated |
 | Mesh-as-compute | ❌ | CPU-only prototype |
 
-Full per-function status: `docs/STATUS.md` (current state at the top, boots through #168).
+Full per-function status: `docs/STATUS.md` (current state at the top, boots through #172).
 
 **What works now (verified on the build machine, all eight harness guests
 ALL PASS):**

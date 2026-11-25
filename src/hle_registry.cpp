@@ -16,6 +16,8 @@
 #include <string.h>
 #include <vector>
 #include <utility>   // std::index_sequence (per-slot unimplemented stubs, build 82)
+#include <map>       // CBV source tracking (boot #171)
+#include <mutex>     // CBV source tracking (boot #171)
 #include <intrin.h>  // _ReturnAddress (COM wrapper unimplemented-slot log)
 
 namespace sc {
@@ -885,6 +887,160 @@ static void ProbeDeviceRemovalSlot(const char* kind, int slot) {
     ProbeDeviceRemoval(op);
 }
 
+// ---- CBV unaligned-location fix (boot #171) -------------------------
+// The desktop requires a CBV's BufferLocation to be 256-byte aligned;
+// the console does not. Boots #169/#170 proved the difference is fatal:
+// the first CBV with an unaligned location (loc mod 256 = 32, size 96)
+// removed the device with reason 0x887A0001, and the guest then hit its
+// DEVICE_REMOVED assert at 0x142474606. The size is already rounded up
+// (slot 17, boot #94); the location was not. Rounding the location down
+// would shift every constant the shader reads, so the layer copies the
+// data to a new 256-aligned UPLOAD buffer and points the CBV there.
+// To find the source data the layer tracks every buffer resource it
+// creates, by GPU VA range. The recorded pointer is raw and not AddRef'd:
+// the resource is alive at CBV-creation time because the game holds it
+// (it is creating a view into it), so the pointer is valid when used.
+// Only buffers are recorded (CBVs only point into buffers).
+struct ScCbvSourceRecord {
+    ID3D12Resource* resource;
+    UINT64 size;
+    D3D12_HEAP_TYPE heapType;
+};
+static std::map<D3D12_GPU_VIRTUAL_ADDRESS, ScCbvSourceRecord> g_cbvSources;
+static std::mutex g_cbvSourcesMutex;
+// Aligned scratch buffers made for unaligned CBVs. The CBV references
+// them, so they must outlive the boot; they are deliberately leaked (one
+// buffer per unaligned CBV, and unaligned CBVs are rare).
+static std::vector<ID3D12Resource*> g_cbvScratchBuffers;
+static std::mutex g_cbvScratchMutex;
+
+static void ScCbvRecordSource(ID3D12Resource* resource, UINT64 size,
+                              D3D12_HEAP_TYPE heapType) {
+    if (!resource || !size) return;
+    D3D12_GPU_VIRTUAL_ADDRESS base = resource->GetGPUVirtualAddress();
+    if (!base) return;
+    std::lock_guard<std::mutex> lock(g_cbvSourcesMutex);
+    g_cbvSources[base] = ScCbvSourceRecord{resource, size, heapType};
+}
+
+static bool ScCbvFindSource(D3D12_GPU_VIRTUAL_ADDRESS va,
+                            ScCbvSourceRecord* out, UINT64* outOffset) {
+    std::lock_guard<std::mutex> lock(g_cbvSourcesMutex);
+    auto it = g_cbvSources.upper_bound(va);
+    if (it == g_cbvSources.begin()) return false;
+    --it;
+    if (va < it->first || va >= it->first + it->second.size) return false;
+    *out = it->second;
+    *outOffset = va - it->first;
+    return true;
+}
+
+// If cbv->BufferLocation is not 256-aligned, copy the data to a new
+// 256-aligned UPLOAD buffer and repoint the CBV. The size must already
+// be rounded up to a 256 multiple by the caller. Returns true when the
+// CBV was repointed to a real copy, false when it fell back to a
+// zero-filled scratch buffer (source not found or not CPU-readable) or
+// when the scratch allocation itself failed (in which case the CBV is
+// left unaligned and the device will be removed, as before).
+static bool ScCbvFixUnalignedLocation(
+    ID3D12Device* device, D3D12_CONSTANT_BUFFER_VIEW_DESC* cbv) {
+    if (!device || !cbv) return false;
+    if ((cbv->BufferLocation & 255u) == 0) return true;
+    UINT64 loc = cbv->BufferLocation;
+    UINT size = cbv->SizeInBytes ? cbv->SizeInBytes : 256;
+    D3D12_HEAP_PROPERTIES uploadProps = {};
+    uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC scratchDesc = {};
+    scratchDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    scratchDesc.Width = size;
+    scratchDesc.Height = 1;
+    scratchDesc.DepthOrArraySize = 1;
+    scratchDesc.MipLevels = 1;
+    scratchDesc.Format = DXGI_FORMAT_UNKNOWN;
+    scratchDesc.SampleDesc.Count = 1;
+    scratchDesc.SampleDesc.Quality = 0;
+    scratchDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    scratchDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Resource* scratch = nullptr;
+    HRESULT hr = device->CreateCommittedResource(
+        &uploadProps, D3D12_HEAP_FLAG_NONE, &scratchDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        __uuidof(ID3D12Resource), (void**)&scratch);
+    if (FAILED(hr) || !scratch) {
+        Log("xboxdev",
+            "CBV unaligned loc=0x%llx size=%u: scratch alloc failed "
+            "hr=0x%08x, forwarding unaligned (device will be removed)",
+            (unsigned long long)loc, (unsigned)size, (unsigned)hr);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_cbvScratchMutex);
+        g_cbvScratchBuffers.push_back(scratch);
+    }
+    bool copied = false;
+    ScCbvSourceRecord src;
+    UINT64 offset = 0;
+    if (ScCbvFindSource(loc, &src, &offset) &&
+        src.heapType == D3D12_HEAP_TYPE_UPLOAD && src.resource) {
+        UINT64 avail = (offset < src.size) ? (src.size - offset) : 0;
+        UINT64 copyBytes = size < avail ? size : avail;
+        if (copyBytes > 0) {
+            D3D12_RANGE readRange = {(SIZE_T)offset,
+                                     (SIZE_T)(offset + copyBytes)};
+            void* srcData = nullptr;
+            HRESULT mapHr = src.resource->Map(0, &readRange, &srcData);
+            if (SUCCEEDED(mapHr) && srcData) {
+                void* dstData = nullptr;
+                D3D12_RANGE writeRange = {0, (SIZE_T)size};
+                HRESULT dstHr = scratch->Map(0, &writeRange, &dstData);
+                if (SUCCEEDED(dstHr) && dstData) {
+                    memcpy(dstData, (const BYTE*)srcData + offset,
+                           (size_t)copyBytes);
+                    if (copyBytes < size) {
+                        memset((BYTE*)dstData + copyBytes, 0,
+                               (size_t)(size - copyBytes));
+                    }
+                    scratch->Unmap(0, &writeRange);
+                    copied = true;
+                }
+                src.resource->Unmap(0, &readRange);
+            }
+        }
+    }
+    if (!copied) {
+        // Source not found or not CPU-readable: zero-fill the scratch so
+        // the CBV is still valid (the game proceeds; constants read
+        // zero). Loud log so the next boot shows whether the real copy
+        // path is needed (a GPU copy for DEFAULT-heap sources).
+        void* dstData = nullptr;
+        D3D12_RANGE writeRange = {0, (SIZE_T)size};
+        if (SUCCEEDED(scratch->Map(0, &writeRange, &dstData)) && dstData) {
+            memset(dstData, 0, size);
+            scratch->Unmap(0, &writeRange);
+        }
+        static int zeroFilled = 0;
+        if (zeroFilled < 8) {
+            ++zeroFilled;
+            Log("xboxdev",
+                "CBV unaligned loc=0x%llx size=%u: source not "
+                "CPU-readable, zero-filled scratch (constants read zero)",
+                (unsigned long long)loc, (unsigned)size);
+        }
+    }
+    cbv->BufferLocation = scratch->GetGPUVirtualAddress();
+    static int fixed = 0;
+    if (fixed < 8) {
+        ++fixed;
+        Log("xboxdev",
+            "CBV unaligned loc=0x%llx size=%u -> aligned scratch "
+            "0x%llx (%s)",
+            (unsigned long long)loc, (unsigned)size,
+            (unsigned long long)cbv->BufferLocation,
+            copied ? "copied" : "zero-filled");
+    }
+    return copied;
+}
+
 // ---- Xbox D3D12 device COM wrapper (graphics milestone #1) ----
 // The game calls Xbox D3D12 device methods via the Xbox vtable layout
 // (192 slots). Returning the raw desktop ID3D12Device* lets the game
@@ -1087,6 +1243,12 @@ static D3D12_HEAP_PROPERTIES* WINAPI XboxDevice_GetCustomHeapProperties(
 // Measured on this adapter: size 128 removes the device at any aligned
 // location, size 256/512 is accepted, and even a guest-only VA is
 // accepted at creation when the size is legal. Round up, never down.
+// Boot #171: the location has the same constraint. The desktop also
+// requires BufferLocation to be 256-aligned; boots #169/#170 proved an
+// unaligned location (loc mod 256 = 32, size 96) removes the device the
+// same way. ScCbvFixUnalignedLocation copies the data to an aligned
+// scratch buffer (see above); the location is never rounded down, which
+// would shift every constant the shader reads.
 static void WINAPI XboxDevice_CreateConstantBufferView(
     XboxDeviceWrapper* self,
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc,
@@ -1107,6 +1269,9 @@ static void WINAPI XboxDevice_CreateConstantBufferView(
                 (unsigned long long)_ReturnAddress());
         }
         cbv.SizeInBytes = rounded;
+    }
+    if (cbv.BufferLocation & 255u) {
+        ScCbvFixUnalignedLocation(self->real, &cbv);
     }
     self->real->CreateConstantBufferView(&cbv, DestDescriptor);
     Log("xboxdev",
@@ -2215,6 +2380,12 @@ static HRESULT WINAPI XboxDevice_CreateCommittedResource3(
             hr = E_FAIL;
         } else {
             *ppvResource = native;
+            // CBV fix (boot #171): record buffer resources by VA so an
+            // unaligned CBV location can be resolved to its source data.
+            if (useDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                ScCbvRecordSource(native, useDesc.Width,
+                                  pHeapProperties->Type);
+            }
         }
     } else {
         // Absolute: never S_OK without a valid object. Propagate
@@ -2812,6 +2983,15 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
         hr = self->real->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, useClear,
             __uuidof(ID3D12Resource), ppvResource);
+    }
+    // CBV fix (boot #171): record buffer resources by VA so an unaligned
+    // CBV location can be resolved to its source data. Slot 133 resources
+    // are DEFAULT-heap (not CPU-readable), so the CBV fix zero-fills for
+    // them; the record still lets the lookup name the source.
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource &&
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        ScCbvRecordSource((ID3D12Resource*)*ppvResource, desc.Width,
+                          D3D12_HEAP_TYPE_DEFAULT);
     }
     // Boot #56 instrumentation: dump the full desc (the boot #55 log
     // showed only va/hr/res — the desc fields are needed to correlate
