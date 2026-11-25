@@ -145,3 +145,20 @@ fell from 8,107,995,931 bytes to 319,363 bytes, so boots no longer leave a multi
 
 This is the next thing to fix: an int3 is executing inside the layer's stub area, which means a
 call is arriving at a stub slot that was never redirected.
+
+### Boot #267: full length forwarded, gate still ret=0, same assert at 0x1409dfc18
+
+The 116-byte clamp was removed for this buffer now that the tail exists, and the boot forwarded
+size=9168400 unchanged:
+
+```
+gate-probe entry buf=000002D1AAA4F520 size=9168400 flag=0 fourcc='PSIN' beLen=0x3340c0 ret=0
+crash-record code=0x80000003 addr=0x1409dfc18 rip=0x1409dfc18 rsp=0xf4e6dfe4a0
+        stack=[0x10000000000e610,0x2d1aaa50520,0x8bd610,0x1478d5810] access=0x0
+framed-ok lines: 84
+minidump: wrote ... (321667 bytes, compact)
+```
+
+Identical outcome to #266, so the clamp never mattered; `0x1409dfc18` is the guest assert after a
+false gate verdict, not a broken thunk. The gate rejects the content even with a terminator
+present.

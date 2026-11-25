@@ -937,7 +937,9 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // = 9168400) runs 116 bytes past the last chunk our walk frames, so forward the
     // framed end to the real gate for this buffer only; every other buffer keeps
     // its size unchanged.
-    const uint32_t useSize = (size == 9168400u) ? 9168284u : size;
+    // The 116-byte terminator is now present (host-authored), so forward the full
+    // requested length: the earlier clamp existed only because the tail was absent.
+    const uint32_t useSize = size;
     if (size == 9168400u) ScBufProbe(buf, size, "pre");
     Log("loader", "gate-forward in=%u out=%u %s", size, useSize,
         useSize == size ? "unchanged" : "clamped-to-framed-end");

@@ -182,3 +182,22 @@ requested stream size:
 The tail written by `ScSynthesizeFramedTail` is HOST-AUTHORED; `framed-ok` here means the
 probe's presence scan saw host-authored terminator bytes, not guest-produced ones. The game's
 own gate still returns 0 (`ret=0`) for the 9,168,400-byte stream.
+
+## 2026-11-25 (boots #266–#267): what ends the boot, and that the clamp is not the cause
+
+#266's crash record was `code=0x80000003 addr=0x1409dfc18 rip=0x1409dfc18`, i.e. the guest's own
+`int3` assert reached after `0x1409dfc30` → gate `0x14407e700` returns false; the dump is
+compact (319,363 bytes) and no longer full memory. It was **not** an unresolved thunk slot.
+
+#267 then forwarded the full requested length (9,168,400) instead of the framed end
+(9,168,284), since the host-authored tail now exists:
+
+```
+gate-probe entry buf=000002D1AAA4F520 size=9168400 flag=0 fourcc='PSIN' beLen=0x3340c0 ret=0
+crash-record code=0x80000003 addr=0x1409dfc18 rip=0x1409dfc18 rsp=0xf4e6dfe4a0
+framed-ok lines: 84
+```
+
+Same verdict, same assert: the earlier clamp was not what the gate objected to. The gate
+rejects the stream's content with the host-authored tail present, so `framed-ok` on our
+presence scan carries no weight with the game's parser.
