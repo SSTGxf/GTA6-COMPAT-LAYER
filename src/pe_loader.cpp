@@ -759,6 +759,16 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+    if (size == 9168400u) {
+        const uint8_t* q1 = (const uint8_t*)buf + size - 32;
+        Log("loader", "gate-probe tail32 %02x%02x%02x%02x%02x%02x%02x%02x "
+            "%02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x "
+            "%02x%02x%02x%02x%02x%02x%02x%02x",
+            q1[0],q1[1],q1[2],q1[3],q1[4],q1[5],q1[6],q1[7],
+            q1[8],q1[9],q1[10],q1[11],q1[12],q1[13],q1[14],q1[15],
+            q1[16],q1[17],q1[18],q1[19],q1[20],q1[21],q1[22],q1[23],
+            q1[24],q1[25],q1[26],q1[27],q1[28],q1[29],q1[30],q1[31]);
+    }
     char fc[5] = {(char)(fourcc >> 24), (char)(fourcc >> 16),
                   (char)(fourcc >> 8), (char)fourcc, 0};
     Log("loader",
