@@ -108,7 +108,7 @@ Tracked as not-implemented: `XGameSaveCreateUpdate` /
 `XPackageEnumeratePackages` are now implemented — the remaining gaps are
 whole areas not yet in the registry — XSAPI (live Xbox Live —
 stub/fail-soft only), XGameUI / TCUI, XDisplay, XSystem, XStore, Game
-Chat, AcpHal / XMA, BCPack, shader lifting (real-shader translation;
+Chat, AcpHal / XMA, BCPack (B1 + B2 done — BC1 decoder + entropy-only layouts for BC3/4/5/BC6H/BC7; DirectStorage wiring + BC6H calibration still open), shader lifting (real-shader translation;
 the pipeline infrastructure Phases 0–5 is built), texture de-tiling
 (`XBOX_TILEMODE_SCARLETT`), unified memory (`MEM_GRAPHICS`).
 
@@ -196,11 +196,11 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-24 (boots through #155, GitHub head `5974f56b`)
+## Status — 2026-11-24 (boots through #162, GitHub head `a88e5097`)
 
-**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (155 boots). No game frame yet, no menu yet.**
+**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (162 boots). No game frame yet, no menu yet.**
 
-**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, game now hammering slot 86 for PSO creation; slot 86 still E_NOTIMPL, no frame yet).**
+**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -233,13 +233,16 @@ subsystem, not a dead harness.
 | WaitFrameEventX: 6-arg form (token is 6th arg) | ✅ | Commit 446b178e, boot #133 |
 | Slot 139: Reset + XMemMapPhysicalPages at guest's base | ✅ | Commit f0a46369, boot #111 |
 | VEH: crash-context logging (TEB, saved rbx, return address) | ✅ | Commit 5974f56b |
-| Game in PSO creation territory (slot 86, 24,000+ calls/boot) | ✅ | Boot #154, slot 86 from game 0x142479A8D |
+| Game in PSO creation territory (slot 86, 28,000+ calls/boot) | ✅ | Boot #162, slot 86 from game 0x142479A8D |
 | Shader pipeline Phases 0–5 (infrastructure + build gate) | ✅ | Phases 0–5 harness-green (125/35/804/728/236/151), /W4 /WX 0 warnings, on GitHub (commits 7c654f2 + b4f0f1f) |
+| Layout 258 (0x102) as 4 KiB-tile layout | ✅ | Boot #158, 1280x720 R32_UINT sizes to 3,768,320 / align 4096, places hr=0 |
+| BCPack B1: BC1 decoder (rANS + BC1 rebuilder) | ✅ | Commit 8b8511f, 128/128 model tables + 8/8 chunks identical to bcpack-decoder, harness 39/39 |
+| BCPack B2: entropy-only lane layouts BC3/4/5/BC6H/BC7 | ✅ | Commit a88e5097, 24/24 codec/block comparisons vs bcpack-decoder lanes, harness 149/149 |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
 | Real shader translation from corpus | ❌ | No corpus yet (slots 86/16 don't create PSOs), no game shader translated |
 | First frame / menu on screen | ❌ | 0 presents (boot #78 segment) |
-| BCPack decode | ❌ | B1 spec written, not implemented |
+| BCPack: BC6H calibration + DirectStorage wiring (B3–B5) | ❌ | B1 + B2 done; real BC1 learned tables not published, game chunks undecodable until calibrated |
 | Mesh-as-compute | ❌ | CPU-only prototype |
 
 Full per-function status: `docs/STATUS.md` (current state at the top, boots through #97).
@@ -296,7 +299,7 @@ ALL PASS):**
   vs heap-create 10,000x 8,355.408 ms. (6) DirectStorage + BCPack: batch
   16x4 MB 26.998 ms vs sync 70.993 ms (overlapped I/O — the desktop
   DirectStorage runtime is not on the build machine); ZLIB stored/fixed/
-  dynamic all decode; BCPack BC7 E_NOTIMPL (rANS format not public).
+  dynamic all decode; BCPack BC1 decoder + entropy-only layouts for BC3/4/5/BC6H/BC7 now implemented (B1 + B2, commits 8b8511f + a88e5097) — DirectStorage wiring still open.
   (7) Shader precompilation cache: compile 2.764 ms vs load 0.223 ms,
   blobs byte-identical, corruption recovered. (8) RT mode selector — see
   below. (9) Frame batching: 16 separate submits 0.260 ms vs 1 batched
