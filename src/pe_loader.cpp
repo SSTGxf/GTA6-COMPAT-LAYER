@@ -914,6 +914,153 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     return r;
 }
 
+
+// ---- guest kernel32 file/mapping interception (observe-then-forward) --------
+// The guest runs in-process and calls real kernel32, so the layer only sees its
+// own DStorage paths. These hooks rewrite the guest image's IAT slots and log one
+// line per call carrying dest, requested bytes, bytes returned, the file size we
+// report for that handle and GetLastError. Args are forwarded unchanged.
+typedef BOOL (WINAPI *ScReadFileFn)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+typedef BOOL (WINAPI *ScSetFilePointerExFn)(HANDLE, LARGE_INTEGER, PLARGE_INTEGER, DWORD);
+typedef BOOL (WINAPI *ScGetFileSizeExFn)(HANDLE, PLARGE_INTEGER);
+typedef HANDLE (WINAPI *ScCreateFileWFn)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES,
+                                         DWORD, DWORD, HANDLE);
+typedef LPVOID (WINAPI *ScMapViewOfFileFn)(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+
+static ScReadFileFn g_realReadFile = nullptr;
+static ScSetFilePointerExFn g_realSetFilePointerEx = nullptr;
+static ScGetFileSizeExFn g_realGetFileSizeEx = nullptr;
+static ScCreateFileWFn g_hookCfW = nullptr;
+static ScMapViewOfFileFn g_realMapViewOfFile = nullptr;
+static volatile LONG g_ioHooked = 0;
+
+static unsigned long long ScHandleSize(HANDLE h) {
+    LARGE_INTEGER li = {};
+    if (h && h != INVALID_HANDLE_VALUE && g_realGetFileSizeEx &&
+        g_realGetFileSizeEx(h, &li))
+        return (unsigned long long)li.QuadPart;
+    return 0ull;
+}
+
+static BOOL WINAPI ScHookReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD got,
+                                  LPOVERLAPPED ov) {
+    const DWORD want = n;
+    SetLastError(0);
+    BOOL r = g_realReadFile(h, buf, want, got, ov);
+    const DWORD e = GetLastError();
+    const unsigned long long fsz = ScHandleSize(h);
+    Log("io", "io guestReadFile dst=%llx req=%lu got=%lu fileLen=%llu ret=%d err=%lu",
+        (unsigned long long)(uintptr_t)buf, (unsigned long)want,
+        (unsigned long)(got ? *got : 0), fsz, (int)r, (unsigned long)e);
+    SetLastError(e);
+    return r;
+}
+
+static BOOL WINAPI ScHookSetFilePointerEx(HANDLE h, LARGE_INTEGER d, PLARGE_INTEGER np,
+                                          DWORD m) {
+    SetLastError(0);
+    BOOL r = g_realSetFilePointerEx(h, d, np, m);
+    const DWORD e = GetLastError();
+    Log("io", "io guestSeek h=%p dist=%lld method=%lu fileLen=%llu ret=%d err=%lu",
+        h, (long long)d.QuadPart, (unsigned long)m, ScHandleSize(h), (int)r,
+        (unsigned long)e);
+    SetLastError(e);
+    return r;
+}
+
+static BOOL WINAPI ScHookGetFileSizeEx(HANDLE h, PLARGE_INTEGER out) {
+    SetLastError(0);
+    BOOL r = g_realGetFileSizeEx(h, out);
+    const DWORD e = GetLastError();
+    Log("io", "io guestGetFileSizeEx h=%p size=%lld ret=%d err=%lu", h,
+        (long long)(out ? out->QuadPart : 0), (int)r, (unsigned long)e);
+    SetLastError(e);
+    return r;
+}
+
+static HANDLE WINAPI ScHookCreateFileW(LPCWSTR path, DWORD acc, DWORD share,
+                                       LPSECURITY_ATTRIBUTES sa, DWORD disp,
+                                       DWORD flags, HANDLE tpl) {
+    SetLastError(0);
+    HANDLE h = g_hookCfW(path, acc, share, sa, disp, flags, tpl);
+    const DWORD e = GetLastError();
+    Log("io", "io guestCreateFileW h=%p fileLen=%llu err=%lu", h, ScHandleSize(h),
+        (unsigned long)e);
+    SetLastError(e);
+    return h;
+}
+
+static LPVOID WINAPI ScHookMapViewOfFile(HANDLE h, DWORD acc, DWORD hi, DWORD lo,
+                                         SIZE_T n) {
+    SetLastError(0);
+    LPVOID p = g_realMapViewOfFile(h, acc, hi, lo, n);
+    const DWORD e = GetLastError();
+    Log("io", "io guestMapViewOfFile view=%llx req=%llu fileLen=%llu err=%lu",
+        (unsigned long long)(uintptr_t)p, (unsigned long long)n, ScHandleSize(h),
+        (unsigned long)e);
+    SetLastError(e);
+    return p;
+}
+
+static void HookGuestImports(void* base) {
+    if (InterlockedCompareExchange(&g_ioHooked, 1, 0) != 0) return;
+    __try {
+        uint8_t* img = (uint8_t*)base;
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)img;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(img + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+        IMAGE_DATA_DIRECTORY* dir = &nt->OptionalHeader.DataDirectory
+                                         [IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dir->VirtualAddress || !dir->Size) return;
+        IMAGE_IMPORT_DESCRIPTOR* imp =
+            (IMAGE_IMPORT_DESCRIPTOR*)(img + dir->VirtualAddress);
+        unsigned hooked = 0;
+        for (; imp->Name; ++imp) {
+            IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*)(img + imp->FirstThunk);
+            for (; thunk->u1.Function; ++thunk) {
+                void** slot = (void**)&thunk->u1.Function;
+                void* cur = *slot;
+                if (!cur) continue;
+                const char* want = nullptr;
+                void* repl = nullptr;
+                if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                 "ReadFile")) {
+                    g_realReadFile = (ScReadFileFn)cur;
+                    want = "ReadFile"; repl = (void*)&ScHookReadFile;
+                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                        "SetFilePointerEx")) {
+                    g_realSetFilePointerEx = (ScSetFilePointerExFn)cur;
+                    want = "SetFilePointerEx"; repl = (void*)&ScHookSetFilePointerEx;
+                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                        "GetFileSizeEx")) {
+                    g_realGetFileSizeEx = (ScGetFileSizeExFn)cur;
+                    want = "GetFileSizeEx"; repl = (void*)&ScHookGetFileSizeEx;
+                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                        "CreateFileW")) {
+                    g_hookCfW = (ScCreateFileWFn)cur;
+                    want = "CreateFileW"; repl = (void*)&ScHookCreateFileW;
+                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                        "MapViewOfFile")) {
+                    g_realMapViewOfFile = (ScMapViewOfFileFn)cur;
+                    want = "MapViewOfFile"; repl = (void*)&ScHookMapViewOfFile;
+                }
+                if (!want) continue;
+                DWORD old = 0;
+                if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+                    *slot = repl;
+                    VirtualProtect(slot, sizeof(void*), old, &old);
+                    ++hooked;
+                    Log("loader", "import-hook %s slot=%p real=%p", want, slot, cur);
+                }
+            }
+        }
+        Log("loader", "import-hook complete: %u slots", hooked);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "import-hook faulted 0x%08lx", GetExceptionCode());
+    }
+}
+
 // Redirect the 5-byte call at 0x1409dfcc1 through a stub in the guest's own
 // address range (rel32 cannot reach this DLL).
 static void PatchGateProbe(void* base) {
@@ -954,6 +1101,7 @@ static void PatchGateProbe(void* base) {
         Log("loader",
             "gate-probe: redirected 0x%llx -> stub=%p wrapper=%p (rel=0x%x)",
             (unsigned long long)callVa, stub, (void*)&ScGateProbe, rel);
+        HookGuestImports(base);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("loader", "gate-probe: patch faulted 0x%08lx", GetExceptionCode());
     }
