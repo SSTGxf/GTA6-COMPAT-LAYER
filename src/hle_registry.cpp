@@ -5634,6 +5634,13 @@ extern "C" void DsqSubmit(void* self) {
                 continue;
             }
             if (compSize == destSize) {
+                // Delivery accounting for this chunk: the member's extent is 139
+                // full 64 KiB pages plus a 58,896-byte partial page (framed end
+                // 9,168,284 inside a 9,168,400-byte offer). Record what this
+                // completion actually writes so a short final page is visible.
+                Log("mapping",
+                    "raw copy chunk dest=%p src=%p destSize=0x%llx compSize=0x%x",
+                    (void*)dest, comp, (unsigned long long)destSize, compSize);
                 memcpy((void*)dest, comp, destSize);
                 g_dsLastResolvedPack = packPath;
                 free(comp);
