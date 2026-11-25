@@ -697,6 +697,105 @@ static void FreeGaView() {
 // Only the disp32 (bytes 5..8) is rewritten, to 0x1480 + 8*gaSlot;
 // the instruction keeps its length. Returns the number of sites
 // patched. Runs while the image is RWX, before section protections.
+
+// ---------------------------------------------------------------------------
+// Gate probe: capture the call to 0x14407e700 made from 0x1409dfcc1.
+//
+// Boots #203/#204 die at 0x1409DFC18 because 0x1409dfc30 returns 0, and the
+// only false-return on this path is that gate call. The gate itself is left
+// completely untouched: the 5-byte `call rel32` is redirected to a stub that
+// jumps to this logging wrapper, which calls the *real* gate with the same
+// arguments and returns its value unchanged.
+// ---------------------------------------------------------------------------
+typedef bool (*ScGateFn)(void*, const void*, uint32_t, uint8_t, void*, void*);
+
+static void ScLogGate(const char* tag, void* obj, const void* buf,
+                      uint32_t size, uint8_t flag, void* a5, void* a6,
+                      bool ret, uint8_t al) {
+    uint32_t status = 0xffffffffu;
+    bool statusOk = false;
+    __try {
+        if (a6) {
+            status = *(const uint32_t*)a6;
+            statusOk = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    uint32_t fourcc = 0, blen = 0;
+    __try {
+        if (buf) {
+            const uint8_t* b = (const uint8_t*)buf;
+            fourcc = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+                     ((uint32_t)b[2] << 8) | b[3];
+            blen = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
+                   ((uint32_t)b[6] << 8) | b[7];
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    char fc[5] = {(char)(fourcc >> 24), (char)(fourcc >> 16),
+                  (char)(fourcc >> 8), (char)fourcc, 0};
+    Log("loader",
+        "gate-probe %s tid=%lu obj=%p buf=%p size=%u flag=%u fourcc='%s' "
+        "(0x%08x) beLen=0x%x a5=%p a6=%p status=%s%u ret=%d al=%u",
+        tag, (unsigned long)GetCurrentThreadId(), obj, buf, size, flag, fc,
+        fourcc, blen, a5, a6, statusOk ? "" : "?", status, (int)ret,
+        (unsigned)al);
+}
+
+static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
+                        void* a5, void* a6) {
+    ScGateFn real = (ScGateFn)(uintptr_t)0x14407e700ull;
+    ScLogGate("entry", obj, buf, size, flag, a5, a6, false, 0);
+    bool r = real(obj, buf, size, flag, a5, a6);
+    ScLogGate("return", obj, buf, size, flag, a5, a6, r, r ? 1 : 0);
+    return r;
+}
+
+// Redirect the 5-byte call at 0x1409dfcc1 through a stub in the guest's own
+// address range (rel32 cannot reach this DLL).
+static void PatchGateProbe(void* base) {
+    const uint64_t callVa = 0x1409dfcc1ull;
+    const uint64_t site = (uint64_t)(uintptr_t)base + 0x9dfcc1;
+    __try {
+        uint8_t* p = (uint8_t*)(uintptr_t)site;
+        if (p[0] != 0xE8) {
+            Log("loader", "gate-probe: call site is 0x%02x, not E8; skipped",
+                p[0]);
+            return;
+        }
+        // Stub near the image: jmp qword ptr [rip+0] ; <abs target>
+        SYSTEM_INFO si = {};
+        GetSystemInfo(&si);
+        uint64_t want = 0x150000000ull;
+        void* stub = VirtualAlloc((void*)(uintptr_t)want, 0x1000,
+                                  MEM_RESERVE | MEM_COMMIT,
+                                  PAGE_EXECUTE_READWRITE);
+        if (!stub) {
+            Log("loader", "gate-probe: stub alloc failed (%lu)",
+                (unsigned long)GetLastError());
+            return;
+        }
+        uint8_t* s = (uint8_t*)stub;
+        s[0] = 0xFF;
+        s[1] = 0x25;
+        *(int32_t*)(s + 2) = 0;
+        *(uint64_t*)(s + 6) = (uint64_t)(uintptr_t)&ScGateProbe;
+        VirtualProtect(p, 8, PAGE_EXECUTE_READWRITE, nullptr);
+        DWORD old = 0;
+        VirtualProtect(p, 8, PAGE_EXECUTE_READWRITE, &old);
+        int32_t rel = (int32_t)((int64_t)(uintptr_t)stub - (int64_t)(site + 5));
+        p[0] = 0xE8;
+        *(int32_t*)(p + 1) = rel;
+        FlushInstructionCache(GetCurrentProcess(), p, 8);
+        VirtualProtect(p, 8, old ? old : PAGE_EXECUTE_READ, &old);
+        Log("loader",
+            "gate-probe: redirected 0x%llx -> stub=%p wrapper=%p (rel=0x%x)",
+            (unsigned long long)callVa, stub, (void*)&ScGateProbe, rel);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "gate-probe: patch faulted 0x%08lx", GetExceptionCode());
+    }
+}
+
 static size_t PatchGaTlsReads(void* base, const IMAGE_NT_HEADERS64* nt) {
     DWORD slot = GaSlot();
     if (slot == TLS_OUT_OF_INDEXES) {
@@ -1850,6 +1949,7 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     // Same window as above — while the image is RWX, before section
     // protections and before any image code (TLS callbacks) runs.
     PatchGaTlsReads(base, nt);
+    PatchGateProbe(base);
 
     // Final page protections: per-section (text XR, rodata R, data RW).
     // Applied AFTER relocations + imports, which write into the image.

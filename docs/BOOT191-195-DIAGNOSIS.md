@@ -626,3 +626,44 @@ resource path present here that earlier boots never reached.
 Not measured yet (requires the gate call's actual rdx/size at 0x1409dfcc1): which
 descriptor was passed and which of the gate's later conditions failed. No fix
 landed, no rebuild, no boot in this pass; nothing patched or forced.
+
+## §16 The gate call captured live (boots #205/#206) — the gate itself rejects the PSIN buffer
+
+Instrumentation landed: the 5-byte `call rel32` at `0x1409dfcc1` is redirected to a
+stub (`jmp [rip+0]`, then the absolute address of the wrapper) allocated inside
+the guest address range, and the wrapper calls the **real** gate with the same
+arguments and returns its value unchanged. The gate is not modified, not
+short-circuited and not weakened.
+
+Live capture of the failing call (boot #205, 171 `gate-probe` lines in total):
+
+```
+gate-probe entry  tid=25660 obj=000002714401DB30 buf=00000271495DFE60 size=9168400
+                  flag=0 fourcc='PSIN' (0x5053494e) beLen=0x3340c0 ret=0 al=0
+gate-probe return tid=25660 obj=000002714401DB30 buf=00000271495DFE60 size=9168400
+                  flag=0 fourcc='PSIN' (0x5053494e) beLen=0x3340c0 ret=0 al=0
+```
+
+and with the out-parameter printed (boot #206):
+
+```
+gate-probe entry tid=24192 obj=000001B4BC20D9F0 buf=000001B4BDBCD580 size=9168400
+                 flag=0 fourcc='PSIN' (0x5053494e) beLen=0x3340c0
+                 a5=0000006407DFDDC4 a6=0000000000000000 status=?4294967295 ret=0 al=0
+```
+
+Facts this establishes:
+
+- the buffer handed to the gate is the full 9,168,400-byte PSIN stream;
+- its first chunk is `PSIN` with BE length `0x3340C0`, which is `<=` the buffer
+  size, so the size guard at `0x14407e765` passes;
+- the fourcc is one the gate accepts, so the fourcc dispatch is not the cause;
+- the 6th argument (the status out-pointer at `[rsp+0xd8]` in the gate) is NULL
+  for this call, so the gate reports nothing through it;
+- earlier calls on the same path with `size=1640` (`beLen=0x170`) and `size=512`
+  (`beLen=0x80`) return 1 — only the full-stream call returns 0.
+
+So the rejection is a later internal guard of the PSIN parser, not the header,
+the size or the fourcc. Not yet measured: which internal guard (the parser's
+chunk-walk is the next probe target). No fix landed this pass, no int3 patch, no
+forced return, gate untouched.
