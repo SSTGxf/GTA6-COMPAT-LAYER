@@ -818,3 +818,31 @@ gate still returns 0 and the boot still stops at 0x1409DFC18.
 Measured conclusion: the wrong raw page was the only writer of that region; when
 it is refused nothing supplies the real `LGID+LRSC+CHKS`. The tail is therefore
 absent from the data this layer can reach, not misplaced by a base shift.
+
+## §22 There is no member-resolution code to reuse: the container is RPF9
+
+Measured from the container this layer reads:
+
+```
+D:\game\game\packs.rpf  size 4,798,213,264
+first 16 bytes: 39 46 50 52 45 50 00 00 40 3f 00 00 90 1c 00 00
+magic bytes = "RPF9"  (u32 LE 0x52504639)
+next u32s: 0x00004550, 0x00003f40, 0x00001c90, 0x57fb6798, 0x706499ba, 0x00047a00, 0x00000150
+'RPF0'..'RPF8' markers in the first 1 MiB: none
+```
+
+`grep -rn "RPF" src/*.cpp` shows **no TOC/directory parser anywhere** in this codebase:
+the only RPF handling is the copy-coverage probing in `hle_registry.cpp`
+(`ScDsResolvePack` / `ScDsPackByCoverage` / `ScDsReprobePack`). So the "real member
+resolution" the previous pass proposed cannot be implemented by wiring up an
+existing parser — RPF9 (the format this game uses) has no implementation here and
+no public layout to copy.
+
+That closes the loop on the tail question honestly: the trailing 116 bytes are not
+missing because of a base or extent error that this layer can correct with its
+current knowledge; they are missing because this layer does not know the member
+layout of an RPF9 container, and therefore cannot fetch the member's true byte
+range. Everything up to 9,168,284 arrives correctly because the guest's own page
+requests happen to land inside the member.
+
+No code changed in this pass. No claim is made beyond the hex and sizes quoted.
