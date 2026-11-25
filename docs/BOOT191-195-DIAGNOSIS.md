@@ -500,3 +500,42 @@ object. Not patched (forbidden), and no return value is forced: the next step is
 to establish which guest TLS index/object is being tested and why its `+8` byte
 is zero — i.e. which guest subsystem's per-thread state the current host thread
 never created.
+
+## §13 The 0x1409DFC18 stop — call chain and the reporting thunk (measured)
+
+From boot #203's log (the VEH already walks the stack on `int3`):
+
+```
+veh: exception 0x80000003 at 00000001409DFC18 thread 11640
+[watch] stack: 0x14667d140, 0x141621ca0
+```
+
+`0x141621ca0` is the return address of `0x141621c9b call 0x1409df9d0`, so the
+stop is inside the guest function that starts at `0x1409df9d0`, entered from
+`0x141621c9b`. The reporting path inside it is a thunk:
+
+```
+0x1409dfc0e: call 0x1455db994
+0x1455db994: xor r8d,r8d; xor ecx,ecx; edx=2; jmp 0x1455dd4f4
+0x1455dd4f4: cmp edx,2; je ...
+0x1455dd509: mov rax, qword ptr gs:[0x58]
+0x1455dd503: mov ecx, dword ptr [rip + 0x182b623]   ; -> 0x146e08b2c
+0x1455dd518: mov rdx, qword ptr [rax + rcx*8]        ; guest per-thread object
+0x1455dd51c: cmp byte ptr [rdx + 8], 1
+0x1455dd521: je  0x1455dd54f
+0x1455dd523: mov byte ptr [rdx + 8], 1               ; "already reported" latch
+```
+
+So the same `[obj+8]` byte is both the condition at `0x1409dfc01` and a
+report-once latch inside the reporting function.
+
+`0x146e08b2c` in the image file holds `e0 d3 07 00 | 3b d4 07 00`, i.e.
+`0x0007d3e0` / `0x0007d43b` — not valid TLS indices, so that dword is a
+**relocation/initialiser placeholder in the file**; the real runtime index has
+to be read from a live process/dump rather than the image. The mount-probe in
+the same boot prints `tlsArray=… slot0=… slot10=… view=… view0=…` populated, so
+the guest is using low indices at runtime, not 0x7d3e0.
+
+Not done this pass and explicitly not claimed: no fix landed for
+`0x1409DFC18`, no new binary was booted, and the assert text was not recovered.
+The int3 was not patched and no value was forced.
