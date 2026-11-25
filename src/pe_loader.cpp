@@ -3021,6 +3021,23 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
             q ? (unsigned long)mbi.Protect : 0ul,
             q ? (unsigned long long)(uintptr_t)mbi.BaseAddress : 0ull,
             q ? (unsigned long long)mbi.RegionSize : 0ull);
+        // Guest-reserved arenas are committed lazily. The guest reserves a large
+        // VA range and touches it without an explicit commit, so commit the single
+        // 64 KiB page containing the touched address and retry the instruction.
+        // Scoped to MEM_RESERVE regions only: committed pages, our own mappings and
+        // every other fault keep their existing handling.
+        if (q && mbi.State == MEM_RESERVE &&
+            ep->ExceptionRecord->ExceptionInformation[0] == 0) {
+            void* page = (void*)(uintptr_t)(fa & ~(uint64_t)0xFFFF);
+            void* c = VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE);
+            Log("loader",
+                "veh: lazy-commit page=%p in reserved region base=%p size=0x%llx "
+                "-> %p (err %lu)",
+                page, (void*)(uintptr_t)mbi.BaseAddress,
+                (unsigned long long)mbi.RegionSize, c,
+                c ? 0ul : (unsigned long)GetLastError());
+            if (c) return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
     if (code == 0xc0000005 && g_guestTlsReady && g_tlsInfo.valid &&
         ep->ExceptionRecord->NumberParameters >= 2 &&

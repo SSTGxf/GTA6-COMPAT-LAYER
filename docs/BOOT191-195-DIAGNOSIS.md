@@ -1043,3 +1043,26 @@ PSIN chunk; `0x8be2d0` is the concatenated buffer extent. Shrinking the buffer t
 `beLen` would truncate the stream and rewriting `beLen` would corrupt pack data; both
 are closed. The `0x80000003` assert at `0x1409DFC18` no longer fires in #222
 (`ret=1 al=1`), and the run stops at `0xc0000005` in the `0x144...` family instead.
+
+## §30 VEH lazy-commit for guest-reserved arenas (unexercised)
+
+Boot #222 faulted at `0x144fc21f5` reading `base+0xa9d` inside a `MEM_RESERVE`
+region (`state=0x2000`, `protect=0x0`, base `0x2588b3c8000`, size `0x3e5888000`):
+the guest reserved an arena and touched it without an explicit commit. The VEH now
+commits the single 64 KiB page containing a write/read fault whose region state is
+`MEM_RESERVE`, then retries the instruction:
+
+```
+veh: lazy-commit page=%p in reserved region base=%p size=0x%llx -> %p (err %lu)
+```
+
+Scoped strictly to `mbi.State == MEM_RESERVE`; committed pages, the loader's own
+mappings and every other fault keep their previous handling unchanged.
+
+Status: `build_ga223` is green (`BUILD_EXIT=0`, `149 checks, 0 failed`,
+`verify exit code: 0`) but the path has never fired — boot #223 logged 0
+`lazy-commit` lines because the run stopped earlier at `0x1409DFC18`. Unexercised,
+not a proven fix.
+
+Gate instability, measured: #220 `ret=0`, #221 `ret=0`, #222 `ret=1 al=1`,
+#223 `ret=0` — same gate code across those builds, so the verdict is not yet stable.
