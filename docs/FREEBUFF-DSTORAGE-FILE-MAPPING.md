@@ -707,3 +707,77 @@ are a sign-extended 32-bit value, not a pointer.
 **Milestone status: not reached.** The boot still ends at this abort stub; there is no present,
 frame or menu line in boots #283/#284. The stop is guest-internal and cannot be skipped without
 leaving the subsystem uninitialised (explicitly out of scope).
+
+## 2026-11-25 (boot #285): the abort slot belongs to the BASE provider; a derived provider with a real slot 6 exists
+
+Static work on the two tables named the pair. The crashing object is a static singleton, not a heap
+object: the image's own initialiser stores the vtable into it.
+
+```
+0x14221a500: lea rax, [rip + 0x40e1b59]        ; -> 0x1462fc060
+0x14221a507: mov qword ptr [rip + 0x4fa7052], rax   ; -> 0x1471c1560
+0x14221a525: lea rdx, [rip + 0x4fa7034]        ; -> 0x1471c1560 (registered by address)
+```
+
+So `0x1471C1560` is a **static instance** (image RVA `0x71C1560`) and `0x1462FC060` (RVA
+`0x62FC060`, in `.rdata`) is its class's vtable, whose slot 6 is `0x142219BE0: jmp 0x1422106E0`.
+
+The same service has a second, implementing class. The factory at `0x14023CB90` returns the
+singleton in the pointer slot `0x1471BFA58`:
+
+```
+0x14023cb90: mov rax, qword ptr [rip + 0x6f82ec1]   ; -> 0x1471bfa58
+0x14023cb97: ret
+```
+
+Boot #285 dumped that singleton at the crash (bounded, validated reads):
+
+```
+loader    ] int3 factory=1471bfa60
+loader    ] int3 factory vt=146188260 slot6=1422196b0
+```
+
+`0x146188260` (RVA `0x6188260`) is a **different class**, and its slot 6 is real:
+
+```
+0x1422196b0: mov rcx, qword ptr [rcx + 0x20]   ; the implementing sub-object
+0x1422196b4: mov rax, qword ptr [rcx]
+0x1422196b7: mov rax, qword ptr [rax + 0x30]
+0x1422196bb: jmp rax                            ; forwards slot 6 to it
+```
+
+Both tables, side by side:
+
+| class | vtable | slot 0 | slot 5 | slot 6 | slot 7 |
+|---|---|---|---|---|---|
+| base (crashed) | 0x1462FC060 | 0x14004B940 | 0x14005A0F0 | 0x142219BE0 -> abort | 0x142219BF0 |
+| derived (factory) | 0x146188260 | 0x144F8DDC0 | 0x14005A0F0 | 0x1422196B0 -> forwards to [+0x20] | 0x1422106A0 |
+
+### Why no type name is available
+
+MSVC would put a Complete Object Locator at `vtable[-8]`. Both tables have `slot[-1] = 0x0`, checked
+against the real section map (`.rdata` VA `0x5f41000`, `.data` VA `0x67e2000`):
+
+```
+vtable rva 0x62fc060:  slot[-2]=0x14288a620  slot[-1]=0x0
+```
+
+The image does carry RTTI for other types (133 `.?AV` and 76 `.?AU` strings), so the absence here is
+per-class, not a stripped binary. **Neither class can be named from the binary**; only its identity,
+instances and slot semantics can be fixed.
+
+### The defect, stated precisely
+
+The dispatch at `0x14221964D` (`call qword ptr [rax+0x30]`) posts to the **base** static instance
+`0x1471C1560`, which the game block caches at `+0x13a8` (crash TLS line:
+`[view[0]+0x13a8]=00000001471C1560`). The base class's slot 6 is statically the abort thunk. The
+class that implements slot 6 is a *different* singleton, `0x1471BFA60`, reachable from the factory
+`0x14023CB90` and forwarded to its `+0x20` sub-object.
+
+So the guest posts to the placeholder provider instead of the implementing one. The provider is
+selected by whoever writes `game+0x13a8` (`0x1403244CB: mov qword ptr [rax + 0x13a8], rdi` with
+`rdi = [rsi+0x40]`), i.e. by a subsystem init that runs with our HLE in the loop.
+
+**Milestone status: not reached.** Boot #285 still ends at `0x1422106E0`; there is no present,
+frame or menu line. What changed is that the stop is no longer anonymous: it is a base-provider
+dispatch into a `_purecall`-style trap, with the implementing provider identified and reachable.

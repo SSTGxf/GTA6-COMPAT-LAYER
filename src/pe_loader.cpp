@@ -3563,6 +3563,37 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
             (unsigned long long)c->Rdx, (unsigned long long)c->Rsi,
             (unsigned long long)c->Rdi, (unsigned long long)c->R8,
             (unsigned long long)c->Rsp);
+        // Boot #285: the crashing object is a static service singleton cached in
+        // the game block at +0x13a8, and the image also has a factory slot
+        // (0x1471bfa58) and a default-instance slot (0x14aad45b0). Dump all three
+        // plus the slot-6 value of the factory object: if that object is a
+        // different (derived) class, the field was populated with the wrong one.
+        uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+        if (base) {
+            const uint64_t cached =
+                ScProbeReadable((const void*)(base + 0x71c13a8), 8)
+                    ? *(const uint64_t*)(base + 0x71c13a8)
+                    : 0;
+            const uint64_t fac =
+                ScProbeReadable((const void*)(base + 0x71bfa58), 8)
+                    ? *(const uint64_t*)(base + 0x71bfa58)
+                    : 0;
+            const uint64_t dflt =
+                ScProbeReadable((const void*)(base + 0x6ad45b0), 8)
+                    ? *(const uint64_t*)(base + 0x6ad45b0)
+                    : 0;
+            Log("loader", "int3 cache=%llx factory=%llx default=%llx",
+                (unsigned long long)cached, (unsigned long long)fac,
+                (unsigned long long)dflt);
+            if (fac && ScProbeReadable((const void*)(uintptr_t)fac, 8)) {
+                const uint64_t fvt = *(const uint64_t*)(uintptr_t)fac;
+                uint64_t fs6 = 0;
+                if (ScProbeReadable((const void*)(uintptr_t)(fvt + 0x30), 8))
+                    fs6 = *(const uint64_t*)(uintptr_t)(fvt + 0x30);
+                Log("loader", "int3 factory vt=%llx slot6=%llx",
+                    (unsigned long long)fvt, (unsigned long long)fs6);
+            }
+        }
         for (int k = 0; k < 2; ++k) {
             const uint64_t o = k ? (uint64_t)c->Rcx : (uint64_t)c->Rbx;
             if (!ScProbeReadable((const void*)(uintptr_t)o, 0x20)) continue;
