@@ -1898,6 +1898,8 @@ static volatile LONG64 g_wpRecord = 0;
 static volatile LONG g_wpTrapCount = 0;
 static volatile LONG g_wpArmed = 0;
 static const uint64_t kWpDr7Write8 = 0x000D0001ull;
+// LEN0 = 00, RW0 = 00 (execute), L0 = 1.
+static const uint64_t kWpDr7Exec = 0x00000001ull;
 // True on the watchdog thread only: its SEH-guarded reads must never be
 // mistaken for a guest crash by the VEH (boot #67's verify children died
 // that way when the watchdog probed a global the small test images do
@@ -1905,7 +1907,7 @@ static const uint64_t kWpDr7Write8 = 0x000D0001ull;
 static thread_local bool t_wpThread = false;
 
 // Arm (or clear, when addr is 0) DR0 on every thread of this process.
-static void WpSetAllThreads(uint64_t addr) {
+static void WpSetAllThreads(uint64_t addr, uint64_t dr7 = kWpDr7Write8) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE)
         return;
@@ -1937,7 +1939,7 @@ static void WpSetAllThreads(uint64_t addr) {
                     c.Dr2 = 0;
                     c.Dr3 = 0;
                     c.Dr6 = 0;
-                    c.Dr7 = addr ? kWpDr7Write8 : 0;
+                    c.Dr7 = addr ? dr7 : 0;
                     if (SetThreadContext(th, &c))
                         ++armed;
                 }
@@ -2056,9 +2058,92 @@ static DWORD WINAPI WpThreadProc(void*) {
     return 0;
 }
 
+// Boot #101 instrumentation (env SCARLETT_ARRWP=1): capture the slot bitmap
+// at the exact store that fills the empty container array (guest +0xA943A38,
+// written by 0x14247B0ED). A DR0 write watchpoint is armed on every thread
+// and the bitmap word (guest +0x6891A08, read by the slot allocator at
+// 0x145CABD9C) is logged right after the store. Read-only observation: no
+// guest code or data is modified, and without the env var nothing runs.
+static DWORD WINAPI ArrWpThreadProc(void*) {
+    uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+    if (!base) {
+        Log("loader", "[arrwp] no guest base; not armed");
+        return 0;
+    }
+    const uint64_t slot = (uint64_t)(uintptr_t)(base + 0xA943A38);
+    g_wpStage = 9;
+    Log("loader", "[arrwp] arming DR0 write/8 on 0x%llx",
+        (unsigned long long)slot);
+    for (int i = 0; i < 20000; ++i) {
+        if (g_wpStage != 9)
+            return 0;
+        WpSetAllThreads(slot);
+        Sleep(2);
+    }
+    Log("loader", "[arrwp] no trap; disarm");
+    g_wpStage = 3;
+    return 0;
+}
+
+static bool ArrWpRequested() {
+    char v[8] = {};
+    return GetEnvironmentVariableA("SCARLETT_ARRWP", v, sizeof(v)) > 0;
+}
+
+// Boot #102 instrumentation (env SCARLETT_SVCPROBE=1): the mode-1 creator
+// branches on the status of a virtual call at 0x142481B2B ([vtable+0x138]
+// on the service object in global 0x148760D00). Trap on the instruction
+// after the call (0x142481B35) and log EAX plus the callee identity. The
+// probe is observation only and arms nothing unless the env var is set.
+static bool SvcWpRequested() {
+    char v[8] = {};
+    return GetEnvironmentVariableA("SCARLETT_SVCPROBE", v, sizeof(v)) > 0;
+}
+
+static DWORD WINAPI SvcWpThreadProc(void*) {
+    uint8_t* base = (uint8_t*)g_guestBaseForVeh;
+    if (!base) {
+        Log("loader", "[svcwp] no guest base; not armed");
+        return 0;
+    }
+    const uint64_t site = (uint64_t)(uintptr_t)(base + 0x2481B2B);
+    g_wpStage = 13;
+    Log("loader", "[svcwp] arming DR0 exec on 0x%llx",
+        (unsigned long long)site);
+    for (int i = 0; i < 20000; ++i) {
+        if (g_wpStage != 13)
+            return 0;
+        WpSetAllThreads(site, kWpDr7Exec);
+        Sleep(2);
+    }
+    Log("loader", "[svcwp] no trap; disarm");
+    g_wpStage = 3;
+    return 0;
+}
+
 void StartStreamWatchpoint() {
     if (InterlockedCompareExchange(&g_wpStage, 0, 0) != 0)
         return;
+    if (SvcWpRequested()) {
+        HANDLE sh = CreateThread(nullptr, 0, SvcWpThreadProc, nullptr, 0,
+                                 nullptr);
+        if (sh)
+            CloseHandle(sh);
+        else
+            Log("loader", "[svcwp] CreateThread failed (%lu)",
+                (unsigned long)GetLastError());
+        return;
+    }
+    if (ArrWpRequested()) {
+        HANDLE ah = CreateThread(nullptr, 0, ArrWpThreadProc, nullptr, 0,
+                                 nullptr);
+        if (ah)
+            CloseHandle(ah);
+        else
+            Log("loader", "[arrwp] CreateThread failed (%lu)",
+                (unsigned long)GetLastError());
+        return;
+    }
     HANDLE h = CreateThread(nullptr, 0, WpThreadProc, nullptr, 0, nullptr);
     if (h)
         CloseHandle(h);
@@ -2610,6 +2695,50 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     // in place; never treated as a crash.
     if (code == 0x80000004) {
         CONTEXT* c = ep->ContextRecord;
+        // Boot #101 probe stage: DR0 watches the empty container array slot;
+        // log the slot bitmap the creator's allocator would have read.
+        if (g_wpStage == 13) {
+            uint64_t svc = 0, fn = 0;
+            __try {
+                svc = *(uint64_t*)((uint8_t*)g_guestBaseForVeh + 0x8760D00);
+                fn = c && c->Rax ? *(uint64_t*)(c->Rax + 0x138) : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            Log("loader",
+                "[svcwp] precall rip=0x%llx obj=0x%llx vt=0x%llx fn=0x%llx "
+                "rdx=0x%llx r8=0x%llx r9=0x%llx svcGlobal=0x%llx thread=%lu",
+                (unsigned long long)(c ? c->Rip : 0),
+                (unsigned long long)(c ? c->Rcx : 0),
+                (unsigned long long)(c ? c->Rax : 0), (unsigned long long)fn,
+                (unsigned long long)(c ? c->Rdx : 0),
+                (unsigned long long)(c ? c->R8 : 0),
+                (unsigned long long)(c ? c->R9 : 0), (unsigned long long)svc,
+                (unsigned long)GetCurrentThreadId());
+            g_wpStage = 10;
+            if (c) {
+                c->Dr0 = 0;
+                c->Dr7 = 0;
+                c->EFlags |= 0x10000; // RF: execute once, no retrigger
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (g_wpStage == 9) {
+            uint64_t stored = 0, bmp = 0;
+            __try {
+                stored = *(uint64_t*)((uint8_t*)g_guestBaseForVeh + 0xA943A38);
+                bmp = *(uint32_t*)((uint8_t*)g_guestBaseForVeh + 0x6891A08);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            Log("loader",
+                "[arrwp] trap rip=0x%llx stored=0x%llx bitmap=0x%x thread=%lu "
+                "dr6=0x%llx",
+                (unsigned long long)(c ? c->Rip : 0),
+                (unsigned long long)stored, (unsigned)bmp,
+                (unsigned long)GetCurrentThreadId(),
+                (unsigned long long)(c ? c->Dr6 : 0));
+            g_wpStage = 10;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if (!c || g_wpStage == 0 || g_wpStage == 3)
             return EXCEPTION_CONTINUE_SEARCH;
         // Stage 1: this trap is the record publish. Re-arm THIS thread on

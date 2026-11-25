@@ -914,6 +914,48 @@ static void WINAPI XboxDevice_CreateUnorderedAccessView(
         GetCurrentThreadId());
 }
 
+// Slot 20: CreateRenderTargetView. Desktop form matches:
+// (this, pResource, pDesc, DestDescriptor); returns void, so there is no
+// HRESULT to report — forwarding the call is the whole contract. Boot #97
+// logged this slot as UNIMPLEMENTED from 0x140CC29EA (call #3), which left
+// the guest writing no descriptor at all. Same descriptor-heap handling as
+// slot 18/19: the destination handle comes from the guest's wrapped heap
+// and is passed through unchanged.
+static void WINAPI XboxDevice_CreateRenderTargetView(
+    XboxDeviceWrapper* self, ID3D12Resource* pResource,
+    const D3D12_RENDER_TARGET_VIEW_DESC* pDesc,
+    D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!self || !self->real) return;
+    self->real->CreateRenderTargetView(pResource, pDesc, DestDescriptor);
+    Log("xboxdev",
+        "CreateRenderTargetView res=%p desc=%p fmt=%u dim=%u dest=0x%llx "
+        "ret=0x%llx thread=%lu",
+        (void*)pResource, (const void*)pDesc,
+        pDesc ? (unsigned)pDesc->Format : 0,
+        pDesc ? (unsigned)pDesc->ViewDimension : 0,
+        (unsigned long long)DestDescriptor.ptr,
+        (unsigned long long)_ReturnAddress(), GetCurrentThreadId());
+}
+
+// Slot 21: CreateDepthStencilView. Same contract as slot 20 (void, real
+// descriptor write). Boot #97 logged it UNIMPLEMENTED from 0x1414A69E8.
+static void WINAPI XboxDevice_CreateDepthStencilView(
+    XboxDeviceWrapper* self, ID3D12Resource* pResource,
+    const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc,
+    D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (!self || !self->real) return;
+    self->real->CreateDepthStencilView(pResource, pDesc, DestDescriptor);
+    Log("xboxdev",
+        "CreateDepthStencilView res=%p desc=%p fmt=%u dim=%u flags=0x%x "
+        "dest=0x%llx ret=0x%llx thread=%lu",
+        (void*)pResource, (const void*)pDesc,
+        pDesc ? (unsigned)pDesc->Format : 0,
+        pDesc ? (unsigned)pDesc->ViewDimension : 0,
+        pDesc ? (unsigned)pDesc->Flags : 0,
+        (unsigned long long)DestDescriptor.ptr,
+        (unsigned long long)_ReturnAddress(), GetCurrentThreadId());
+}
+
 // Slot 25: GetResourceAllocationInfo. Xbox struct-return convention
 // (as with slot 26 GetCustomHeapProperties): (return buffer, this,
 // visibleMask, numDescs, pDescs). The game calls it from 0x140344182
@@ -1944,6 +1986,70 @@ static HRESULT WINAPI XboxDevice_CreateFence(
     return hr;
 }
 
+// Slot 27: CreateCommittedResource. Boot #105's container init (the same
+// 0x142481AA0 mode-1 callback) calls this after the query heap: heap props
+// from the stack, a PC-shaped D3D12_RESOURCE_DESC (Dimension=1 BUFFER,
+// Width=(pitch&0xfff)*2460, Height=Depth=Mips=1, Format=0), state 0x400
+// (COPY_DEST), no clear, IID_ID3D12Resource. The unimplemented stub's
+// E_NOTIMPL failed the init and nulled the four array entries, so forward
+// it to the real device and report the real HRESULT.
+static HRESULT WINAPI XboxDevice_CreateCommittedResource(
+    XboxDeviceWrapper* self, const D3D12_HEAP_PROPERTIES* pHeapProperties,
+    D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC* pDesc,
+    D3D12_RESOURCE_STATES InitialResourceState,
+    const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource,
+    void** ppvResource) {
+    if (!self || !self->real) return E_POINTER;
+    HRESULT hr = self->real->CreateCommittedResource(
+        pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+        pOptimizedClearValue, riidResource, ppvResource);
+    if (hr == E_NOINTERFACE && ppvResource) {
+        hr = self->real->CreateCommittedResource(
+            pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+            pOptimizedClearValue, __uuidof(ID3D12Resource), ppvResource);
+    }
+    Log("xboxdev",
+        "CreateCommittedResource dim=%u w=%llu h=%u mips=%u fmt=%u "
+        "state=0x%x flags=0x%x -> hr=0x%08x res=%p ret=0x%llx",
+        pDesc ? (unsigned)pDesc->Dimension : 0,
+        pDesc ? (unsigned long long)pDesc->Width : 0,
+        pDesc ? (unsigned)pDesc->Height : 0,
+        pDesc ? (unsigned)pDesc->MipLevels : 0,
+        pDesc ? (unsigned)pDesc->Format : 0, (unsigned)InitialResourceState,
+        pDesc ? (unsigned)pDesc->Flags : 0, (unsigned)hr,
+        ppvResource ? *ppvResource : nullptr,
+        (unsigned long long)_ReturnAddress());
+    return hr;
+}
+
+// Slot 39: CreateQueryHeap. Boot #103's DR probe named this as the wall's
+// cause: the guest's container init (0x142481AA0, mode 1) calls
+// device[0x138] with D3D12_QUERY_HEAP_DESC{Type=0 (occlusion), Count=2460,
+// NodeMask=1} and IID_ID3D12QueryHeap (0x0d9658ae-ed45-469e-a61d-...).
+// The unimplemented stub answered E_NOTIMPL, the init treated the negative
+// status as failure and published four NULLs into 0x14A943A38, which the
+// TLS path later dereferenced at 0x1424840C5. Forwarding to the real
+// device preserves the desktop's heap semantics (the guest IID matches the
+// desktop IID exactly, verified from the dump).
+static HRESULT WINAPI XboxDevice_CreateQueryHeap(
+    XboxDeviceWrapper* self, const D3D12_QUERY_HEAP_DESC* pDesc, REFIID riid,
+    void** ppQueryHeap) {
+    if (!self || !self->real) return E_POINTER;
+    HRESULT hr = self->real->CreateQueryHeap(pDesc, riid, ppQueryHeap);
+    if (hr == E_NOINTERFACE && ppQueryHeap) {
+        hr = self->real->CreateQueryHeap(pDesc, __uuidof(ID3D12QueryHeap),
+                                         ppQueryHeap);
+    }
+    Log("xboxdev",
+        "CreateQueryHeap type=%u count=%u node=%u -> hr=0x%08x heap=%p "
+        "ret=0x%llx",
+        pDesc ? (unsigned)pDesc->Type : 0, pDesc ? pDesc->Count : 0,
+        pDesc ? pDesc->NodeMask : 0, (unsigned)hr,
+        ppQueryHeap ? *ppQueryHeap : nullptr,
+        (unsigned long long)_ReturnAddress());
+    return hr;
+}
+
 static HRESULT WINAPI XboxDevice_CreateCommandQueue(
     XboxDeviceWrapper* self, const D3D12_COMMAND_QUEUE_DESC* pDesc,
     REFIID riid, void** ppCommandQueue) {
@@ -2594,10 +2700,14 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[17] = (void*)XboxDevice_CreateConstantBufferView;
     g_xboxDeviceVtable[18] = (void*)XboxDevice_CreateShaderResourceView;
     g_xboxDeviceVtable[19] = (void*)XboxDevice_CreateUnorderedAccessView;
+    g_xboxDeviceVtable[20] = (void*)XboxDevice_CreateRenderTargetView;
+    g_xboxDeviceVtable[21] = (void*)XboxDevice_CreateDepthStencilView;
     g_xboxDeviceVtable[25] = (void*)XboxDevice_GetResourceAllocationInfo;
     g_xboxDeviceVtable[108] = (void*)XboxDevice_GetResourceAllocationInfo1;
     g_xboxDeviceVtable[26] = (void*)XboxDevice_GetCustomHeapProperties;
+    g_xboxDeviceVtable[27] = (void*)XboxDevice_CreateCommittedResource;
     g_xboxDeviceVtable[36] = (void*)XboxDevice_CreateFence;
+    g_xboxDeviceVtable[39] = (void*)XboxDevice_CreateQueryHeap;
     g_xboxDeviceVtable[48] = (void*)XboxDevice_CreateCommandQueue;
     g_xboxDeviceVtable[73] = (void*)XboxDevice_CreateCommandList;
     g_xboxDeviceVtable[74] = (void*)XboxDevice_RegisterPagePoolX;
