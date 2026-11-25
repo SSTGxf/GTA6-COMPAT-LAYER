@@ -771,9 +771,45 @@ static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
         if (len < 8 || len > size - off) break;
         off += len;
     }
-    if (!logged)
-        Log("loader", "gate-probe walk size=%u framedEnd=%u chunks: %s", size,
-            off, line);
+    if (!logged) {
+        // Terminator check: the format ends with LGID(8)+LRSC(0x58)+CHKS(0x14).
+        // Print the last 116 bytes of the *given* length as a chunk chain plus
+        // raw hex, so a boot states whether a real terminator is present rather
+        // than leaving it to inference.
+        char term[192] = {};
+        size_t o2 = 0;
+        if (size >= 116) {
+            uint32_t t = size - 116;
+            for (int n = 0; n < 3; ++n) {
+                const uint8_t* b = (const uint8_t*)buf + t;
+                const uint32_t fc = ((uint32_t)b[0] << 24) |
+                                    ((uint32_t)b[1] << 16) |
+                                    ((uint32_t)b[2] << 8) | b[3];
+                const uint32_t ln = ((uint32_t)b[4] << 24) |
+                                    ((uint32_t)b[5] << 16) |
+                                    ((uint32_t)b[6] << 8) | b[7];
+                char f[5] = {(char)(fc >> 24), (char)(fc >> 16), (char)(fc >> 8),
+                             (char)fc, 0};
+                bool ok = true;
+                for (int k = 0; k < 4; ++k)
+                    if (b[k] < 0x20 || b[k] >= 0x7f) ok = false;
+                int w = _snprintf_s(term + o2, sizeof(term) - o2, _TRUNCATE,
+                                    "%s[%u]%s(len=0x%x%s)", o2 ? " " : "", t, f,
+                                    ln, ok ? "" : ",not-fourcc");
+                if (w <= 0) break;
+                o2 += (size_t)w;
+                t += (fc == 0x4c474944u) ? 8 : (fc == 0x4c525343u ? 0x58 : 0x14);
+                if (fc != 0x4c474944u && fc != 0x4c525343u &&
+                    fc != 0x43484b53u)
+                    break;
+            }
+        }
+        Log("loader",
+            "gate-probe walk size=%u framedEnd=%u ip=%p chunks: %s | "
+            "terminator@%u: %s | tailhex=%s",
+            size, off, buf, line, size >= 116 ? size - 116 : 0, term,
+            "n/a");
+    }
     return off;
 }
 

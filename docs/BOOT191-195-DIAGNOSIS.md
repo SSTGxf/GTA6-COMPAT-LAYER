@@ -875,3 +875,40 @@ the member is longer than 9,168,400 and the guest's descriptors stop short of it
 end for this variant.
 
 No code changed in this pass; nothing invented, nothing trimmed, gate untouched.
+
+## §24 Boot #216: the PSIN gate stop is gone; new stop localized at 0x144FC21F5
+
+Boot #216 (build_ga216: `BUILD_EXIT=0`, `B1 result: 149 checks, 0 failed -> PASS`,
+`=== verify exit code: 0 ===`) logged **zero** occurrences of `1409DFC18` — the PSIN
+assert no longer fires. The gate takes complete streams that each end in a real
+terminator:
+
+```
+gate-probe walk size=14448 … [14332]LGID(len=0x8) [14340]LRSC(len=0x58) [14428]CHKS(len=0x14)
+gate-probe walk size=528   … [412]LGID(len=0x8) [420]LRSC(len=0x58) [508]CHKS(len=0x14)
+gate-probe entry … size=632 / 14448 / 528, fourcc='PSIN'
+```
+
+Measured: **no `walk size=9168400` line exists in #216** — the 9,168,400-byte call
+is no longer reached in this run (the guest now feeds 528/632/14,448-byte streams
+to the same gate). Nothing was resolved from an RPF9 directory; the large call
+simply does not occur any more, which is why the assert stopped firing. Inferred,
+not proven: with the smaller streams accepted, the guest never takes the code path
+that reassembled the large buffer.
+
+New stop, localized:
+
+```
+exception code=0xc0000005 rip=0x144fc21f5 tid=5720
+params[0]=0x0 (read), params[1]=0x1f4f7511f24 (faulting address)
+rax=0x1f486206560 rcx=0x1f4f7511f24 (== faulting address) rdx=0x0 r8=0xffffffff00000000
+0x144fc21f0: test rcx,rcx
+0x144fc21f3: je   0x144fc226c
+0x144fc21f5: movzx r8d, byte ptr [rcx]     <- fault, rcx is not mapped
+```
+
+So the guest dereferences the pointer `0x1f4f7511f24`, which is not mapped in the
+process. That pointer is the value it was handed; the fix belongs where that
+pointer is produced/committed by the layer, not at the fault.
+
+No fix landed for 0x144FC21F5; one boot only; nothing forced or swallowed.
