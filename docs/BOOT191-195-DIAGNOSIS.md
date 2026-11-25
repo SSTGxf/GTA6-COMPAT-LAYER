@@ -174,3 +174,55 @@ question is exactly: which of `r12`/`rdi`/`r14` is zero at `0x14407ECDB`, and
 which chunk arm was supposed to set it — the four candidate arms are
 `0x14407EA93` (STRE/STRF), `0x14407EAAA`, `0x14407E968` (LSNS) and
 `0x14407E9B4`.
+
+## §6 What the 0x14407EC98 gate actually requires (from the arms)
+
+The dispatcher's chunk arms write these slots in the parse struct (`rsi`):
+
+| fourcc | arm | writes |
+|---|---|---|
+| `PSIN` (nested) | `0x14407F0B3` | `[rsi+0x20]=chunk`, `[rsi+0x28]=len`, `[rsp+0x30]=chunk`, `[rsp+0x48]=1` |
+| `LSCH` | `0x14407EEA9` | `[rsi+0xB0]=chunk+8`, `[rsi+0xB8]=len-8` |
+| `LENM` | `0x14407F09B` | `[rsi+0xC0]=chunk+8`, `[rsi+0xC8]=len-8` |
+| `LSNS` | `0x14407F0E2` | `[rsi+0xD0]=chunk+8`, `[rsi+0xD8]=len-8` |
+| `STRF` | `0x14407F05A` | `[rsi+0x90]=chunk+8`, `[rsi+0x98]=len-8` |
+| **`PSCG`** | **`0x14407F02D`** | `[rsi+0x40]=chunk`, `[rsi+0x48]=len`, **`r12 = chunk`**, `[rsp+0x38]=1` |
+
+`r12` is written **only** by the `PSCG` arm. `rdi`/`r14` are written only in the
+`0x14407EBD2` block, which is entered only when `r11` (the walker's saved
+previous-chunk pointer, `[rsp+0x50]`) is non-zero. The walk's natural end
+(`0x14407F1BC: mov r10,r15; jmp 0x14407EB78`) comes back through that block with
+`r11 = [rsp+0x50]`, which the top-level `PSIN` entry arm zeroed
+(`0x14407EAEC xor r10d,r10d`), so for a resource whose **first** chunk is
+`PSIN`, `r11 == 0` and control falls to `0x14407EC98`.
+
+From there the required state is:
+
+```
+0x14407EC98: cmp qword ptr [rsi+0x90], 0   ; needs a STRF/VSTR chunk …
+0x14407ECDB: test r12, r12                 ; … or a PSCG chunk (r12)
+0x14407ECE4: test rdi, rdi                 ; … and rdi
+0x14407ECED: test r14, r14                 ; … and r14
+```
+
+With `r14 = [rsp+0x30]` set by the `PSIN` arm (non-null), the two that are null
+for a `PSIN`/`LSCH`/`LENM`/`LSNS` stream are **`r12` and `rdi`** — i.e. the
+resource class this parse is being called for must carry a **`PSCG` chunk**
+(`0x50534348`), and a resource without one is rejected with status 3 at
+`0x14407F228`.
+
+That is a property of the **data**, not of a struct field the layer can
+initialise: nothing in the layer writes `rsi`'s chunk slots (they are filled by
+the arms from the buffer the guest is parsing). So the fix has to be on the feed
+side: either this resource is the wrong member of its container (the
+`PSCG`-bearing sibling exists and was never served — the pack feed answered a
+first-chunk-`PSIN` resource for a request whose consumer expects the
+pipeline-carrying one), or the container has a sibling chunk the loader has not
+requested yet.
+
+Status: not cleared. The blob is complete and self-consistent (from chunk offsets)
+but carries no `PSCG`/`STRF` chunk, so the guest's own parser is entitled to
+reject it. The next concrete step is to identify the file the guest opened for
+this parse (the helper `0x141621C30` reads via `0x1451D2260` after a size query
+`0x140048A50`) and confirm which container member should carry `PSCG`, rather
+than fabricating one.
