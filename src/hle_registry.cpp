@@ -1307,6 +1307,34 @@ XboxDevice_GetResourceAllocationInfo(
 
     *retBuf = self->real->GetResourceAllocationInfo(
         visibleMask, numResourceDescs, useDesc);
+    // Boot #162: the guest's 2560x1440 typeless depth allocation (fmt 19,
+    // flags 0x80300006 -> sanitized 0x6) came back UINT64_MAX and the guest
+    // int3'd at 0x140344196 before it could place anything. Measured on this
+    // adapter (direct probe, and the boot's own flags=0x800002 request for
+    // the same shape): every depth-stencil format refuses
+    // ALLOW_UNORDERED_ACCESS - fmt 19 with 0x6 is UINT64_MAX while the same
+    // desc with 0x2 sizes to 19,988,480 / align 65536, and fmt 40 and 45
+    // behave identically. D3D12 has no UAV depth resource, so the bit cannot
+    // be honoured; retry the same descriptor with only that bit cleared and
+    // report what the runtime computes (the layer never derives a depth
+    // size of its own).
+    if (retBuf->SizeInBytes == UINT64_MAX && pResourceDescs &&
+        numResourceDescs == 1 &&
+        ((UINT)useDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+        D3D12_RESOURCE_DESC noUav = *useDesc;
+        noUav.Flags = (D3D12_RESOURCE_FLAGS)(
+            (UINT)noUav.Flags &
+            ~(UINT)D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        D3D12_RESOURCE_ALLOCATION_INFO retry =
+            self->real->GetResourceAllocationInfo(visibleMask, 1, &noUav);
+        Log("xboxdev",
+            "alloc-info: fmt=%u flags=0x%x refused (UINT64_MAX); retried "
+            "without ALLOW_UNORDERED_ACCESS -> size=%llu align=%llu",
+            (unsigned)noUav.Format, sanitizedFlags,
+            (unsigned long long)retry.SizeInBytes,
+            (unsigned long long)retry.Alignment);
+        *retBuf = retry;
+    }
     LogAllocInfo(pResourceDescs, sanitizedFlags, nullptr, "linear-forward",
                  retBuf);
     return retBuf;
