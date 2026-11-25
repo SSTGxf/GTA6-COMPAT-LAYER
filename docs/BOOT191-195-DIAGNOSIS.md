@@ -1021,3 +1021,25 @@ not-yet-copied page set; (c) the stop is deterministic on this tree.
 Next step: decide which number is wrong in the producer (over-extended extent /
 page rounding / pack attribution, versus truncated stream header) and make the
 extent equal the declared length. No fix landed.
+
+## §29 Boot #222: beLen bounds one chunk, not the buffer (extent question closed)
+
+Probe `atEnd8` (8 bytes at `buf + beLen`) added to `ScGateProbe`. Boot #222,
+`build_ga222` (`BUILD_EXIT=0`, `B1 result: 149 checks, 0 failed -> PASS`,
+`=== verify exit code: 0 ===`):
+
+```
+gate-probe ... size=976 fourcc='PSIN' beLen=0x150 ret=1 al=1
+   head8=5053494e00000150  atEnd8=4c53434800000158
+```
+
+`4c 53 43 48` = `LSCH`, `00000158` = its length, sitting exactly at `buf + beLen`.
+So `beLen` is the length of the **PSIN chunk only**, inside a buffer of concatenated
+chunks (`PSIN` -> `LSCH` -> ...), which matches the chunk walk seen on the 528/632/
+14,448-byte streams.
+
+Verdict on the "which number is wrong" question: **neither.** `0x3340c0` bounds the
+PSIN chunk; `0x8be2d0` is the concatenated buffer extent. Shrinking the buffer to
+`beLen` would truncate the stream and rewriting `beLen` would corrupt pack data; both
+are closed. The `0x80000003` assert at `0x1409DFC18` no longer fires in #222
+(`ret=1 al=1`), and the run stops at `0xc0000005` in the `0x144...` family instead.

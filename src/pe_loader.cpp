@@ -734,9 +734,12 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
     }
     static uint64_t g_gateSum = 0;
     uint8_t hb[8] = {};
+    uint8_t eb[8] = {};
     __try {
         const uint8_t* q = (const uint8_t*)buf;
         for (int i = 0; i < 8; ++i) hb[i] = q[i];
+        const uint8_t* e = q + blen;
+        for (int i = 0; i < 8; ++i) eb[i] = e[i];
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
     char fc[5] = {(char)(fourcc >> 24), (char)(fourcc >> 16),
@@ -744,11 +747,13 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
     Log("loader",
         "gate-probe %s tid=%lu obj=%p buf=%p size=%u flag=%u fourcc='%s' "
         "(0x%08x) beLen=0x%x a5=%p a6=%p status=%s%u ret=%d al=%u "
-        "head8=%02x%02x%02x%02x%02x%02x%02x%02x sumPrev=0x%llx sumNow=0x%llx",
+        "head8=%02x%02x%02x%02x%02x%02x%02x%02x "
+        "atEnd8=%02x%02x%02x%02x%02x%02x%02x%02x sumPrev=0x%llx sumNow=0x%llx",
         tag, (unsigned long)GetCurrentThreadId(), obj, buf, size, flag, fc,
         fourcc, blen, a5, a6, statusOk ? "" : "?", status, (int)ret,
         (unsigned)al,
         hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7],
+        eb[0], eb[1], eb[2], eb[3], eb[4], eb[5], eb[6], eb[7],
         (unsigned long long)g_gateSum,
         (unsigned long long)(g_gateSum + size));
     g_gateSum += size;
