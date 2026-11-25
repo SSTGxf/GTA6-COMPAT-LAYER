@@ -2987,6 +2987,24 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     // i.e. the guest CRT's per-thread init) and retry the same instruction.
     // Nothing is fabricated: slot 0 remains the guest CRT's and is written
     // only by its own callbacks.
+    if (code == 0xc0000005 && ep->ExceptionRecord->NumberParameters >= 2) {
+        // State of the faulting address at the fault, so an unmapped operand is
+        // recorded with its region facts instead of inferred from a later dump.
+        MEMORY_BASIC_INFORMATION mbi = {};
+        const uint64_t fa = ep->ExceptionRecord->ExceptionInformation[1];
+        const SIZE_T q = VirtualQuery((LPCVOID)(uintptr_t)fa, &mbi, sizeof(mbi));
+        Log("loader",
+            "veh: av rip=0x%llx tid=%lu faultAddr=0x%llx read=%d "
+            "vq=%llu state=0x%lx protect=0x%lx base=0x%llx regionsize=0x%llx",
+            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long)GetCurrentThreadId(), (unsigned long long)fa,
+            (int)(ep->ExceptionRecord->ExceptionInformation[0] == 0),
+            (unsigned long long)q,
+            q ? (unsigned long)mbi.State : 0ul,
+            q ? (unsigned long)mbi.Protect : 0ul,
+            q ? (unsigned long long)(uintptr_t)mbi.BaseAddress : 0ull,
+            q ? (unsigned long long)mbi.RegionSize : 0ull);
+    }
     if (code == 0xc0000005 && g_guestTlsReady && g_tlsInfo.valid &&
         ep->ExceptionRecord->NumberParameters >= 2 &&
         ep->ExceptionRecord->ExceptionInformation[1] == 0) {

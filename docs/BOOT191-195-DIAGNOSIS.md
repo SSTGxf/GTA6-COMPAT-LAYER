@@ -934,3 +934,35 @@ handed the guest an address this process never backs (a guest-computed pointer i
 a region we did not map, or an allocator answer we returned from a non-owning path).
 
 No fix landed. One boot (#216). Nothing swallowed, nothing forced.
+
+## §26 Boot #217: the faulting page is COMMITTED but PAGE_NOACCESS (measured)
+
+New VEH probe logs VirtualQuery at the fault (`src/pe_loader.cpp`), boot #217
+(`build_ga217`: `BUILD_EXIT=0`, `B1 result: 149 checks, 0 failed -> PASS`,
+`=== verify exit code: 0 ===`, 0 × `1409DFC18`):
+
+```
+veh: av rip=0x144fc21f5 tid=19680 faultAddr=0x19b7784992b read=1 vq=48
+     state=0x10000 protect=0x1 base=0x19b77849000 regionsize=0x3247000
+```
+
+- `state=0x10000` = `MEM_COMMIT`
+- `protect=0x1` = `PAGE_NOACCESS`
+- region base `0x19b77849000`, size `0x3247000` (~50 MB)
+
+So this is **not** an unmapped address and **not** an uncommitted one — it is
+committed memory whose protection was set to `PAGE_NOACCESS`. The access is a
+*read* of one byte at `base+0x92b` inside a 50 MB committed region.
+
+That changes the diagnosis: the block was protected (or decommitted-then-represented
+as `PAGE_NOACCESS`) by a `VirtualProtect`/`MEM_DECOMMIT` path while the guest still
+holds a live pointer into it. In this layer the guest's memory comes from
+`EraXMemAllocDefault`/`HeapAlloc` (host heap), and the guest's own allocator can
+`VirtualProtect`; the region size (50 MB) looks like an arena, not a single object.
+
+Measured: committed + `PAGE_NOACCESS` read fault. Inferred: a free/decommit or
+protect path ran on a region the guest still uses. No fix landed; one boot; no
+fault swallowing, no protection changes made by us.
+
+Earlier §25 said the address is "unmapped" — that was read from the *minidump* map,
+which omits `PAGE_NOACCESS` ranges; §26's live VirtualQuery supersedes it.
