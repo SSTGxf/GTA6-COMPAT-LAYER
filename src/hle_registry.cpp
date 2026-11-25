@@ -42,9 +42,13 @@ static unsigned long long g_logFileBytes = 0;
 static bool g_logCapNoted = false;
 static const unsigned long long kLogFileCapBytes = 192ull << 20;
 
+static LONG WINAPI ScarlettLayerVeh(EXCEPTION_POINTERS* ep);
+
 static void EnsureLogInit() {
     if (g_logInit) return;
     g_logInit = true;
+    if (getenv("SCARLETT_VEH_LOG"))
+        AddVectoredExceptionHandler(1, ScarlettLayerVeh);
     static char errBuf[1 << 20];
     setvbuf(stderr, errBuf, _IOFBF, sizeof(errBuf));
     wchar_t logPath[MAX_PATH] = {};
@@ -94,6 +98,86 @@ void WriteLogLine(const char* line) {
         if (g_logFile) fflush(g_logFile);
         g_lastLogFlush = now;
     }
+}
+
+static LONG WINAPI ScarlettLayerVeh(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+    auto* er = ep->ExceptionRecord;
+    if (er->ExceptionCode != 0xc0000005) return EXCEPTION_CONTINUE_SEARCH;
+    static LONG logged = 0;
+    if (InterlockedIncrement(&logged) > 6) return EXCEPTION_CONTINUE_SEARCH;
+    HANDLE f = CreateFileW(L"F:\\ScarlettCompat\\scarlett_veh.log",
+                           FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        f = CreateFileW(L"scarlett_veh.log", FILE_APPEND_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    char buf[4096];
+    int off = _snprintf_s(
+        buf, sizeof(buf), _TRUNCATE,
+        "=== AV rip=%p addr=%p rsp=%p rbp=%p rbx=%p rdi=%p rsi=%p "
+        "rax=%p rcx=%p rdx=%p r8=%p r9=%p tid=%lu\n",
+        (void*)er->ExceptionAddress,
+        (void*)er->ExceptionInformation[1], (void*)c->Rsp, (void*)c->Rbp,
+        (void*)c->Rbx, (void*)c->Rdi, (void*)c->Rsi, (void*)c->Rax,
+        (void*)c->Rcx, (void*)c->Rdx, (void*)c->R8, (void*)c->R9,
+        GetCurrentThreadId());
+    unsigned long long tlsPtr = __readgsqword(0x58);
+    unsigned long long gaVal = __readgsqword(0x14c8);
+    unsigned long long arr0 = 0, view0 = 0;
+    __try {
+        if (tlsPtr) arr0 = *(volatile unsigned long long*)tlsPtr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    __try {
+        if (gaVal) view0 = *(volatile unsigned long long*)gaVal;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    if (off > 0 && off < (int)sizeof(buf)) {
+        off += _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
+                           "=== tls=%p arr0=%p ga=%p view0=%p\n",
+                           (void*)tlsPtr, (void*)arr0, (void*)gaVal,
+                           (void*)view0);
+    }
+    if (off > 0 && off < (int)sizeof(buf)) {
+        const unsigned char* r = (const unsigned char*)er->ExceptionAddress;
+        off += _snprintf_s(
+            buf + off, sizeof(buf) - off, _TRUNCATE,
+            "=== bytes %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]);
+    }
+    const uintptr_t rsp = (uintptr_t)c->Rsp;
+    int shown = 0;
+    for (int i = 0; i < 96 && shown < 10 && off > 0 &&
+                    off < (int)sizeof(buf) - 64;
+         ++i) {
+        uintptr_t v = 0;
+        __try {
+            v = *(volatile uintptr_t*)(rsp + i * 8);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        if ((v >= 0x140000000ull && v < 0x147000000ull) ||
+            (v >= 0x7ff000000000ull && v < 0x7fff00000000ull)) {
+            off += _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
+                               "===   [rsp+0x%02x]=%p\n", i * 8, (void*)v);
+            ++shown;
+        }
+    }
+    if (off > 0) {
+        DWORD wr = 0;
+        WriteFile(f, buf,
+                  (DWORD)(off < (int)sizeof(buf) ? off : (int)sizeof(buf) - 1),
+                  &wr, nullptr);
+    }
+    CloseHandle(f);
+    if (g_logFile) fflush(g_logFile);
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 }  // namespace
@@ -157,6 +241,13 @@ static double FramePeriodMs() {
 }
 
 // ---- host implementations ----
+
+
+// Diagnostic VEH (opt-in via SCARLETT_VEH_LOG=1): the loader's own handler
+// dies before dumping when the faulting RIP is inside the guest module, so
+// this logs the exception record (RIP, faulting address, rbx/rbp/rsp and a
+// return-address scan) to scarlett_veh.log. Returns CONTINUE_SEARCH so the
+// loader's handler still runs.
 
 extern "C" HRESULT HleXGameRuntimeInitialize() {
     Log("xgrt", "XGameRuntimeInitialize() -> S_OK");
@@ -2267,11 +2358,20 @@ static XboxCommandListWrapper* WrapXboxCommandList(
 // (console list IID), out. Map to the desktop form with nodeMask 0.
 // The riid is a console IID the desktop driver does not know; retry
 // with IID_ID3D12GraphicsCommandList on E_NOINTERFACE.
+// Re-arm the diagnostic VEH from here: the loader installs its own handler
+// when it loads the guest, and vectored handlers run last-installed-first,
+// so an arm from DLL init never sees an AV the loader's handler dies on.
 static HRESULT WINAPI XboxDevice_CreateCommandList(
     XboxDeviceWrapper* self, const void* pDesc,
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState,
     REFIID riid, void** ppCommandList) {
     if (!self || !self->real) return E_POINTER;
+    static bool vehReArmed = false;
+    if (!vehReArmed && getenv("SCARLETT_VEH_LOG")) {
+        vehReArmed = true;
+        AddVectoredExceptionHandler(1, ScarlettLayerVeh);
+        Log("veh", "diag re-armed at CreateCommandList");
+    }
     D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (pDesc) type = (D3D12_COMMAND_LIST_TYPE)(*(const UINT32*)pDesc);
     ID3D12GraphicsCommandList* realList = nullptr;
@@ -2582,25 +2682,46 @@ static HRESULT WINAPI XboxDevice_ScheduleFrameEventX(
     return S_OK;
 }
 
-// Slot 80: WaitFrameEventX(event, timeout_ms, flags, token).
+// Slot 80: WaitFrameEventX(event, timeout_ms, flags, reserved, token*).
 // The natural next pacing call after ScheduleFrameEventX. Returns at
 // once with a fresh non-zero token: there is no vblank source behind
 // the device before a presenter, and a zero wait cannot stall the title.
-// A null token pointer is E_POINTER.
+//
+// Boot #133 call sites 0x142482405 / 0x142482448 / 0x142484637 show the
+// real ABI: the token out-pointer is the SIXTH argument ([rsp+0x28]) and
+// the fifth ([rsp+0x20]) is 0 or 2, not a pointer. The old five-parameter
+// form treated 2 as the token and wrote through it, faulting inside the
+// layer at ScarlettCompat.dll+0x1d19e (boot #133, thread 8760).
 static HRESULT WINAPI XboxDevice_WaitFrameEventX(
     XboxDeviceWrapper* self, UINT64 event, UINT64 timeoutMs, UINT64 flags,
-    UINT64* token) {
+    UINT64 reserved, UINT64* token) {
     (void)event;
     (void)timeoutMs;
     (void)flags;
+    (void)reserved;
     if (!self) return E_POINTER;
-    if (!token) return E_POINTER;
+    // Six-argument ABI is what the title uses; older synthetic guests (and
+    // the verify harness) still call the five-argument form, where the
+    // token pointer arrives in the fifth slot instead. Accept either: use
+    // the sixth argument when it is a plausible pointer, else fall back to
+    // the fifth.
+    UINT64* out = token;
+    if ((!out || (uintptr_t)out < 0x10000) &&
+        (uintptr_t)reserved >= 0x10000)
+        out = (UINT64*)(uintptr_t)reserved;
+    if (!out) {
+        Log("xboxdev",
+            "WaitFrameEventX token=%p reserved=%p not pointers -> "
+            "E_POINTER",
+            (void*)token, (void*)reserved);
+        return E_POINTER;
+    }
     static LONG s_frameToken = 1;
     LONG t = InterlockedIncrement(&s_frameToken);
     if (t == 0) t = InterlockedIncrement(&s_frameToken);
-    *token = (UINT64)t;
+    *out = (UINT64)t;
     Log("xboxdev", "WaitFrameEventX -> S_OK token=%llu",
-        (unsigned long long)*token);
+        (unsigned long long)*out);
     return S_OK;
 }
 
@@ -3029,6 +3150,99 @@ static HRESULT WINAPI XboxList_Close(XboxCommandListWrapper* self) {
     return hr;
 }
 
+// Safe probe read: returns true only when the whole span is committed and
+// readable. Used by the slot probes so a bad guest pointer cannot fault the
+// layer while we identify a method.
+static bool SafeReadQwords(const void* p, UINT64* out, int n) {
+    if (!p || n <= 0) return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT)
+        return false;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)))
+        return false;
+    SIZE_T avail = (SIZE_T)mbi.BaseAddress + mbi.RegionSize - (SIZE_T)p;
+    if (avail < (SIZE_T)n * sizeof(UINT64)) return false;
+    memcpy(out, p, (size_t)n * sizeof(UINT64));
+    return true;
+}
+
+// Slot 32: SetDescriptorHeaps(NumDescriptorHeaps, heaps). Boot #123's call
+// sites 0x144E4CAC2 / 0x144E89DE7 pass edx=2 and r8 = &heaps[2], where the
+// two pointers come from the global descriptor-heap slots 0x1475E7390 /
+// 0x1475E73D8 (the first is dereferenced and queried at its vtable slot 9,
+// GetCPUDescriptorHandleForHeapStart). That is exactly the desktop
+// signature; the heaps are the raw desktop objects CreateDescriptorHeap
+// returned, so forward directly.
+static HRESULT WINAPI XboxList_SetDescriptorHeaps(
+    XboxCommandListWrapper* self, UINT count,
+    ID3D12DescriptorHeap* const* heaps) {
+    if (!self || !self->real) return E_POINTER;
+    if (count > 8 || (count && !heaps)) {
+        Log("xboxlist",
+            "SetDescriptorHeaps(slot32) rejected count=%u heaps=%p", count,
+            heaps);
+        return E_INVALIDARG;
+    }
+    // The heaps the guest holds are the layer's Xbox wrappers; pass the real
+    // desktop heaps or d3d12 dereferences the wrapper layout (boot #125 read
+    // address -1 inside D3D12Core). Desktop SetDescriptorHeaps returns void;
+    // the Xbox slot is checked as an HRESULT by the caller, so answer S_OK.
+    ID3D12DescriptorHeap* realHeaps[8] = {};
+    for (UINT i = 0; i < count; ++i)
+        realHeaps[i] = UnwrapXboxDescriptorHeap(heaps[i]);
+    Log("xboxlist",
+        "SetDescriptorHeaps(slot32) count=%u heaps=%p [0]=%p [1]=%p "
+        "real[0]=%p real[1]=%p",
+        count, heaps, count > 0 ? heaps[0] : nullptr,
+        count > 1 ? heaps[1] : nullptr, realHeaps[0], realHeaps[1]);
+    if (g_logFile) fflush(g_logFile);
+    self->real->SetDescriptorHeaps(count, realHeaps);
+    Log("xboxlist", "SetDescriptorHeaps(slot32) -> hr=0x00000000");
+    return S_OK;
+}
+
+// Slots 71/72: Xbox command-list root-parameter setters. Boot #126's call
+// sites pass a 72-byte record out of the guest's root-parameter table
+// (0x144ED46A3: record/index/0/0) and one 8-byte handle slot out of the
+// per-parameter array (0x142482B31: handle/0/0/1). Both payloads are null
+// at this stage, and a null binding is a legal no-op. The guest treats a
+// negative HRESULT as failure and publishes NULLs that the TLS path then
+// dereferences (0x142484133), so answer S_OK after logging the payload.
+static HRESULT WINAPI XboxList_RootParam71(XboxCommandListWrapper* self,
+                                           UINT64 a, UINT64 b, UINT64 c) {
+    UINT64 q[8] = {};
+    bool ok = SafeReadQwords((const void*)(uintptr_t)a, q, 8);
+    Log("xboxlist",
+        "slots 71/72 root-param setter self=%p a=0x%llx b=0x%llx c=0x%llx "
+        "read=%d "
+        "q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx q4=0x%llx q5=0x%llx "
+        "q6=0x%llx q7=0x%llx -> hr=0x00000000",
+        self, (unsigned long long)a, (unsigned long long)b,
+        (unsigned long long)c, (int)ok, (unsigned long long)q[0],
+        (unsigned long long)q[1], (unsigned long long)q[2],
+        (unsigned long long)q[3], (unsigned long long)q[4],
+        (unsigned long long)q[5], (unsigned long long)q[6],
+        (unsigned long long)q[7]);
+    return S_OK;
+}
+
+static HRESULT WINAPI XboxList_RootParam72(XboxCommandListWrapper* self,
+                                           UINT64 a, UINT64 b, UINT64 c) {
+    UINT64 q[4] = {};
+    bool ok = SafeReadQwords((const void*)(uintptr_t)a, q, 4);
+    Log("xboxlist",
+        "slots 71/72 root-param setter self=%p a=0x%llx b=0x%llx c=0x%llx "
+        "read=%d "
+        "q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx -> hr=0x00000000",
+        self, (unsigned long long)a, (unsigned long long)b,
+        (unsigned long long)c, (int)ok, (unsigned long long)q[0],
+        (unsigned long long)q[1], (unsigned long long)q[2],
+        (unsigned long long)q[3]);
+    return S_OK;
+}
+
 // Slot 139: Xbox Reset(pAllocator, pInitialState). Boot #113 proved it:
 // the guest helper 0x142474CC0 calls [vtable+0x458] with rdx = the
 // allocator returned by CreateCommandAllocator (0x21C7DA2D590 in that
@@ -3098,6 +3312,9 @@ static void InitXboxCommandListVtable() {
     g_xboxCommandListVtable[1] = (void*)XboxList_AddRef;
     g_xboxCommandListVtable[2] = (void*)XboxList_Release;
     g_xboxCommandListVtable[9] = (void*)XboxList_Close;
+    g_xboxCommandListVtable[32] = (void*)XboxList_SetDescriptorHeaps;
+    g_xboxCommandListVtable[71] = (void*)XboxList_RootParam71;
+    g_xboxCommandListVtable[72] = (void*)XboxList_RootParam72;
     g_xboxCommandListVtable[131] = (void*)XboxList_Stub131;
     g_xboxCommandListVtable[132] = (void*)XboxList_Stub132;
     g_xboxCommandListVtable[139] = (void*)XboxList_Reset;

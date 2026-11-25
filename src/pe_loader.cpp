@@ -2124,6 +2124,13 @@ static DWORD WINAPI SvcWpThreadProc(void*) {
 void StartStreamWatchpoint() {
     if (InterlockedCompareExchange(&g_wpStage, 0, 0) != 0)
         return;
+    // The watchdog is diagnostic instrumentation (hardware write watchpoints
+    // re-armed on every thread). Opt out with SCARLETT_NOWATCH=1 so a boot
+    // can be judged without DR0/DR7 context surgery on the guest threads.
+    if (getenv("SCARLETT_NOWATCH")) {
+        Log("loader", "[watch] disabled by SCARLETT_NOWATCH");
+        return;
+    }
     if (SvcWpRequested()) {
         HANDLE sh = CreateThread(nullptr, 0, SvcWpThreadProc, nullptr, 0,
                                  nullptr);
