@@ -410,17 +410,186 @@ ERA_NOTIMPL_STUB(EraXGComputeTexture3DLayout, "era-xg")
 ERA_NOTIMPL_STUB(EraXGCreateTexture1DComputer, "era-xg")
 ERA_NOTIMPL_STUB(EraXGCreateTexture2DComputer, "era-xg")
 ERA_NOTIMPL_STUB(EraXGCreateTexture3DComputer, "era-xg")
-ERA_NOTIMPL_STUB(EraAcpHalAllocateShapeContexts, "era-acphal")
-ERA_NOTIMPL_STUB(EraAcpHalCreate, "era-acphal")
 ERA_NOTIMPL_STUB(EraAcpHalReleaseShapeContexts, "era-acphal")
-ERA_NOTIMPL_STUB(EraApuAlloc, "era-acphal")
-ERA_NOTIMPL_STUB(EraApuCreateHeap, "era-acphal")
 ERA_NOTIMPL_STUB(EraApuFree, "era-acphal")
 ERA_NOTIMPL_STUB(EraApuIsVirtualAddressValid, "era-acphal")
 ERA_NOTIMPL_STUB(EraApuMapApuAddress, "era-acphal")
 ERA_NOTIMPL_STUB(EraApuMapVirtualAddress, "era-acphal")
 
 #undef ERA_NOTIMPL_STUB
+
+// ---- APU audio heap + AcpHal context (boots #184/#185) ----
+// The title's audio bring-up lives at guest 0x1443AD8B0 and runs, in order:
+//
+//   0x1443AD933  call ApuCreateHeap(0x1C700000, 0x226E00, -1, -1)
+//   0x1443AD938  test eax,eax / js 0x1443AD94E      <- int3 on ANY failure
+//   0x1443AD93C  call 0x1443AEC40 -> AcpHalAllocateShapeContexts(&ctx)
+//                                   0x1443AEC73, js -> return 0 -> int3
+//                                   then AcpHalCreate(&ctx) 0x1443AED91
+//   0x1443AD945  call 0x1443AEE50 -> XApuConnect (already an S_OK stub)
+//
+// Boot #184 stopped here: ApuCreateHeap returned E_NOTIMPL, the sign test
+// failed, and the guest hit its own int3 at 0x1443AD94E. The heap is a plain
+// window the title owns (base 0x1C700000 = 0x1C7 << 20, 0x226E00 bytes), so it
+// is modelled as committed host memory at the requested base — the same
+// treatment EraD3DAllocateGraphicsMemory already gives the guest's GPU VAs.
+// The two shape-context calls have no desktop equivalent (there are no DSP
+// shapes); they answer S_OK and say so, like the xapu.dll stubs.
+static uintptr_t g_apuHeapBase = 0;
+static uintptr_t g_apuHeapSize = 0;
+
+extern "C" HRESULT EraApuCreateHeap(uintptr_t base, uintptr_t size,
+                                    uintptr_t a2, uintptr_t a3) {
+    if (base == 0 || size == 0) {
+        Log("era-acphal",
+            "ApuCreateHeap(base=0x%llx size=0x%llx a2=0x%llx a3=0x%llx) "
+            "-> E_INVALIDARG (empty window)",
+            (unsigned long long)base, (unsigned long long)size,
+            (unsigned long long)a2, (unsigned long long)a3);
+        return E_INVALIDARG;
+    }
+    void* p = VirtualAlloc((LPVOID)base, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT,
+                           PAGE_READWRITE);
+    if (!p) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        Log("era-acphal",
+            "ApuCreateHeap(base=0x%llx size=0x%llx a2=0x%llx a3=0x%llx) "
+            "-> VirtualAlloc failed hr=0x%08x",
+            (unsigned long long)base, (unsigned long long)size,
+            (unsigned long long)a2, (unsigned long long)a3, (unsigned)hr);
+        return hr;
+    }
+    g_apuHeapBase = base;
+    g_apuHeapSize = size;
+    Log("era-acphal",
+        "ApuCreateHeap(base=0x%llx size=0x%llx a2=0x%llx a3=0x%llx) "
+        "-> S_OK heap=%p (committed host memory, no APU on desktop)",
+        (unsigned long long)base, (unsigned long long)size,
+        (unsigned long long)a2, (unsigned long long)a3, p);
+    return S_OK;
+}
+
+// ApuAlloc(out, flags, size, align, kind) — measured from the guest's own
+// code (boots #187/#188 dumped the call), not from XDK documentation:
+//   0x1443A6110 is a 7-instruction wrapper around the AcpHal thunk:
+//     rcx = caller's rcx        -> ApuAlloc arg1, forwarded untouched (&out)
+//     edx = 0                   -> ApuAlloc arg2 (flags)
+//     eax = caller's edx        -> ApuAlloc r8d (size)
+//     r9d = 0x800               -> ApuAlloc arg4 (alignment)
+//     caller's r8d              -> [rsp+0x20] (5th argument, a 32-bit kind)
+//   Its one real caller 0x1443AED13 (the shape-context builder) does
+//     lea rsi,[rsp+0x30] / mov qword [rsi],0 / call / mov r15,[rsi]
+//   and then bumps that slot by 0x1700 then 0x200 for each of its 350 table
+//   entries, zeroing both ranges through the published pointer. The return
+//   value (eax) is never inspected: the out slot is the whole contract.
+// Boots #187/#188 answered E_NOTIMPL and never wrote the slot, so the guest
+// kept *out = 0 and died writing through it (0xc0000005 write at 0x20 in
+// VCRUNTIME140, one line after the call).
+static uintptr_t g_apuAllocUsed = 0;  // bump offset inside the APU heap
+
+extern "C" HRESULT EraApuAlloc(uintptr_t outPtr, uintptr_t flags,
+                               uintptr_t size, uintptr_t align) {
+    if (outPtr == 0) {
+        Log("era-acphal",
+            "ApuAlloc(out=null flags=0x%llx size=0x%llx align=0x%llx) -> "
+            "E_INVALIDARG (no out slot)",
+            (unsigned long long)flags, (unsigned long long)size,
+            (unsigned long long)align);
+        return E_INVALIDARG;
+    }
+    if (size == 0) {
+        Log("era-acphal",
+            "ApuAlloc(out=%p flags=0x%llx size=0 align=0x%llx) -> "
+            "E_INVALIDARG (empty request)",
+            (void*)outPtr, (unsigned long long)flags,
+            (unsigned long long)align);
+        return E_INVALIDARG;
+    }
+    if (g_apuHeapBase == 0 || g_apuHeapSize == 0) {
+        Log("era-acphal",
+            "ApuAlloc(out=%p size=0x%llx) -> E_FAIL (ApuCreateHeap has not "
+            "created the APU window)",
+            (void*)outPtr, (unsigned long long)size);
+        return E_FAIL;
+    }
+    const uintptr_t gran = align ? align : 8;
+    if ((gran & (gran - 1)) != 0) {
+        Log("era-acphal",
+            "ApuAlloc(out=%p size=0x%llx align=0x%llx) -> E_INVALIDARG "
+            "(alignment is not a power of two)",
+            (void*)outPtr, (unsigned long long)size,
+            (unsigned long long)align);
+        return E_INVALIDARG;
+    }
+    const uintptr_t heapEnd = g_apuHeapBase + g_apuHeapSize;
+    uintptr_t start = (g_apuHeapBase + g_apuAllocUsed + (gran - 1)) & ~(gran - 1);
+    if (size > g_apuHeapSize || start < g_apuHeapBase || start + size < start ||
+        start + size > heapEnd) {
+        Log("era-acphal",
+            "ApuAlloc(out=%p size=0x%llx align=0x%llx) -> E_OUTOFMEMORY "
+            "(used=0x%llx of 0x%llx in the APU heap)",
+            (void*)outPtr, (unsigned long long)size, (unsigned long long)align,
+            (unsigned long long)g_apuAllocUsed,
+            (unsigned long long)g_apuHeapSize);
+        return E_OUTOFMEMORY;
+    }
+    // The guest zeroes both sub-ranges itself, but the window is recycled host
+    // memory, so hand out a clean block like an APU allocation would be.
+    ZeroMemory((void*)start, (SIZE_T)size);
+    g_apuAllocUsed = (start - g_apuHeapBase) + size;
+    *(void**)outPtr = (void*)start;
+    Log("era-acphal",
+        "ApuAlloc(out=%p flags=0x%llx size=0x%llx align=0x%llx) -> S_OK "
+        "block=%p used=0x%llx/0x%llx of the APU heap",
+        (void*)outPtr, (unsigned long long)flags, (unsigned long long)size,
+        (unsigned long long)align, (void*)start,
+        (unsigned long long)g_apuAllocUsed, (unsigned long long)g_apuHeapSize);
+    return S_OK;
+}
+
+// AcpHalAllocateShapeContexts(ctx, allocator, 0x7FFF...FC, 0). The guest's
+// own code (0x1443AEC40) shows the contract without any XDK documentation:
+//   +0x10  u64 count = 0x15E, set by the guest BEFORE the call
+//   +0x38  void*  array, read right AFTER the call and memset to count<<6
+// so the callee must allocate count * 64 bytes and publish it at +0x38.
+// Boot #185 returned S_OK without filling +0x38 and the guest then wrote
+// through the stale pointer (0xc0000005, write, address 0x20).
+extern "C" HRESULT EraAcpHalAllocateShapeContexts(uintptr_t ctx,
+                                                  uintptr_t a1,
+                                                  uintptr_t a2,
+                                                  uintptr_t a3) {
+    if (ctx == 0) return E_INVALIDARG;
+    uint8_t* base = (uint8_t*)ctx;
+    uint64_t count = *(const uint64_t*)(base + 0x10);
+    if (count == 0 || count > 0x10000) {
+        Log("era-acphal",
+            "AcpHalAllocateShapeContexts(ctx=%p, %p, %p, %p) -> E_INVALIDARG "
+            "(count %llu out of range)",
+            (void*)ctx, (void*)a1, (void*)a2, (void*)a3,
+            (unsigned long long)count);
+        return E_INVALIDARG;
+    }
+    const SIZE_T bytes = (SIZE_T)count * 64;
+    void* array = calloc(1, bytes);
+    if (!array) return E_OUTOFMEMORY;
+    *(void**)(base + 0x38) = array;
+    Log("era-acphal",
+        "AcpHalAllocateShapeContexts(ctx=%p, %p, %p, %p) -> S_OK "
+        "count=%llu array=%p bytes=%llu (shape records are 64 bytes; "
+        "host memory, no DSP on desktop)",
+        (void*)ctx, (void*)a1, (void*)a2, (void*)a3,
+        (unsigned long long)count, array, (unsigned long long)bytes);
+    return S_OK;
+}
+
+extern "C" HRESULT EraAcpHalCreate(uintptr_t a0, uintptr_t a1, uintptr_t a2,
+                                   uintptr_t a3) {
+    Log("era-acphal",
+        "AcpHalCreate(ctx=%p, %p, %p, %p) -> S_OK "
+        "(stub: audio context is the guest's own struct)",
+        (void*)a0, (void*)a1, (void*)a2, (void*)a3);
+    return S_OK;
+}
 
 // ---- WinRT activation routing ----
 // The real RoGetActivationFactory, stashed by the loader when it

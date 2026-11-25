@@ -5331,6 +5331,64 @@ static const char* ScDsResolvePack(uint64_t hash, uint64_t fileOffset,
     return found;
 }
 
+// Read `compSize` bytes at `fileOffset` from `path`, zlib-inflate them and copy
+// exactly `destSize` bytes into `dst`. S_OK only when the stream decodes to at
+// least destSize bytes (the inflater verifies the adler32, so a wrong pack can
+// not pass by accident).
+static HRESULT ScDsReadInflateInto(const char* path, uint64_t fileOffset,
+                                   uint32_t compSize, uint32_t destSize,
+                                   void* dst) {
+    uint8_t* comp = nullptr;
+    uint32_t got = 0;
+    if (ScOpt_DStorageReadFile(path, fileOffset, compSize, &comp, &got) !=
+            S_OK ||
+        !comp || got != compSize) {
+        free(comp);
+        return E_FAIL;
+    }
+    uint8_t* outBuf = (uint8_t*)malloc(destSize);
+    size_t outLen = 0;
+    HRESULT hr = outBuf ? ScOpt_DStorageDecompress(SC_OPT_DS_DECOMP_ZLIB, comp,
+                                                   compSize, outBuf, destSize,
+                                                   &outLen)
+                        : E_OUTOFMEMORY;
+    free(comp);
+    if (hr == S_OK && outBuf && outLen >= destSize) {
+        memcpy(dst, outBuf, destSize);
+        free(outBuf);
+        return S_OK;
+    }
+    free(outBuf);
+    return E_FAIL;
+}
+
+// The hash -> pack cache is only a hint: one hash can carry requests for
+// several packs. Boot #186: hash 0x7473efe372 first arrived at audio.rpf
+// (offset 0xb01000) and every later request reused that path, so the PSIN
+// blobs that live in data.rpf (offsets 0x1af39910/0x1c2767f0) read audio
+// bytes, failed to inflate, left the guest destination stale and the guest
+// int3'd in the resource parser at 0x1409DFC18. Re-probe the candidates for
+// this exact request and serve from whichever pack really holds the stream.
+static const char* ScDsReprobePack(const char* triedPath, uint64_t hash,
+                                   uint64_t fileOffset, uint32_t compSize,
+                                   uint32_t destSize, void* dst, int index) {
+    for (size_t p = 0;
+         p < sizeof(kDsPackCandidates) / sizeof(kDsPackCandidates[0]); ++p) {
+        const char* path = kDsPackCandidates[p];
+        if (triedPath && strcmp(path, triedPath) == 0) continue;
+        if (ScDsReadInflateInto(path, fileOffset, compSize, destSize, dst) !=
+            S_OK)
+            continue;
+        Log("dstorage",
+            "Submit[%d] re-resolved hash 0x%016llx offset=0x%llx compSize=%u "
+            "destSize=%u -> %s (cached pack %s held no matching stream)",
+            index, (unsigned long long)hash, (unsigned long long)fileOffset,
+            compSize, destSize, path, triedPath ? triedPath : "(none)");
+        return path;
+    }
+    return nullptr;
+}
+
 extern "C" void DsqSubmit(void* self) {
     ScDsQueue* q = (ScDsQueue*)self;
     int copied = 0, refused = 0, fileSource = 0;
@@ -5421,6 +5479,14 @@ extern "C" void DsqSubmit(void* self) {
                     "compSize=%u destSize=%u)",
                     i, (unsigned long long)hash,
                     (unsigned long long)fileOffset, compSize, destSize);
+                ++copied;
+                continue;
+            }
+            // The cached pack did not hold this request's stream: probe the
+            // other packs before refusing (see ScDsReprobePack).
+            if (ScDsReprobePack(packPath, hash, fileOffset, compSize,
+                                destSize, (void*)dest, i)) {
+                free(comp);
                 ++copied;
                 continue;
             }
@@ -7315,8 +7381,9 @@ static const Export kExports[] = {
      "E_NOTIMPL stub (logged)."},
     {"xg_x.dll", "XGComputeTexture2DLayout", Status::kNotImplemented,
      (void*)EraXGComputeTexture2DLayout,
-     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 5): explicit "
-     "E_NOTIMPL stub (logged)."},
+     "ERA adaptation (boots #184/#185): the title's audio init calls this "
+     "first (guest 0x1443AD933) and int3s on any failure; the heap is "
+     "committed host memory at the requested base."},
     {"xg_x.dll", "XGComputeTexture3DLayout", Status::kNotImplemented,
      (void*)EraXGComputeTexture3DLayout,
      "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 6): explicit "
@@ -7333,25 +7400,27 @@ static const Export kExports[] = {
      (void*)EraXGCreateTexture3DComputer,
      "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 10): explicit "
      "E_NOTIMPL stub (logged)."},
-    {"AcpHal.dll", "AcpHalAllocateShapeContexts", Status::kNotImplemented,
+    {"AcpHal.dll", "AcpHalAllocateShapeContexts", Status::kStub,
      (void*)EraAcpHalAllocateShapeContexts,
      "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 1): the ACP audio "
      "DSP has no desktop equivalent; explicit E_NOTIMPL stub (logged)."},
-    {"AcpHal.dll", "AcpHalCreate", Status::kNotImplemented,
+    {"AcpHal.dll", "AcpHalCreate", Status::kStub,
      (void*)EraAcpHalCreate,
-     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 2): explicit "
-     "E_NOTIMPL stub (logged)."},
+     "ERA adaptation (boots #184/#185): called by the audio init "
+     "(0x1443AED91) after the APU heap; S_OK stub, no DSP shapes."},
     {"AcpHal.dll", "AcpHalReleaseShapeContexts", Status::kNotImplemented,
      (void*)EraAcpHalReleaseShapeContexts,
      "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 3): explicit "
      "E_NOTIMPL stub (logged)."},
-    {"AcpHal.dll", "ApuAlloc", Status::kNotImplemented, (void*)EraApuAlloc,
-     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 4): explicit "
-     "E_NOTIMPL stub (logged)."},
-    {"AcpHal.dll", "ApuCreateHeap", Status::kNotImplemented,
+    {"AcpHal.dll", "ApuAlloc", Status::kImplemented, (void*)EraApuAlloc,
+     "ERA adaptation (boots #187/#188/#189): arg1 is an out slot the guest "
+     "reads back (0x1443A6110 -> 0x1443AED13), not a return value; the block "
+     "is bump-allocated inside the APU window ApuCreateHeap committed."},
+    {"AcpHal.dll", "ApuCreateHeap", Status::kImplemented,
      (void*)EraApuCreateHeap,
-     "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 5): explicit "
-     "E_NOTIMPL stub (logged)."},
+     "ERA adaptation (boots #184/#185): the title's audio init calls this "
+     "first (guest 0x1443AD933) and int3s on any failure; the heap is "
+     "committed host memory at the requested base."},
     {"AcpHal.dll", "ApuFree", Status::kNotImplemented, (void*)EraApuFree,
      "ERA no-equivalent (phase 5, Xbox One shim-DLL ordinal 6): explicit "
      "E_NOTIMPL stub (logged)."},

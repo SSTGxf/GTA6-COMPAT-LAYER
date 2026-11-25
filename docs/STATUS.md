@@ -1,5 +1,73 @@
 # Status
 
+
+## SLOT 86 — DO NOT REGISTER A FORWARD
+
+Boots #183/#184 (2026-11-25) proved the entry-33 slot-86 handler crashes the process **inside**
+the forwarded desktop `CreatePipelineState`: the probe logs `-> forward` and never `-> returned`,
+then `0xc0000005` in `amdxc64.dll+0x52ffd0` while the AMD UMD parses the guest's 688-byte console
+pipeline-state stream (its VS payload is a 992-byte DXBC/DXIL container at exe `.data` `0x14688E13C`).
+Registration, ABI and layout are ruled out — a registered `E_NOTIMPL` handler ran 50,467 times and
+reached the same assert as #182 (`0x1443AD94E`). **Do not re-add `g_xboxDeviceVtable[86]` as a
+forward.** Full evidence and the required capture-and-translate design: `docs/SLOT86-ROOT-CAUSE.md`.
+
+## Boots #186-#188 — the 0x1409DFC18 int3 was a DStorage pack-cache poisoning (2026-11-25)
+
+Boot #186 stopped on a guest `int3` `0x80000003` at `0x1409DFC18`, reachable only from
+`0x1409dfacf` after `call 0x1409dfc30`: a TLS-cached get-or-create whose resource parser
+`0x14407E700` (big-endian fourcc dispatch, the `PSIN` arm at `0x14407e90f`) returned false, so the
+helper freed its object and returned NULL. The blob was bad because DStorage refused its delivery
+three lines earlier: `Submit[0] refused: inflate failed (hash 0x7473efe372 offset=0x1c2767f0
+compSize=259 destSize=472 outLen=0 hr=0x80004005)`. That payload and its 483->1008 sibling **do**
+exist in data.rpf (verified with real zlib and with the layer's own inflater extracted verbatim
+into a standalone harness: 472/1008 bytes, adler32 valid, both start with `PSIN`), but
+`ScDsResolvePack` had cached that hash to audio.rpf from the hash's first request (offset
+0xb01000), so every later request under it was read from the wrong pack. **Fixed** in
+`src/hle_registry.cpp`: when the cached pack yields no stream decoding to exactly `destSize`,
+`ScDsReprobePack` probes the remaining candidate RPFs for that exact (offset, compSize, destSize)
+and serves from whichever validates — the inflater's adler32 + exact-size check means a wrong pack
+cannot pass, and the per-hash cache stays the fast path. **Two boots, same binary: #187 and #188
+both re-resolve the PSIN to data.rpf and contain zero `0x80000003`** (16,272 and 16,207 lines).
+Both then stop at a wall they are the first boots ever to reach: `EraApuAlloc(size=0x222E00,
+align=0x800) -> E_NOTIMPL` immediately followed by `0xc0000005` at `VCRUNTIME140.dll+0x128a0`
+(params[0]=1 write, params[1]=0x20) — #185/#186 never called ApuAlloc at all. The audio path needs
+ApuAlloc answered (the request fits the 0x226E00 heap ApuCreateHeap committed at 0x1C700000, but
+the guest's out-pointer argument has to be read from the call site first: an HRESULT in rax is not
+a pointer, the guest wrote through a null structure field at +0x20). Because the guest now dies
+before it re-issues the 472-byte request, the int3 site is not re-exercised in these boots; passing
+`0x1409DFC18` in a boot needs ApuAlloc first. Gates: BUILD_EXIT=0, era/ft/verify ALL PASS, B1
+149/149. Dumps #187/#188 archived byte-identical to D: (`scarlett_crash_boot187.dmp`,
+`scarlett_crash_boot188.dmp`), F: back to 8.1 GB free. Full evidence:
+`docs/FREEBUFF-DSTORAGE-FILE-MAPPING.md` ("Boots #186-#188").
+
+## Boots #189/#190 — ApuAlloc implemented from the guest's call site (2026-11-25)
+
+The call is reached through the import thunk `0x145f40190` (guest code never names the IAT slot
+`0x146794188`). The wrapper `0x1443A6110` forwards `rcx` untouched as arg1, hard-codes flags 0 and
+alignment 0x800, passes the caller's `edx` as the size and the caller's `r8d` 32-bit at
+`[rsp+0x20]` (fifth argument = 2). Its only real caller, the shape-context builder at
+`0x1443AED13`, zeroes `*out` first, calls `ApuAlloc(&out, 0, 0x222E00, 0x800, 2)`, then reads the
+slot back (`mov r15, [rsi]`) and never inspects `eax`: **arg1 is an out pointer, not a return
+value**. It advances that slot by 0x1700 then 0x200 per entry across 350 entries, zeroing through
+it. With the old `E_NOTIMPL` stub the slot stayed 0 and the guest died in its own memset path
+(`0xc0000005`, write, address `0x20`, `VCRUNTIME140+0x128a0`, boots #187/#188).
+`EraApuAlloc` is now a bump allocator over the committed window at `0x1C700000` (0x226E00 bytes):
+requested power-of-two alignment honoured, block zeroed, pointer published through the out slot,
+`S_OK` on success and `E_OUTOFMEMORY` with the used size when the window is exhausted; registry
+status is `kImplemented`. **Two boots, same binary: #189 and #190 both log `ApuAlloc(out=..., flags=0x0
+size=0x222e00 align=0x800) -> S_OK block=000000001C700000 used=0x222e00/0x226e00`, the
+VCRUNTIME140 AV is gone in both, `0x80000003` count is 0**, and both stop one call later at guest
+`0x1443AEDB7`: `AcpHalCreate(ctx=0x149AE98B8, 0x20, 0xE0, 0xE0)` is expected to publish a HAL
+object at `ctx+0`, the guest then does `mov rcx,[0x149AE98B8]; mov rax,[rcx]; call [rax]` with
+(0x1000, 0x1000), and the `S_OK` stub writes nothing, so `[ctx]` is 0 — that is the next wall, with
+the addresses already pinned. **Open / undetermined:** the builder's own arithmetic (350 entries x
+0x1900 = 0x36E000) exceeds the 0x222E00 block we return, yet neither boot faulted there; either the
+guest's bump collapses (its stride lives in `rsi`, which its memset call may clobber) or the
+neighbouring range happens to be mapped. Do not assume the block covers a larger table. Gates:
+BUILD_EXIT=0, all verdicts ALL PASS, B1 149/149, verify 0. Dumps #189/#190 archived byte-identical
+to D: (`scarlett_crash_boot189.dmp`, `scarlett_crash_boot190.dmp`), F: back to 8.1 GB free. Full
+evidence: `docs/ERA-GDK-MAPPING.md` ("ApuAlloc — implemented from the guest's call site").
+
 ## Current state — 2026-11-25 ~01:15 EST (GitHub head `82397032`, boots through #172)
 
 **Progress: ~44% proven toward first menu (GPU-copy path for CBV sources PROVEN in boot #177 — all 8 unaligned CBVs now carry real data via a READBACK-staged GPU copy, 16,084 lines, the game passed the 0x1425A087D read crash; CBV unaligned-location fix PROVEN in boot #172 — the game passed the DEVICE_REMOVED assert at 0x142474606 and ran 16,079 log lines, nearly 4x further than boots #169/#170; TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet; current stop was an int3 at 0x141DAC734 in boot #177, after DStorage refuses an unresolvable source hash — the hash gate).** **Boots #179/#180 (entry-33 DLL, slot 86 + hash resolver): BOTH crashed at exactly 2,018 lines in amdxc64.dll (0xc0000005 null read), before either new function ran — slot 86 is the culprit, mechanism unknown. Boot #181 (entry-32 control): 16,074 lines, hash gate normally. Boot #182 (hash-resolver-only, slot 86 REMOVED, build #182 372,736 B): 16,058 lines, hash gate RESOLVED — ResolvePack found audio.rpf for hash 0x6a4519e812, 0 unresolvable hashes, 0x141DAC734 appears 0 times, 8 CBVs copied. New stop: int3 at 0x1443AD94E after a raw 16-byte DStorage request (compSize == destSize == 16) fails to inflate — build #183 adds a raw-copy fallback. Diagnosis doc docs/BOOT182-DIAGNOSIS.md. CORRECTION (boot #183): the amdxc64 crash happens WITHOUT slot 86, so slot 86 was NOT the cause — the crash is an intermittent early-init flake (3 crashes #179/#180/#183 vs 2 successes #181/#182). Slot 86 stays REMOVED because the forward-unchanged design is wrong for real shaders, not because it caused the crash.** **Boot #183 (first run): crashed at 2,020 lines in amdxc64.dll (same flaky early-init crash as #179/#180) — the raw-copy fix never ran. Boot #183 re-run (same DLL): 18,317 lines, FURTHEST YET — flaky crash did not recur; raw-copy fix PROVEN (13 raw copies, DStorage totals batches=14 copied=4219 refused=0 file=4220); game still int3s at 0x1443AD94E because EraApuCreateHeap returns E_NOTIMPL (the line immediately before the assert, line 15954 in #182; the guest checks only the HRESULT sign via js). CreateRootSignature (slot 16) returned S_OK in #182. New hammering slot: 57 (vtable +0x1c8, from game 0x14247575E, 306 calls, E_NOTIMPL). Slots 62/67 are PSO-cache create paths (asking IID_ID3D12PipelineState) — downstream of shader translation, not the immediate wall. Freebuff's AI is implementing EraApuCreateHeap.** (Seth: "not near but from 35% to about 45%.")

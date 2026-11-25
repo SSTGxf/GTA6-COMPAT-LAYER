@@ -58,3 +58,78 @@ The reads are sequential compressed chunks from one stream:
 The exact RPF for hash ACA58068328F107A — the pack manager's full table is
 not in the logs (only entries 0/1 were probed). That one lookup is yours:
 read the pack manager table and resolve the hash.
+
+## Boots #186-#188 — the hash -> pack cache was poisoning later requests
+
+Measured 2026-11-25 (boots #186/#187/#188, same binary for #187/#188).
+
+**Symptom.** Boot #186 (16,451 lines) ended on a guest `int3` `0x80000003` at
+`0x1409DFC18`. That instruction is only reachable from `0x1409dfacf`
+(`test rax,rax` / `je 0x1409dfc18`) after `call 0x1409dfc30`; that helper is a
+TLS-cached get-or-create (stores into `[TEB_TLS+0x1258]`) which allocates
+`0xF0` bytes, runs ctor `0x140788CB0`, then the resource parser `0x14407E700`,
+and frees the object and returns NULL when the parser returns false.
+
+**The failing check.** `0x14407E700` parses a big-endian fourcc chunk stream
+(`GUID`, `CHKS`, `LENL`, `PSIN`, `PSCH`, `PSIG`, `STRD`, `PMAP`, ...):
+`movbe ecx,[rdx]` and a compare tree whose `0x5053494e` = `"PSIN"` arm is at
+`0x14407e90f`. It returns false when the blob is null or zero-sized (it then
+writes 2 through the optional out pointer), when the big-endian length at
+`+4` exceeds the supplied size, or when the fourcc is not in the table.
+
+**Why the blob was bad.** Three log lines before the int3, DStorage refused
+the request that should have delivered it:
+
+    Submit[0] refused: inflate failed (hash 0x0000007473efe372 offset=0x1c2767f0 compSize=259 destSize=472 outLen=0 hr=0x80004005)
+
+The payload is real and it lives in data.rpf:
+- offline, data.rpf at 0x1c2767f0 (259 B) inflates with zlib to exactly 472 B
+  with a valid adler32 and starts with `"PSIN"`; the sibling refusal
+  (0x1af39910, 483 -> 1008 B) also decodes exactly, also `"PSIN"`.
+- the comment above `ScDsResolvePack` in src/hle_registry.cpp already
+  recorded `offset 0x1c2767f0 compSize 259 destSize 472 -> data.rpf` as
+  proven offline.
+- the inflater itself is fine: extracted verbatim into a standalone harness
+  (temp, not in the tree) it decodes both payloads to 472/1008 bytes.
+
+The cause is the resolver's cache. `ScDsResolvePack` probes the candidate
+RPFs once per *hash* and caches `hash -> path`, but a hash is not unique to a
+pack: in #186 hash `0x7473efe372` first arrived as audio.rpf
+(`offset=0xb01000 compSize=776 destSize=3169`, which did validate), so every
+later request under that hash read audio.rpf — including the PSIN blobs,
+which live in data.rpf. 259 or 483 bytes of audio are not a zlib stream, the
+inflate was refused, the guest destination kept stale content, the PSIN parse
+failed, the get-or-create returned NULL, and the guest hit `int3` at
+`0x1409DFC18`.
+
+**Fix.** Pack resolution is per request, not per hash: when the cached pack
+does not yield a stream decoding to exactly `destSize`, `ScDsReprobePack`
+probes the remaining candidates for that exact
+`(offset, compSize, destSize)` and serves from whichever pack validates. The
+inflater verifies the adler32 and the exact output size, so a wrong pack
+cannot pass — this adds no heuristic and no table. The per-hash cache stays
+as the fast path, so the 4,214+ raw 16-byte copies per boot do no extra I/O.
+
+**Verified with two boots (same binary).**
+- #187: `Submit[0] re-resolved hash ... offset=0x1af39910 compSize=483
+  destSize=1008 -> D:\game\game\data.rpf (cached pack ... audio.rpf held
+  no matching stream)`; `0x80000003` occurrences: **0**; 16,272 lines.
+- #188: identical re-resolve for the same payload, `0x80000003`
+  occurrences: **0**; 16,207 lines; same terminal stop.
+- Both boots then die at `0xc0000005` `VCRUNTIME140.dll+0x128a0`
+  (params[0]=1 write, params[1]=0x20) one line after
+  `EraApuAlloc(size=0x222E00 align=0x800) -> E_NOTIMPL`. #187/#188 are the
+  **first boots that ever call ApuAlloc** (#185/#186 never logged it), so
+  that is a newly reached wall, not a regression of this fix.
+
+**Still open.** The int3 site is no longer exercised: with the first PSIN
+delivered correctly the guest takes the APU path and dies at `ApuAlloc`
+before it issues the 472-byte request. Demonstrating a boot that reaches and
+passes `0x1409DFC18` needs `ApuAlloc` answered first — the request
+(0x222E00, align 0x800) fits the 0x226E00 heap ApuCreateHeap created at
+0x1C700000, but the guest's fifth argument / out-pointer has to be read from
+the call site before anything is returned (an HRESULT in rax is not a
+pointer: the guest wrote to 0x20, i.e. through a null structure field).
+
+**Do not regress.** Never reuse a cached hash -> pack path without validating
+it against the current request's `(offset, compSize, destSize)`.

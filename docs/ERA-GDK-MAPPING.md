@@ -317,3 +317,93 @@ rebuild `BUILD_EXIT=0`; `guest_era` ALL PASS end to end (20/20 boot
 stages, including `era_esram` and `era_presentarray`); all 3 existing
 guests still ALL PASS (no regressions). The synthetic guest is the
 regression proof that the translation itself works.
+
+## Audio (AcpHal / APU) — status after boots #184/#185
+
+The real title's audio bring-up is guest `0x1443AD8B0`. Boot #184 pinned the
+exact chain and where it stopped:
+
+| guest site | import | boot #184 | now |
+|---|---|---|---|
+| `0x1443AD933` | `AcpHal!ApuCreateHeap(0x1C700000, 0x226E00, -1, -1)` | `E_NOTIMPL` → int3 `0x1443AD94E` | **implemented** — committed host memory at the requested base |
+| `0x1443AEC73` | `AcpHal!AcpHalAllocateShapeContexts(&ctx)` | `E_NOTIMPL` (step A returns 0 → int3) | `S_OK` stub — no DSP shape contexts on desktop |
+| `0x1443AED91` | `AcpHal!AcpHalCreate(&ctx)` | `E_NOTIMPL` | `S_OK` stub |
+| `0x1443AEE69` | `xapu!XApuConnect` | `S_OK` stub (already) | unchanged |
+
+The guest checks only the HRESULT *sign* (`test eax,eax; js 0x1443AD94E`), so
+the two shape-context calls can answer `S_OK` honestly-labelled as stubs. The
+heap itself is real (host memory at `0x1C700000`), because the title may
+address the window directly — the same treatment `EraD3DAllocateGraphicsMemory`
+already gives the guest's GPU VAs.
+
+`tests/guest_era.cpp::TestNoEquiv` was updated with this: `xg_x!XGComputeTexture2DLayout`
+must still return `E_NOTIMPL`, and `AcpHalCreate` must now return `S_OK`.
+
+## ApuAlloc — implemented from the guest's call site (boots #189/#190)
+
+The AcpHal imports are reached through the import thunks at the end of `.text`
+(`0x145f40160` AcpHalAllocateShapeContexts, `0x145f40190` ApuAlloc,
+`0x145f401a0` ApuCreateHeap, `0x145f401b0` ApuFree), so a call is found by
+searching for `call 0x145f40190` — the IAT slot `0x146794188` is never named
+directly by guest code.
+
+**Call shape** (wrapper `0x1443A6110`, seven instructions):
+
+| register | value | meaning |
+|---|---|---|
+| `rcx` | caller's `rcx`, forwarded untouched | pointer to a 64-bit out slot |
+| `rdx` | 0 (`xor edx,edx`) | flags |
+| `r8` | caller's `edx` | size |
+| `r9` | 0x800 (hard-coded) | alignment |
+| `[rsp+0x20]` | caller's `r8d`, stored 32-bit | fifth argument (a small kind; 2 at the real call) |
+
+**The one real caller** (`0x1443AED13`, the shape-context builder):
+
+```
+0x1443AECF2  lea  rsi, [rsp+0x30]
+0x1443AECF7  mov  edx, 0x222E00     ; size
+0x1443AECFC  mov  r8d, 2            ; fifth argument
+0x1443AED09  mov  rcx, rsi          ; &out
+0x1443AED0C  mov  qword [rsi], 0    ; *out = 0 before the call
+0x1443AED13  call ApuAlloc
+0x1443AED18  mov  r15, [rsi]        ; the guest reads the slot, never eax
+```
+
+It then walks its 350-entry table advancing that slot by 0x1700 and then 0x200
+per entry, zeroing both ranges through the published pointer. **The contract is
+an out pointer, not a return value.**
+
+Boots #187/#188 answered `E_NOTIMPL` and never wrote the slot, so the guest kept
+`*out = 0` and died in its own memset path (`0xc0000005`, write, address `0x20`,
+`VCRUNTIME140+0x128a0`, one line after the call).
+
+**Implementation** (`EraApuAlloc`, `src/era_to_gdk.cpp`): a bump allocator over
+the window `ApuCreateHeap` committed (`0x1C700000`, `0x226E00`), honouring the
+requested power-of-two alignment, handing out a zeroed block and publishing it
+through the out slot; exhaustion returns `E_OUTOFMEMORY` with the used size
+logged. The first real request is `size=0x222E00 align=0x800` — nearly the whole
+heap. The registry status is now `kImplemented`.
+
+**Boots #189/#190, same binary, identical:**
+
+    ApuAlloc(out=..., flags=0x0 size=0x222e00 align=0x800) -> S_OK
+    block=000000001C700000 used=0x222e00/0x226e00 of the APU heap
+
+The `VCRUNTIME140+0x128a0` AV is gone in both, `0x80000003` count is 0, and both
+stop one call later (guest `0x1443AEDB7`). Gates unchanged: BUILD_EXIT=0, all
+verdicts ALL PASS, B1 149/149, verify 0.
+
+**Undetermined.** The builder's own arithmetic (350 entries x 0x1900 = 0x36E000)
+exceeds the 0x222E00 block we return, yet neither boot faulted there: either the
+guest's bump collapses (it keeps its stride in `rsi`, which its `memset` call may
+clobber) or the neighbouring range happens to be mapped already. Not resolved —
+do not assume the returned block covers a larger table.
+
+**Next wall, evidence ready.** `AcpHalCreate(ctx=0x149AE98B8, 0x20, 0xE0, 0xE0)`
+must publish a HAL object at `ctx+0`; the guest immediately executes
+
+    0x1443AEDA5  mov rcx, [0x149AE98B8]
+    0x1443AEDB7  mov rax, [rcx]
+    0x1443AEDBA  call [rax]          ; with edx = 0x1000, r8d = 0x1000
+
+The `S_OK` stub writes nothing, so `[ctx]` is 0 and the load faults.

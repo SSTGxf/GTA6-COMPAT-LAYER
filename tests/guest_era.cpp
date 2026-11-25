@@ -1443,12 +1443,17 @@ static bool TestWinRt(char* detail, size_t n) {
 // instead of crashing or faking success. An Xbox One title boot will
 // hit these — the stage proves the layer fails honestly at that wall.
 static bool TestNoEquiv(char* detail, size_t n) {
+    // Updated for boots #184/#185: the real title's audio bring-up
+    // (guest 0x1443AD8B0) calls ApuCreateHeap, AcpHalAllocateShapeContexts
+    // and AcpHalCreate and int3s at 0x1443AD94E if any of them fails, so
+    // AcpHalCreate is now an S_OK stub instead of E_NOTIMPL. xg_x texture
+    // tiling still has no equivalent and must keep failing honestly.
     HRESULT hrXg = XGComputeTexture2DLayout(0, 0, 0, 0);
     HRESULT hrAcp = AcpHalCreate(0, 0, 0, 0);
-    bool ok = (hrXg == E_NOTIMPL) && (hrAcp == E_NOTIMPL);
+    bool ok = (hrXg == E_NOTIMPL) && (hrAcp == S_OK);
     snprintf(detail, n,
-             "XGComputeTexture2DLayout -> 0x%08x, AcpHalCreate -> "
-             "0x%08x (want 0x80004001 both)",
+             "XGComputeTexture2DLayout -> 0x%08x (want 0x80004001), "
+             "AcpHalCreate -> 0x%08x (want 0x00000000)",
              (unsigned)hrXg, (unsigned)hrAcp);
     return ok;
 }
