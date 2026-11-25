@@ -966,3 +966,34 @@ fault swallowing, no protection changes made by us.
 
 Earlier §25 said the address is "unmapped" — that was read from the *minidump* map,
 which omits `PAGE_NOACCESS` ranges; §26's live VirtualQuery supersedes it.
+
+## §27 Boots #218/#219: the reverted tree stops at 0x1409DFC18 again
+
+Two fresh builds of the reverted sources, both green:
+
+```
+build_ga218  BUILD_EXIT=0  B1 result: 149 checks, 0 failed -> PASS  verify exit code: 0
+build_ga219  BUILD_EXIT=0  B1 result: 149 checks, 0 failed -> PASS  verify exit code: 0
+```
+
+Boots:
+
+```
+#218  veh: exception 0x80000003 at 00000001409DFC18 thread 28008
+#219  veh: exception 0x80000003 at 00000001409DFC18 thread 2736
+```
+
+#218 carried temporary `VirtualFree`-site logging (removed in #219, verified absent from
+both sources); neither boot logged a single `VirtualFree RELEASE` line, so those three
+`MEM_RELEASE` sites are not on the path that matters. `PAGE_NOACCESS` is produced by
+`VirtualProtect`/`VirtualProtectEx`/`NtProtectVirtualMemory`/`MEM_DECOMMIT`, not by
+`MEM_RELEASE` — the wrong API family was watched in #218.
+
+Comparator: #216 and #217 (same source family, with the chunk-walk terminator parse)
+got past `0x1409DFC18`. So across #216/#217 versus #218/#219 the gate's accept/reject
+differs while the gate code is unchanged; the difference is not the probes (they do not
+touch the gate). Measured: two stop kinds on effectively the same source.
+
+Open: `0x144FC21F5`'s `PAGE_NOACCESS` producer on region base `0x19b77849000`
+(size `0x3247000`) is still unnamed. #217's dump was deleted without archiving; from
+here every dump is copied to `D:\scarlett-dumps` before any delete.
