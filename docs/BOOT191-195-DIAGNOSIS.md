@@ -1112,3 +1112,24 @@ returns for it.
 
 Still needed: the tail of the buffer on a boot that does reach it (`tail32`), then
 cause (a) truncated assembly / (b) walk final-boundary — no fix landed.
+
+## §33 Sampled cause for the 9,168,400-byte stream: not observable
+
+Bounded boot loop with the tail32 build (`build_ga226`, green: `BUILD_EXIT=0`,
+`149 checks, 0 failed`, `verify exit 0`). Per-boot occurrence counts:
+
+```
+#226  size=9168400: 0    tail32: 0   (walked 2456 and 74720 only, then 0xc0000005)
+```
+
+The repeated relaunches did not produce a boot that issues the large call inside the
+observation window, so `tail32` — the last 32 bytes of that buffer — has never been
+written to a log. Cause (a) truncated/mis-sized assembly versus cause (b) walk
+final-boundary handling therefore remains **unresolved by measurement**.
+
+What is reproducible whenever the call *is* made (#220, #221, #225): identical bytes
+(`head8=5053494e003340c0`, `atEnd8=4c534348000004c8`), full residency
+(`resPages=2239/2239`, `firstNonRes=0x0`, `resExtent=0x8bf000`) and `ret=0`.
+
+No gate tolerance, assert byte, stream byte, pack byte or verification constant was
+changed. The fix is not landed because the deciding bytes have not been observed.
