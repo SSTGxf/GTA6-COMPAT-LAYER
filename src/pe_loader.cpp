@@ -742,8 +742,39 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
         (unsigned)al);
 }
 
+// Walk the chunk stream the way the gate frames it (BE fourcc + BE length) and
+// log the sequence once per distinct buffer, so the rejection point is named.
+static void ScLogChunkWalk(const void* buf, uint32_t size) {
+    static const void* seen[8] = {};
+    for (int i = 0; i < 8; ++i)
+        if (seen[i] == buf) return;
+    for (int i = 0; i < 8; ++i)
+        if (!seen[i]) { seen[i] = buf; break; }
+    char line[512] = {};
+    size_t o = 0;
+    uint32_t off = 0;
+    for (int n = 0; n < 12 && off + 8 <= size; ++n) {
+        const uint8_t* b = (const uint8_t*)buf + off;
+        const uint32_t fc = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+                            ((uint32_t)b[2] << 8) | b[3];
+        const uint32_t len = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
+                             ((uint32_t)b[6] << 8) | b[7];
+        char f[5] = {(char)(fc >> 24), (char)(fc >> 16), (char)(fc >> 8),
+                     (char)fc, 0};
+        int w = _snprintf_s(line + o, sizeof(line) - o, _TRUNCATE,
+                            "%s[%u]%s(0x%08x,len=0x%x)", o ? " " : "", off, f,
+                            fc, len);
+        if (w <= 0) break;
+        o += (size_t)w;
+        if (len < 8 || len > size - off) break;
+        off += len;
+    }
+    Log("loader", "gate-probe walk size=%u chunks: %s", size, line);
+}
+
 static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
                         void* a5, void* a6) {
+    ScLogChunkWalk(buf, size);
     ScGateFn real = (ScGateFn)(uintptr_t)0x14407e700ull;
     ScLogGate("entry", obj, buf, size, flag, a5, a6, false, 0);
     bool r = real(obj, buf, size, flag, a5, a6);

@@ -667,3 +667,42 @@ So the rejection is a later internal guard of the PSIN parser, not the header,
 the size or the fourcc. Not yet measured: which internal guard (the parser's
 chunk-walk is the next probe target). No fix landed this pass, no int3 patch, no
 forced return, gate untouched.
+
+## §17 The failing guard is named: the LSNS chunk overruns the assembled stream by 908 bytes
+
+Boot #207 (probe build `build_ga207`: `BUILD_EXIT=0`, `B1 result: 149 checks,
+0 failed -> PASS`, `=== verify exit code: 0 ===`, 0 FAILED) logs the gate's own
+view of each buffer it is handed:
+
+```
+gate-probe walk size=512    chunks: [0]PSIN(len=0x80) [128]LSCH(len=0xa8) [296]LENM(len=0x40) [360]LSNS(len=0x24) [396]LGID(len=0x8) [404]LRSC(len=0x58) [492]CHKS(len=0x14)
+gate-probe walk size=1640   chunks: [0]PSIN(len=0x170) [368]LSCH(len=0x428) [1432]LENM(len=0x8) [1440]LSNS(len=0x54) [1524]LGID(len=0x8) [1532]LRSC(len=0x58) [1620]CHKS(len=0x14)
+gate-probe walk size=9168400 chunks: [0]PSIN(len=0x3340c0) [3358912]LSCH(len=0x4c8) [3360136]LENM(len=0xb0) [3360312]LSNS(len=0x589f64) [9168284]<garbage>(0x56d61794,len=0xb4e073cd)
+gate-probe entry  tid=21436 ... size=9168400 fourcc='PSIN' beLen=0x3340c0 ... ret=0 al=0
+veh: exception 0x80000003 at 00000001409DFC18 thread 21436
+```
+
+The small streams are complete: every chunk fits exactly inside the buffer and
+they return 1. The 9,168,400-byte stream is **one chunk short**:
+
+- `PSIN` len `0x3340C0` = 3,358,912 → next chunk at 3,358,912 (matches LSCH)
+- `LSCH` len `0x4C8` = 1,224 → 3,360,136 (matches LENM)
+- `LENM` len `0xB0` = 176 → 3,360,312 (matches LSNS)
+- `LSNS` len `0x589F64` = 5,808,996 → would end at **9,169,308**, but the buffer
+  is **9,168,400** bytes: **908 bytes short**
+- only `9,168,400 − 3,360,312 = 5,808,088` bytes remain for LSNS
+
+The parser therefore walks past the end of the buffer, reads a garbage fourcc at
+9,168,284 (`0x56d61794` with a nonsense length `0xb4e073cd`), rejects it, returns
+0, and the caller asserts at `0x1409DFC18`.
+
+Measured cause: the assembled PSIN stream handed to the gate is **908 bytes too
+short for the LSNS chunk it declares** — i.e. the tail of the stream was never
+copied into the buffer (the archived blob in D:\scarlett-dumps is zero-padded to
+its declared 9,168,400 bytes). Inference (not proven): the shortfall comes from
+the final DStorage page (`Submit[138] ... compSize=58896`) or from the guest's
+size accounting, rather than from the parser.
+
+No fix landed this pass; the gate is byte-identical, no int3 patch, no forced
+return. Fix target: make the loader supply the full declared chunk length when it
+assembles the stream, using the same path as clip_sets.zmt.
