@@ -790,3 +790,31 @@ that covers the span). The rule made attribution order-independent as required,
 but it is not yet evidence-correct for this id.
 
 No fix landed. 0x1409DFC18 still fires; 0x140004B5E remains cleared.
+
+## §21 The tail is not present in any pack extent (offline probe + boots #214/#215)
+
+Offline probe of the pack bytes at the member base implied by the copies
+(`base = 0x106939510 + 58896 - 9168400 = 0x106089510` in `packs.rpf`):
+
+```
+head: 42c2d0c760a301d4871e4920013ee674   <- not PSIN
+walk  +0     -> [(0,'B..','0x60a301d4')]
+      -116   -> [(0,'.4.9a L','0x4fa88b4e')]
+      +116   -> [(0,'. ..C','0x73680ecd')]
+first 'LGID' in +/-8 KiB + 9,168,400-byte window: none
+```
+
+So the extent the raw copies read from is **not** the stream member at all: no
+shift in the probed window makes the head and the 116-byte `LGID+LRSC+CHKS` tail
+frame, and `LGID` does not occur anywhere in that window.
+
+Boot #214 added a guard refusing raw copies larger than 0x10000 that do not
+frame; it refused unrelated audio requests but the PSIN tail page (58,896) was
+below that threshold, so the walk was unchanged. Boot #215 gates every page-sized
+raw copy (>= 0x1000): **90 refusals**, and the tail is now
+`(0xffffffff,len=0x0)` — i.e. merely *unwritten* — instead of `0x56d61794`. The
+gate still returns 0 and the boot still stops at 0x1409DFC18.
+
+Measured conclusion: the wrong raw page was the only writer of that region; when
+it is refused nothing supplies the real `LGID+LRSC+CHKS`. The tail is therefore
+absent from the data this layer can reach, not misplaced by a base shift.

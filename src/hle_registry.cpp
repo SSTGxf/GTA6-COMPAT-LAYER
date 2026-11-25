@@ -5342,14 +5342,58 @@ static const char* kDsPackCandidates[] = {
 };
 // Deterministic raw-request attribution (see ScDsContextPackForRaw): the
 // first candidate in declared order whose file covers the requested span.
+// Evidence check for a candidate extent: a real member begins with a chunk
+// fourcc and ends either on another chunk fourcc or in zero padding. Boot #212
+// showed packs.rpf covering the span while its tail bytes are 0x56d61794, i.e.
+// that extent runs past the end of the real member.
+static bool ScDsExtentLooksFramed(const char* path, uint64_t off,
+                                  uint32_t size) {
+    auto printable = [](const uint8_t* t) {
+        for (int i = 0; i < 4; ++i)
+            if (t[i] < 0x20 || t[i] >= 0x7f) return false;
+        return true;
+    };
+    auto zero = [](const uint8_t* t) {
+        return !(t[0] | t[1] | t[2] | t[3]);
+    };
+    if (size < 16) return true;
+    bool headOk = false, tailOk = false;
+    uint8_t* b = nullptr;
+    uint32_t got = 0;
+    if (ScOpt_DStorageReadFile(path, off, 8, &b, &got) == S_OK && b &&
+        got == 8) {
+        headOk = printable(b) || zero(b);
+        free(b);
+        b = nullptr;
+    }
+    got = 0;
+    if (ScOpt_DStorageReadFile(path, off + size - 8, 8, &b, &got) == S_OK &&
+        b && got == 8) {
+        const uint8_t* t = b;
+        tailOk = printable(t) || zero(t);
+        free(b);
+    }
+    return headOk && tailOk;
+}
+
 static const char* ScDsPackByCoverage(uint64_t fileOffset, uint32_t compSize) {
+    const char* firstCovering = nullptr;
     for (size_t p = 0;
          p < sizeof(kDsPackCandidates) / sizeof(kDsPackCandidates[0]); ++p) {
         const uint64_t sz = ScDsPackSize(kDsPackCandidates[p]);
         if (sz < fileOffset || sz - fileOffset < compSize) continue;
-        return kDsPackCandidates[p];
+        if (!firstCovering) firstCovering = kDsPackCandidates[p];
+        if (ScDsExtentLooksFramed(kDsPackCandidates[p], fileOffset, compSize))
+            return kDsPackCandidates[p];
     }
-    return nullptr;
+    // No candidate frames correctly: keep the deterministic coverage choice so
+    // behaviour stays defined and log it.
+    if (firstCovering)
+        Log("dstorage",
+            "pack-coverage: no candidate extent frames at offset=0x%llx "
+            "size=%u; falling back to %s",
+            (unsigned long long)fileOffset, compSize, firstCovering);
+    return firstCovering;
 }
 
 static const char* ScDsResolvePack(uint64_t hash, uint64_t fileOffset,
@@ -5572,6 +5616,23 @@ extern "C" void DsqSubmit(void* self) {
             // directly. The 16-byte request at 0x9048000 (hash
             // 0x6a4519e812) is raw, not zlib; refusing it int3s the game at
             // 0x1443AD94E.
+            // Guard (boot #213 + offline probe): an oversized "raw" request whose
+            // source extent does not frame clobbers already-valid stream bytes.
+            // The implied member base 0x106089510 in packs.rpf holds 42c2d0c7,
+            // not PSIN, and contains no LGID in a +/-8 KiB + 9.17 MB window, so
+            // the 58,896-byte tail page overwrote the real tail.
+            // 58,896-byte tail page was under the old 0x10000 threshold, so gate
+            // every page-sized raw copy, not just the larger ones.
+            if (compSize == destSize && compSize >= 0x1000 &&
+                !ScDsExtentLooksFramed(packPath, fileOffset, compSize)) {
+                Log("dstorage",
+                    "Submit[%d] raw copy REFUSED (extent does not frame): "
+                    "hash 0x%016llx offset=0x%llx compSize=%u pack=%s",
+                    i, (unsigned long long)hash,
+                    (unsigned long long)fileOffset, compSize, packPath);
+                free(comp);
+                continue;
+            }
             if (compSize == destSize) {
                 memcpy((void*)dest, comp, destSize);
                 g_dsLastResolvedPack = packPath;
