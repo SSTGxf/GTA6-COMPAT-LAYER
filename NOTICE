@@ -1,0 +1,16 @@
+ScarlettCompat — NOTICE
+
+This repository is licensed under the MIT License (see LICENSE).
+
+Third-party content included in this repository:
+
+- LLVM Project test files (llvm/test/MC/AMDGPU/gfx10*.s)
+  The GFX10 conformance fixtures in tests/shader/fixtures/
+  (gfx10_mc_fixtures.tsv) are derived from the LLVM Project's MC assembler
+  tests, licensed under the Apache License 2.0 WITH LLVM-exception.
+  Only derived facts are stored (source file, line, instruction family,
+  canonical mnemonic text, encoding dwords), plus the SHA-256 of each raw
+  input, recorded in the TSV header. The raw .s files are not stored in
+  this repository. See tests/shader/fixtures/README.md for the full
+  provenance and regeneration instructions.
+  Source: https://github.com/llvm/llvm-project

@@ -493,3 +493,9 @@ docs/             ARCHITECTURE.md     — loader / shim / graphics design
 - **Do not run the harness against an exe from an unofficial source** —
   treat any third-party exe as untrusted code in a sandbox, and verify
   its SHA-256 against a known-good value before running it.
+  Expected SHA-256 values for the build this layer was verified against
+  (`early_xmas.zip` / `game_scarlett_master.exe`):
+  - ZIP: `7545a2f7fb4b399cf8856987f087ed9ad48499ddb6d6c2d64f2fd60c27f569730`
+  - EXE: `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`
+  If either hash does not match, do not run it — it is not the build this
+  layer was verified against.
