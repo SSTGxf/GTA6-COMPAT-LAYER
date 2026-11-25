@@ -433,3 +433,70 @@ slot 0 stays the CRT's.
 Unverified: `build_ga202` reports `guest_minimal FAILED` (BUILD_EXIT=1) before the
 verify stage — `B1 result: 149 checks, 0 failed -> PASS` still prints. That gate
 must be green again before the VEH fix can be booted and claimed.
+
+## §12 Boots #202–#204 — the TLS wall is cleared; the boot now stops at the 0x1409DFC18 int3
+
+### guest_minimal regression (build_ga201/202) and its real cause
+
+`scarlett_verify.exe` on `guest_minimal.exe` reported every stage PASS with
+`child_exit=0xc0000005`. Cause (measured): the VEH TLS bootstrap returned
+`EXCEPTION_CONTINUE_EXECUTION` for **any** null-read AV whose thread lacked a
+/GA view, so unrelated genuine faults were retried instead of propagating. Fix:
+one attempt per thread, only for a null read (`ExceptionInformation[1] == 0`),
+and the /GA view is re-checked before retrying. `build_ga202`/`ga203`:
+`BUILD_EXIT=0`, `B1 result: 149 checks, 0 failed -> PASS`,
+`=== verify exit code: 0 ===` (guest_minimal passes again).
+
+### Boot #202 — the bootstrap fired, and the measurement that fixed it
+
+```
+veh: guest TLS bootstrap on faulting thread 23788 rip=0x140004b5e
+     tlsArray=000002427BC36060 ourSlot=0000000000000000 slot0=000002427B9C21A0 -> retry once
+veh: exception 0xc0000005 at 0000000140004B5E thread 23788
+```
+
+Measured: the TLS **array** existed, the guest CRT's slot 0 existed
+(`0x2427B9C21A0`), and the **/GA view was null** (`ourSlot=0`) — the patched
+`mov rax,gs:[58h]` reads `TlsSlots[gaSlot]`, so a null view is what produced
+`rax=0`. The attach path had early-returned because `arr[index]` was non-null.
+Fix: when the block exists but the view does not, reinstall the view over the
+**same** block (`InstallGaView(blk, index)`) — no second allocation, no second
+CRT init, slot 0 untouched.
+
+### Boots #203/#204 — past the TLS wall, agreeing
+
+| boot | lines | `0x140004B5E` faults | `reinstalled /GA view` | DStorage | stop |
+|---|---|---|---|---|---|
+| #203 | 18,045 | 0 | 64 | 139/139 copied, 0 refused | `0x80000003` at `0x1409DFC18` |
+| #204 | 17,538 | 0 | 63 | 139/139 copied, 0 refused | `0x80000003` at `0x1409DFC18` |
+
+Both logs show `inflate length mismatch` = 0 and get well past `0x14407ECF0`
+(the PSIN accept path) before stopping. Identical descriptor, identical pack in
+both boots:
+
+```
+#203 Submit[0] raw copy via deterministic pack D:\game\game\data.rpf (id 0x30000705a4fca4f8 ... offset=0x1c000 compSize=16 ...)
+#204 Submit[0] raw copy via deterministic pack D:\game\game\data.rpf (id 0x30000705a4fca4f8 ... offset=0x1c000 compSize=16 ...)
+```
+
+### The remaining wall: 0x1409DFC18
+
+Disassembly (measured) around the stop:
+
+```
+0x1409dfbee: mov  eax, dword ptr [rip + 0x6428f38]  ; guest TlsAlloc index
+0x1409dfbf4: mov  rcx, qword ptr gs:[0x58]
+0x1409dfbfd: mov  rax, qword ptr [rcx + rax*8]      ; guest per-thread obj
+0x1409dfc01: cmp  byte ptr [rax + 8], 0
+0x1409dfc08: jne  0x1409dfa95
+0x1409dfc0e: call 0x1455db994                        ; CRT assert/report path
+0x1409dfc13: jmp  0x1409dfa95
+0x1409dfc18: int3                                    ; <- stop
+```
+
+The `int3` is a landing pad after the assert-report call, not the check itself;
+the checked condition is `byte [guestPerThreadObj + 8] != 0` for the guest TLS
+object. Not patched (forbidden), and no return value is forced: the next step is
+to establish which guest TLS index/object is being tested and why its `+8` byte
+is zero — i.e. which guest subsystem's per-thread state the current host thread
+never created.

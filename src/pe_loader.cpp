@@ -899,9 +899,29 @@ extern "C" void ScGuestTlsThreadAttach() {
     // Re-entrancy guard: the guest TLS callbacks are guest code and may
     // create threads themselves.
     if (InterlockedExchange(&g_guestTlsBusy, 1) != 0) return;
-    // Already bootstrapped for this thread (our slot carries the block)?
+    // Boot #202 measured the real gap: on tid 23788 the TLS *block* existed
+    // (tlsArray non-null, slot0 = 0x2427B9C21A0, the guest CRT's per-thread
+    // data) while the /GA view the patched `mov rax,gs:[58h]` actually reads
+    // was NULL. The old early-return keyed on the block and so skipped the
+    // view install. Now: block present but view missing -> reinstall the view
+    // over the *same* block (no second allocation, no second CRT init);
+    // nothing present -> full bootstrap through EnsureThreadTls().
     PVOID* tlsArr = (PVOID*)__readgsqword(0x58);
-    if (tlsArr && tlsArr[g_tlsInfo.index]) {
+    void* blk = (tlsArr && g_tlsInfo.index < 64)
+                    ? tlsArr[g_tlsInfo.index] : nullptr;
+    void* view = (g_gaSlot != TLS_OUT_OF_INDEXES)
+                     ? TlsSlots()[g_gaSlot] : nullptr;
+    if (blk && view) {
+        InterlockedExchange(&g_guestTlsBusy, 0);
+        return;
+    }
+    if (blk) {
+        InstallGaView(blk, g_tlsInfo.index);
+        void* now = (g_gaSlot != TLS_OUT_OF_INDEXES)
+                        ? TlsSlots()[g_gaSlot] : nullptr;
+        Log("loader",
+            "thread-attach: reinstalled /GA view for tid=%lu block=%p view=%p",
+            (unsigned long)GetCurrentThreadId(), blk, now);
         InterlockedExchange(&g_guestTlsBusy, 0);
         return;
     }
@@ -2784,9 +2804,25 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     // i.e. the guest CRT's per-thread init) and retry the same instruction.
     // Nothing is fabricated: slot 0 remains the guest CRT's and is written
     // only by its own callbacks.
-    if (code == 0xc0000005 && g_guestTlsReady && g_tlsInfo.valid) {
-        // The guest's `mov r64, gs:[58h]` is rewritten to read the /GA view
-        // at TlsSlots[gaSlot] (TEB+0x1480+8*slot), so *that* is the per-thread
+    if (code == 0xc0000005 && g_guestTlsReady && g_tlsInfo.valid &&
+        ep->ExceptionRecord->NumberParameters >= 2 &&
+        ep->ExceptionRecord->ExceptionInformation[1] == 0) {
+        // One attempt per thread only: this must complete missing per-thread
+        // TLS state for a null TLS/GA read, never re-try unrelated faults
+        // (guest_minimal regressed with child_exit=0xc0000005 when every null
+        // read was retried).
+        static volatile LONG g_tlsThreads[512];
+        static volatile LONG g_tlsSlotOverride = -1;
+        const DWORD tid = GetCurrentThreadId();
+        if (g_tlsSlotOverride < 0) {
+            const LONG slot = (LONG)(tid % 512);
+            if (InterlockedCompareExchange(&g_tlsThreads[slot], (LONG)tid, 0) !=
+                    0 &&
+                g_tlsThreads[slot] != (LONG)tid)
+                return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // The guest's `mov r64, gs:[58h]` is rewritten to read the /GA view at
+        // TlsSlots[gaSlot] (TEB+0x1480+8*slot), so *that* is the per-thread
         // state to probe; the real TLS array can hold our block while the
         // view is still missing.
         PVOID* arr = (PVOID*)__readgsqword(0x58);
@@ -2799,8 +2835,8 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
                        ? TlsSlots()[g_gaSlot] : nullptr;
             Log("loader",
                 "veh: guest TLS bootstrap on faulting thread %lu rip=0x%llx "
-                "tlsArray=%p ourSlot=%p slot0=%p -> retry faulting insn",
-                (unsigned long)GetCurrentThreadId(),
+                "tlsArray=%p ourSlot=%p slot0=%p -> retry once",
+                (unsigned long)tid,
                 (unsigned long long)ep->ContextRecord->Rip, (void*)arr, ours,
                 arr ? arr[0] : nullptr);
             if (ours) return EXCEPTION_CONTINUE_EXECUTION;
