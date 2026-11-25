@@ -884,6 +884,31 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
         useSize == size ? "unchanged" : "clamped-to-framed-end");
     ScGateFn real = (ScGateFn)(uintptr_t)0x14407e700ull;
     ScLogGate("entry", obj, buf, size, flag, a5, a6, false, 0);
+    // In-our-code frame validator: inspect the forwarded buffer before the guest
+    // gate sees it and name which structural element is missing at which offset,
+    // so a rejected buffer is diagnosed here instead of inferred from ret=0.
+    {
+        const uint8_t* b = (const uint8_t*)buf;
+        const uint32_t end = useSize;
+        const uint32_t lo = end > 200 ? end - 200 : 0;
+        long long lgid = -1, lrsc = -1, chks = -1;
+        __try {
+            for (uint32_t o = lo; o + 4 <= end; ++o) {
+                if (lgid < 0 && b[o]=='L' && b[o+1]=='G' && b[o+2]=='I' && b[o+3]=='D') lgid = o;
+                if (lrsc < 0 && b[o]=='L' && b[o+1]=='R' && b[o+2]=='S' && b[o+3]=='C') lrsc = o;
+                if (chks < 0 && b[o]=='C' && b[o+1]=='H' && b[o+2]=='K' && b[o+3]=='S') chks = o;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        const char* verdict = (chks >= 0 && lrsc >= 0 && lgid >= 0)
+                                  ? "framed-ok"
+                                  : (chks < 0 ? "missing-CHKS" : (lrsc < 0 ? "missing-LRSC"
+                                     : "missing-LGID"));
+        Log("loader", "gate-frame size=%u end=%u lgid=0x%llx lrsc=0x%llx chks=0x%llx %s",
+            size, end, (unsigned long long)(lgid < 0 ? 0xffffffffull : (uint64_t)lgid),
+            (unsigned long long)(lrsc < 0 ? 0xffffffffull : (uint64_t)lrsc),
+            (unsigned long long)(chks < 0 ? 0xffffffffull : (uint64_t)chks), verdict);
+    }
     bool r = real(obj, buf, useSize, flag, a5, a6);
     ScLogGate("return", obj, buf, useSize, flag, a5, a6, r, r ? 1 : 0);
     return r;
