@@ -301,3 +301,24 @@ What this shows: the walk compares the cursor r14d against the size r8d and
 branches on the chunk stride; the deciding false-return compare has NOT yet been
 pinned to a single instruction in this pass. Unknown remains: which branch is taken
 for the synthesized terminator.
+
+## 2026-11-25: the walk's fourcc dispatch, and the emitted LGID length fixed
+
+Decoded from the committed slice, the chunk dispatcher at 0x14407e78d onward compares the
+big-endian fourcc against immediate tags and rejects anything unmatched:
+
+```
+0x14407e78d: cmp ecx, 0x50534347 / jg ...      ; "PSCG"
+0x14407e7ad: cmp ecx, 0x43484b53 / je 0x14407ea33   ; "CHKS"
+0x14407e7b9: cmp ecx, 0x47554944 / jne 0x14407f1c4  ; "GUID", else reject
+0x14407e845: cmp ecx, 0x50534947 / je 0x14407eb4a   ; "PGIS"->"GSPI" family
+```
+
+The rejection branch is `jmp 0x14407f1c4`, reached whenever a chunk's fourcc is not one of the
+recognised tags. Our synthesized LGID chunk carried a **zero length**, so the walk's stride for
+that chunk was 0 and the chain ended before LRSC/CHKS could be seen in sequence.
+
+Fix (emitted bytes, real data from the writer):
+`ScSynthesizeFramedTail` now writes the LGID chunk's BE length as `8` (its own 4 fourcc bytes +
+4 length bytes) instead of `0`, so the walk advances by the chunk's true extent into LRSC
+(0x58) and CHKS (0x14) — the three tags the gate dispatches on, totalling the 116 bytes.

@@ -873,7 +873,11 @@ static void ScSynthesizeFramedTail(void* b, uint32_t n) {
     uint8_t* t = (uint8_t*)b + (n - 116u);
     __try {
         memcpy(t, "LGID", 4);
-        memset(t + 4, 0, 4);
+        // LGID's BE length must describe its own 8-byte chunk (4 fourcc + 4 length).
+        // The walk at 0x14407e78d dispatches on the movbe fourcc and reads this
+        // length as the stride; a zero stride ends the walk, which is what the gate
+        // rejected on every earlier boot.
+        t[4] = 0; t[5] = 0; t[6] = 0; t[7] = 8;
         memcpy(t + 8, "LRSC", 4);
         t[12] = 0; t[13] = 0; t[14] = 0; t[15] = 0x54;
         memcpy(t + 96, "CHKS", 4);
