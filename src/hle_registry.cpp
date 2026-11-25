@@ -104,9 +104,24 @@ static LONG WINAPI ScarlettLayerVeh(EXCEPTION_POINTERS* ep) {
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
         return EXCEPTION_CONTINUE_SEARCH;
     auto* er = ep->ExceptionRecord;
-    if (er->ExceptionCode != 0xc0000005) return EXCEPTION_CONTINUE_SEARCH;
+    // AVs are the crash being chased; 0xe06d7363 is a guest C++ throw and
+    // 0x80000003 a guest int3 assert. Both matter here: a throw from the
+    // state dispatcher would unwind into a resumed context, which is one
+    // of the two explanations for a register that does not match the
+    // instruction. Everything else is passed straight through.
+    const bool isAv = er->ExceptionCode == 0xc0000005;
+    const bool isThrow = er->ExceptionCode == 0xe06d7363;
+    const bool isInt3 = er->ExceptionCode == 0x80000003;
+    if (!isAv && !isThrow && !isInt3) return EXCEPTION_CONTINUE_SEARCH;
+    // Only guest-originated throws are interesting (the guest's own code
+    // raising, not d3d12/DXGI throwing internally during setup).
+    if (isThrow) {
+        const uintptr_t a = (uintptr_t)er->ExceptionAddress;
+        if (a < 0x140000000ull || a >= 0x147000000ull)
+            return EXCEPTION_CONTINUE_SEARCH;
+    }
     static LONG logged = 0;
-    if (InterlockedIncrement(&logged) > 6) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&logged) > 12) return EXCEPTION_CONTINUE_SEARCH;
     HANDLE f = CreateFileW(L"F:\\ScarlettCompat\\scarlett_veh.log",
                            FILE_APPEND_DATA,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -120,10 +135,16 @@ static LONG WINAPI ScarlettLayerVeh(EXCEPTION_POINTERS* ep) {
     char buf[4096];
     int off = _snprintf_s(
         buf, sizeof(buf), _TRUNCATE,
-        "=== AV rip=%p addr=%p rsp=%p rbp=%p rbx=%p rdi=%p rsi=%p "
-        "rax=%p rcx=%p rdx=%p r8=%p r9=%p tid=%lu\n",
-        (void*)er->ExceptionAddress,
-        (void*)er->ExceptionInformation[1], (void*)c->Rsp, (void*)c->Rbp,
+        "=== %s code=%08lx rip=%p addr=%p p0=%p p1=%p p2=%p p3=%p "
+        "rsp=%p rbp=%p rbx=%p rdi=%p rsi=%p rax=%p rcx=%p rdx=%p "
+        "r8=%p r9=%p tid=%lu\n",
+        isAv ? "AV" : (isThrow ? "THROW" : "INT3"),
+        (unsigned long)er->ExceptionCode, (void*)er->ExceptionAddress,
+        (void*)er->ExceptionInformation[1],
+        (void*)er->ExceptionInformation[0],
+        (void*)er->ExceptionInformation[1],
+        (void*)er->ExceptionInformation[2],
+        (void*)er->ExceptionInformation[3], (void*)c->Rsp, (void*)c->Rbp,
         (void*)c->Rbx, (void*)c->Rdi, (void*)c->Rsi, (void*)c->Rax,
         (void*)c->Rcx, (void*)c->Rdx, (void*)c->R8, (void*)c->R9,
         GetCurrentThreadId());
@@ -155,6 +176,26 @@ static LONG WINAPI ScarlettLayerVeh(EXCEPTION_POINTERS* ep) {
         off += _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
                            "=== teb=%p savedRbx=%p ret58=%p\n", (void*)tebSelf,
                            (void*)savedRbx, (void*)retAddr);
+        if (isAv) {
+            // Settle what gs:[0x14c8] actually holds: a /GA view (a 64-entry
+            // array whose [0] and [tlsIndex] are the block) or the block
+            // itself. view9/view10 are zero and block for a real view; a
+            // block instead has arbitrary words there.
+            unsigned long long v9 = 0, v10 = 0, blk0 = 0, blkhdr = 0;
+            __try {
+                if (gaVal) {
+                    v9 = *((volatile unsigned long long*)gaVal + 9);
+                    v10 = *((volatile unsigned long long*)gaVal + 10);
+                    blkhdr = *(volatile unsigned long long*)(gaVal - 8);
+                }
+                if (view0) blk0 = *(volatile unsigned long long*)view0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            off += _snprintf_s(
+                buf + off, sizeof(buf) - off, _TRUNCATE,
+                "=== view v9=%p v10=%p slotHdr=%p block0=%p\n", (void*)v9,
+                (void*)v10, (void*)blkhdr, (void*)blk0);
+        }
     }
     if (off > 0 && off < (int)sizeof(buf)) {
         const unsigned char* r = (const unsigned char*)er->ExceptionAddress;
@@ -2314,6 +2355,189 @@ static HRESULT WINAPI XboxDevice_CreateQueryHeap(
     return hr;
 }
 
+// ---- Xbox D3D12 command-queue wrapper ----
+// Boot #152 proved the title must never see the raw desktop queue. It
+// takes the object from CreateCommandQueue and calls vtable +0x90 on it.
+// On the Xbox queue layout that slot is GetTimestampFrequency(UINT64*):
+// the guest zeroes an 8-byte out slot, checks HRESULT and value, then
+// converts the value to float and divides a constant by it
+// (0x1424841C8..0x1424841F7). On the desktop vtable +0x90 is GetDesc,
+// which writes a 16-byte D3D12_COMMAND_QUEUE_DESC; the third dword lands
+// on the caller's saved-rbx slot ([rsp+0x30] in 0x142484180), so that
+// function returns with rbx = the value left there and 0x142484133 AVs
+// on [rbx]. The wrapper forwards the slots the title already drives at
+// the same indices (identical to the old raw-pointer behaviour, with
+// `this` translated to the real queue) and maps the Xbox tail onto the
+// desktop methods it actually means: 18 timestamp frequency, 19 clock
+// calibration, 20 desc. Slots 16/17 (no desktop counterpart) are logged
+// and left unimplemented.
+struct XboxCommandQueueWrapper {
+    void** vtable;
+    ID3D12CommandQueue* real;
+    LONG refCount;
+};
+
+static void* g_xboxQueueVtable[64];
+static bool g_xboxQueueVtableInit = false;
+
+static ULONG WINAPI XboxQueue_AddRef(XboxCommandQueueWrapper* self) {
+    if (!self) return 0;
+    return (ULONG)InterlockedIncrement(&self->refCount);
+}
+
+static ULONG WINAPI XboxQueue_Release(XboxCommandQueueWrapper* self) {
+    if (!self) return 0;
+    LONG rc = InterlockedDecrement(&self->refCount);
+    if (rc == 0) {
+        if (self->real) self->real->Release();
+        HeapFree(GetProcessHeap(), 0, self);
+    }
+    return (ULONG)rc;
+}
+
+static HRESULT WINAPI XboxQueue_QueryInterface(XboxCommandQueueWrapper* self,
+                                               REFIID riid,
+                                               void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (!self) return E_POINTER;
+    if (memcmp(&riid, &__uuidof(IUnknown), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(ID3D12Object), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(ID3D12DeviceChild), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(ID3D12Pageable), sizeof(GUID)) == 0 ||
+        memcmp(&riid, &__uuidof(ID3D12CommandQueue), sizeof(GUID)) == 0) {
+        InterlockedIncrement(&self->refCount);
+        *ppvObject = self;
+        return S_OK;
+    }
+    Log("xboxdev",
+        "queue QueryInterface: unknown IID {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}, E_NOINTERFACE",
+        (unsigned)riid.Data1, (unsigned)riid.Data2, (unsigned)riid.Data3,
+        riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
+        riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7]);
+    return E_NOINTERFACE;
+}
+
+// Generic passthrough: call the desktop method at the same vtable index
+// with the wrapper's real queue as `this`. Six integer arguments cover
+// every command-queue method (the widest is BeginEvent/SetMarker with
+// four); the return covers HRESULT, pointer and 8-byte struct returns.
+// Nothing here is guessed: index N previously reached desktop N through
+// the raw pointer, so N -> N keeps that behaviour intact.
+template <int Slot>
+static uint64_t WINAPI XboxQueue_Forward(void* self, uint64_t a1, uint64_t a2,
+                                         uint64_t a3, uint64_t a4,
+                                         uint64_t a5, uint64_t a6) {
+    XboxCommandQueueWrapper* w = (XboxCommandQueueWrapper*)self;
+    if (!w || !w->real) return (uint64_t)E_POINTER;
+    void** vt = *(void***)w->real;
+    typedef uint64_t(WINAPI * Fn)(void*, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t);
+    return ((Fn)vt[Slot])((void*)w->real, a1, a2, a3, a4, a5, a6);
+}
+
+// Xbox slot 18: GetTimestampFrequency(UINT64* pFrequency). Logged because
+// this is the call whose desktop misroute clobbered saved rbx.
+static HRESULT WINAPI XboxQueue_GetTimestampFrequency(
+    XboxCommandQueueWrapper* self, UINT64* pFrequency) {
+    if (!self || !self->real) return E_POINTER;
+    HRESULT hr = self->real->GetTimestampFrequency(pFrequency);
+    Log("xboxdev",
+        "queue GetTimestampFrequency(slot18) -> hr=0x%08x value=%llu",
+        (unsigned)hr,
+        (unsigned long long)(SUCCEEDED(hr) && pFrequency ? *pFrequency
+                                                          : 0));
+    return hr;
+}
+
+template <int Slot>
+static HRESULT WINAPI XboxQueue_SlotUnimplemented(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 8 || (n % 64) == 0) {
+        Log("xboxdev",
+            "UNIMPLEMENTED queue slot %d (vtable +0x%x) from game %p "
+            "args=%llx %llx %llx %llx %llx %llx (call #%ld) -> E_NOTIMPL",
+            Slot, Slot * 8, _ReturnAddress(), (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)a3,
+            (unsigned long long)a4, (unsigned long long)a5,
+            (unsigned long long)a6, (long)n);
+    }
+    return E_NOTIMPL;
+}
+
+// Generic fallback for queue slots nothing calls: logs the caller and the
+// raw arguments, returns E_NOTIMPL.
+static HRESULT WINAPI XboxQueue_SlotUnknown(void* self, uint64_t a1,
+                                            uint64_t a2, uint64_t a3,
+                                            uint64_t a4, uint64_t a5,
+                                            uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 8 || (n % 64) == 0) {
+        Log("xboxdev",
+            "UNIMPLEMENTED queue slot ? from game %p args=%llx %llx %llx "
+            "%llx %llx %llx (call #%ld) -> E_NOTIMPL",
+            _ReturnAddress(), (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n);
+    }
+    return E_NOTIMPL;
+}
+
+static void InitXboxQueueVtable() {
+    if (g_xboxQueueVtableInit) return;
+    for (int i = 0; i < 64; ++i)
+        g_xboxQueueVtable[i] = (void*)XboxQueue_SlotUnknown;
+    g_xboxQueueVtable[16] = (void*)XboxQueue_SlotUnimplemented<16>;
+    g_xboxQueueVtable[17] = (void*)XboxQueue_SlotUnimplemented<17>;
+    g_xboxQueueVtable[0] = (void*)XboxQueue_QueryInterface;
+    g_xboxQueueVtable[1] = (void*)XboxQueue_AddRef;
+    g_xboxQueueVtable[2] = (void*)XboxQueue_Release;
+    // 0..15 keep the desktop index the title already used through the raw
+    // queue pointer (3..6 object, 7 GetDevice, 10 ExecuteCommandLists,
+    // 11..13 markers/events, 14 Signal, 15 Wait).
+    g_xboxQueueVtable[3] = (void*)XboxQueue_Forward<3>;
+    g_xboxQueueVtable[4] = (void*)XboxQueue_Forward<4>;
+    g_xboxQueueVtable[5] = (void*)XboxQueue_Forward<5>;
+    g_xboxQueueVtable[6] = (void*)XboxQueue_Forward<6>;
+    g_xboxQueueVtable[7] = (void*)XboxQueue_Forward<7>;
+    g_xboxQueueVtable[8] = (void*)XboxQueue_Forward<8>;
+    g_xboxQueueVtable[9] = (void*)XboxQueue_Forward<9>;
+    g_xboxQueueVtable[10] = (void*)XboxQueue_Forward<10>;
+    g_xboxQueueVtable[11] = (void*)XboxQueue_Forward<11>;
+    g_xboxQueueVtable[12] = (void*)XboxQueue_Forward<12>;
+    g_xboxQueueVtable[13] = (void*)XboxQueue_Forward<13>;
+    g_xboxQueueVtable[14] = (void*)XboxQueue_Forward<14>;
+    g_xboxQueueVtable[15] = (void*)XboxQueue_Forward<15>;
+    // 16/17 stay the logging E_NOTIMPL stub: the Xbox layout has two
+    // methods here with no desktop counterpart (nothing in the boot has
+    // called them), so forwarding them to GetTimestampFrequency /
+    // GetClockCalibration would corrupt whatever the title passed.
+    g_xboxQueueVtable[18] = (void*)XboxQueue_GetTimestampFrequency;
+    g_xboxQueueVtable[19] = (void*)XboxQueue_Forward<17>;
+    g_xboxQueueVtable[20] = (void*)XboxQueue_Forward<18>;
+    g_xboxQueueVtableInit = true;
+}
+
+static XboxCommandQueueWrapper* WrapXboxCommandQueue(
+    ID3D12CommandQueue* real) {
+    if (!real) return nullptr;
+    InitXboxQueueVtable();
+    XboxCommandQueueWrapper* w = (XboxCommandQueueWrapper*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*w));
+    if (!w) return nullptr;
+    w->vtable = g_xboxQueueVtable;
+    w->real = real;
+    w->refCount = 1;
+    real->AddRef();
+    return w;
+}
+
 static HRESULT WINAPI XboxDevice_CreateCommandQueue(
     XboxDeviceWrapper* self, const D3D12_COMMAND_QUEUE_DESC* pDesc,
     REFIID riid, void** ppCommandQueue) {
@@ -2353,6 +2577,18 @@ static HRESULT WINAPI XboxDevice_CreateCommandQueue(
     if (hr == E_NOINTERFACE && ppCommandQueue) {
         hr = self->real->CreateCommandQueue(
             &pcDesc, __uuidof(ID3D12CommandQueue), ppCommandQueue);
+    }
+    if (SUCCEEDED(hr) && ppCommandQueue && *ppCommandQueue) {
+        ID3D12CommandQueue* real = (ID3D12CommandQueue*)*ppCommandQueue;
+        XboxCommandQueueWrapper* w = WrapXboxCommandQueue(real);
+        if (w) {
+            real->Release();  // the wrapper owns one reference
+            *ppCommandQueue = w;
+        }
+        Log("xboxdev",
+            "CreateCommandQueue -> hr=0x%08x real=%p wrapper=%p",
+            (unsigned)hr, (void*)real, (void*)w);
+        return hr;
     }
     Log("xboxdev", "CreateCommandQueue -> hr=0x%08x queue=%p",
         (unsigned)hr, ppCommandQueue ? *ppCommandQueue : nullptr);
