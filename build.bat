@@ -85,6 +85,13 @@ REM title activation path) + runtimeobject.lib (RoGetActivationFactory).
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\guest_winrt.cpp" /Fe"%OUT%\guest_winrt.exe" /Fo%OUT%\ /Fd%OUT%\guest_winrt.pdb /link /OPT:NOREF /BASE:0x180000000 /LIBPATH:"%OUT%\lib" kernelx.lib vccorlib110.lib runtimeobject.lib
 if errorlevel 1 exit /b 1
 
+REM BCPack B1 (docs/FREEBUFF-BCPACK-TEXTURE-SPEC.md Part 1): the module is
+REM built with its own harness, which carries the spec-built test encoder and
+REM the reference cross-check mode. Nothing in the layer calls it yet.
+echo === 3b. BCPack B1 harness (own decoder + spec-built encoder) ===
+cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%tests\bcpack_b1.cpp" "%ROOT%src\bcpack.cpp" /Fe"%OUT%\bcpack_b1.exe" /Fo%OUT%\ /Fd%OUT%\bcpack_b1.pdb
+if errorlevel 1 exit /b 1
+
 echo === 4. Verification harness ===
 cl /nologo /EHsc /MD /O2 /W3 /I"%ROOT%include" "%ROOT%src\verify.cpp" /Fe"%OUT%\scarlett_verify.exe" /Fo%OUT%\ /Fd%OUT%\scarlett_verify.pdb /link "%OUT%\ScarlettCompat.lib"
 if errorlevel 1 exit /b 1
@@ -121,6 +128,8 @@ set RC6=%ERRORLEVEL%
 set RC7=%ERRORLEVEL%
 "%OUT%\scarlett_verify.exe" "%OUT%\guest_winrt.exe" 120000
 set RC8=%ERRORLEVEL%
+"%OUT%\bcpack_b1.exe"
+set RC9=%ERRORLEVEL%
 cd /d "%ROOT%"
 if %RC1% neq 0 (echo guest_minimal FAILED & exit /b 1)
 if %RC2% neq 0 (echo guest_ordinal FAILED & exit /b 1)
@@ -132,5 +141,6 @@ if %RC5c% neq 0 (echo guest_software_rt [hardware] FAILED & exit /b 1)
 if %RC6% neq 0 (echo guest_opt FAILED & exit /b 1)
 if %RC7% neq 0 (echo guest_physics FAILED & exit /b 1)
 if %RC8% neq 0 (echo guest_winrt FAILED & exit /b 1)
+if %RC9% neq 0 (echo bcpack_b1 FAILED & exit /b 1)
 echo === verify exit code: 0 ===
 exit /b 0
