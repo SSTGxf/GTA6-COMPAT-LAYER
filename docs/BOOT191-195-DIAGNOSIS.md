@@ -586,3 +586,43 @@ Measured: the TLS object exists with `[+8]=1`; the gate call exists on this path
 Inference (not proven): `0x14407e700` returns false for this resource and the
 caller treats null as a hard assert. Not patched, nothing forced, no value
 synthesised. No rebuild and no boot were run in this pass.
+
+## §15 What 0x14407e700 accepts, and what was live on the stack at the stop (measured)
+
+Chunk fourccs compared by the gate (BE dwords at [buf+0], `movbe ecx,[rdx]`):
+
+`PSCG LRSB LENL CHKS GUID STFM PSIM PSCH PSIG LSNR LRSC LSCH STRD STFN STNS
+LENM LGID PSIN STND LSNS PMAP STRE STRF`
+
+So every chunk of the clip-sets PSIN stream (`PSIN`, `LSCH`, `LENM`, `LSNS`) is
+handled by this parser; the rejection is not "unknown fourcc".
+
+First rejection test inside the gate:
+
+```
+0x14407e731: test rdx,rdx ; setne al
+0x14407e737: test r8d,r8d ; setne cl
+0x14407e73d: test al,cl  ; jne 0x14407e757
+0x14407e741: (null buffer or size) status=2 -> return false
+0x14407e757: movbe r14d, dword ptr [rdx + 4]   ; chunk BE length
+0x14407e765: cmp   r14d, r8d
+0x14407e768: jbe   0x14407e77f                  ; length <= size -> parse
+             else: return false (rax=0)
+```
+
+Live objects found on the faulting thread's stack at the stop (dump scan):
+
+```
+stack+0x0d0 -> 0x19f0ae655c0  fourcc='PSIN'  head=5053494e003340c0 5c000000 30d50600
+stack+0x200 -> 0x19f07253930  "platform:/anim/jlimits.r..."
+stack+0x230 -> 0x19f073777d0  "platform:/anim/clip_sets..."
+stack+0x2e8 -> 0x19f0724c300  "audio:/config/speechanim..."
+```
+
+Measured: the PSIN buffer is live in this frame and its first chunk is
+`PSIN` with BE length `0x003340C0`; `platform:/anim/jlimits.rpf` is a *new*
+resource path present here that earlier boots never reached.
+
+Not measured yet (requires the gate call's actual rdx/size at 0x1409dfcc1): which
+descriptor was passed and which of the gate's later conditions failed. No fix
+landed, no rebuild, no boot in this pass; nothing patched or forced.
