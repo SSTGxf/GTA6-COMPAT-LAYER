@@ -4863,7 +4863,14 @@ extern "C" HRESULT HleScOptDStorageInit(ScOptDsPath* path) {
 extern "C" HRESULT HleScOptDStorageReadFile(const char* path, uint64_t offset,
                                             uint32_t size, uint8_t** data,
                                             uint32_t* bytesRead) {
-    return ScOpt_DStorageReadFile(path, offset, size, data, bytesRead);
+    HRESULT hr_ = ScOpt_DStorageReadFile(path, offset, size, data, bytesRead);
+    Log("io", "io packread path=%s off=%llu req=%llu got=%llu dst=%llx hr=%ld err=%lu",
+        path ? path : "(null)", (unsigned long long)offset,
+        (unsigned long long)size,
+        (unsigned long long)(bytesRead ? *bytesRead : 0ull),
+        (unsigned long long)(uintptr_t)data, (long)hr_,
+        (unsigned long)GetLastError());
+    return hr_;
 }
 
 extern "C" HRESULT HleScOptDStorageReadFileBatch(const char* path,
