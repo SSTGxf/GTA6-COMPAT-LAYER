@@ -200,7 +200,7 @@ subsystem, not a dead harness.
 
 **GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (172 boots). No game frame yet, no menu yet.**
 
-**Progress: ~44% proven toward first menu (CBV unaligned-location fix PROVEN in boot #172 — the game passed the DEVICE_REMOVED assert at 0x142474606 and ran 16,079 log lines, nearly 4x further than boots #169/#170; TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet; current stop is a read AV at 0x1425A087D in boot #172).**
+**Progress: ~44% proven toward first menu (GPU-copy path for CBV sources PROVEN in boot #177 — all 8 unaligned CBVs now carry real data via a READBACK-staged GPU copy, 16,084 lines, the game passed the 0x1425A087D read crash; CBV unaligned-location fix PROVEN in boot #172 — the game passed the DEVICE_REMOVED assert at 0x142474606 and ran 16,079 log lines, nearly 4x further than boots #169/#170; TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet; current stop is an int3 at 0x141DAC734 in boot #177, after DStorage refuses an unresolvable source hash — the hash gate).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -244,7 +244,7 @@ subsystem, not a dead harness.
 | BC1–BC7 decode + BC6H GPU verification bit-exact | ✅ | Entry 29, commit 51d86fe9, 118/118 vs independent decoder; BC6H 0/64 max 0 on RX 5700 XT, BC7 all 8 modes bit-exact on silicon |
 | Shader Phase 8: mesh-as-compute (CPU reference model) | ✅ | Entry 29, commit 51d86fe9, 79 checks, order-independent validator |
 | Link contract (no-DXC link smoke test) | ✅ | Entry 29, commit 51d86fe9, LNK2019 without emitter, clean link + run with it |
-| CBV unaligned-location fix (slot 17 copies to aligned scratch) | ✅ | Boot #172, 8 unaligned CBVs repointed to aligned scratch buffers, 0x142474606 absent (0 occurrences in 16,079 lines), game runs ~4x further than #169/#170 |
+| CBV unaligned-location fix (slot 17 copies to aligned scratch) | ✅ | Boot #172, 8 unaligned CBVs repointed to aligned scratch buffers, 0x142474606 absent (0 occurrences in 16,079 lines), game runs ~4x further than #169/#170; boot #177, GPU-copy path PROVEN — all 8 CBVs (copied) with real data via READBACK staging, game past 0x1425A087D |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
 | Real shader translation from corpus | ❌ | No corpus yet (slots 86/16 don't create PSOs), no game shader translated |

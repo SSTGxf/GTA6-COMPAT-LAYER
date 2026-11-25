@@ -923,6 +923,22 @@ static void ScCbvRecordSource(ID3D12Resource* resource, UINT64 size,
     g_cbvSources[base] = ScCbvSourceRecord{resource, size, heapType};
 }
 
+// Record by an explicit VA. Slot 133 (CreatePlacedResourceX) takes a
+// GUEST va where the game wants the resource placed, but Model A creates
+// it via CreateCommittedResource, whose NATIVE GPU VA is different. The
+// game references the resource by the GUEST va (e.g. in CBV
+// BufferLocation), so the map must be keyed by the guest va or the
+// lookup never finds it (boots #172–#174: the 182 MB buffer at guest va
+// 0x223ce1c0000 was recorded under its native VA, so all 8 CBVs missed
+// and stayed zero-filled).
+static void ScCbvRecordSourceAt(ID3D12Resource* resource,
+                                D3D12_GPU_VIRTUAL_ADDRESS va, UINT64 size,
+                                D3D12_HEAP_TYPE heapType) {
+    if (!resource || !va || !size) return;
+    std::lock_guard<std::mutex> lock(g_cbvSourcesMutex);
+    g_cbvSources[va] = ScCbvSourceRecord{resource, size, heapType};
+}
+
 static bool ScCbvFindSource(D3D12_GPU_VIRTUAL_ADDRESS va,
                             ScCbvSourceRecord* out, UINT64* outOffset) {
     std::lock_guard<std::mutex> lock(g_cbvSourcesMutex);
@@ -932,6 +948,208 @@ static bool ScCbvFindSource(D3D12_GPU_VIRTUAL_ADDRESS va,
     if (va < it->first || va >= it->first + it->second.size) return false;
     *out = it->second;
     *outOffset = va - it->first;
+    return true;
+}
+
+// ---- GPU copy for DEFAULT-heap CBV sources (boot #173) -------------
+// Boot #172 proved the CBV fix works (game past 0x142474606), but all 8
+// unaligned CBVs were zero-filled: their sources are DEFAULT-heap, not
+// CPU-readable, so the Map-copy path could not read them. If a constant
+// holds a pointer or an offset, zero gives a bad address — the leading
+// suspect for the read AV at 0x1425A087D. The real fix is a GPU copy on
+// a dedicated COPY queue, then wait for the fence. The copy goes through
+// a READBACK staging buffer (boot #177): an UPLOAD buffer cannot be a
+// CopyBufferRegion destination (it cannot leave GENERIC_READ), so the
+// GPU copies src -> READBACK and the CPU memcpys READBACK -> scratch.
+// The source is NOT barriered: a CBV source buffer is normally in
+// GENERIC_READ, which already includes COPY_SOURCE, and touching the
+// game's resource state could break the game's own state tracking.
+// game's own state tracking. If the copy fails or times out, the caller
+// falls back to the zero-filled scratch (same as before).
+// The copy objects are created once, lazily, and shared; a mutex
+// serialises copies because the queue/list/fence are shared.
+static ID3D12CommandQueue* g_cbvCopyQueue = nullptr;
+static ID3D12CommandAllocator* g_cbvCopyAlloc = nullptr;
+static ID3D12GraphicsCommandList* g_cbvCopyList = nullptr;
+static ID3D12Fence* g_cbvCopyFence = nullptr;
+static HANDLE g_cbvCopyFenceEvent = nullptr;
+static UINT64 g_cbvCopyFenceValue = 0;
+static std::mutex g_cbvCopyMutex;
+static bool g_cbvCopyInitTried = false;
+static bool g_cbvCopyInitOk = false;
+
+static bool ScCbvCopyInit(ID3D12Device* device) {
+    if (g_cbvCopyInitTried) return g_cbvCopyInitOk;
+    g_cbvCopyInitTried = true;
+    g_cbvCopyInitOk = false;
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    qd.NodeMask = 0;
+    if (FAILED(device->CreateCommandQueue(
+            &qd, __uuidof(ID3D12CommandQueue), (void**)&g_cbvCopyQueue)) ||
+        !g_cbvCopyQueue) {
+        Log("xboxdev", "CBV GPU copy: CreateCommandQueue failed");
+        return false;
+    }
+    if (FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COPY,
+            __uuidof(ID3D12CommandAllocator), (void**)&g_cbvCopyAlloc)) ||
+        !g_cbvCopyAlloc) {
+        Log("xboxdev", "CBV GPU copy: CreateCommandAllocator failed");
+        return false;
+    }
+    if (FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_COPY, g_cbvCopyAlloc, nullptr,
+            __uuidof(ID3D12GraphicsCommandList), (void**)&g_cbvCopyList)) ||
+        !g_cbvCopyList) {
+        Log("xboxdev", "CBV GPU copy: CreateCommandList failed");
+        return false;
+    }
+    // CreateCommandList leaves the list open; close it so Reset works.
+    g_cbvCopyList->Close();
+    if (FAILED(device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+            (void**)&g_cbvCopyFence)) ||
+        !g_cbvCopyFence) {
+        Log("xboxdev", "CBV GPU copy: CreateFence failed");
+        return false;
+    }
+    g_cbvCopyFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_cbvCopyFenceEvent) {
+        Log("xboxdev", "CBV GPU copy: CreateEvent failed");
+        return false;
+    }
+    g_cbvCopyInitOk = true;
+    Log("xboxdev", "CBV GPU copy: copy queue ready");
+    return true;
+}
+
+// Copy copyBytes from src (GPU-only, at offset) into dst (the aligned
+// UPLOAD scratch buffer, at 0). Blocks until the copy completes (max 5 s).
+// Returns true on success. The caller keeps the scratch either way.
+// Boot #176 found the first attempt failed: an UPLOAD buffer cannot be a
+// CopyBufferRegion destination (it cannot leave GENERIC_READ, so the
+// COPY_DEST barrier made the list invalid and Close failed E_INVALIDARG).
+// The fix is a READBACK staging buffer: the GPU copies src -> READBACK
+// (READBACK is created in COPY_DEST, no barrier needed), then the CPU
+// Maps the READBACK buffer and memcpys into the UPLOAD scratch. The
+// READBACK buffer is one reusable staging buffer, grown if a larger copy
+// is ever requested.
+static ID3D12Resource* g_cbvCopyReadback = nullptr;
+static UINT64 g_cbvCopyReadbackSize = 0;
+
+static bool ScCbvCopyFromDefault(ID3D12Device* device,
+                                 ID3D12Resource* src, UINT64 offset,
+                                 ID3D12Resource* dst, UINT64 copyBytes) {
+    if (!device || !src || !dst || !copyBytes) return false;
+    std::lock_guard<std::mutex> lock(g_cbvCopyMutex);
+    if (!ScCbvCopyInit(device)) return false;
+    // Ensure the READBACK staging buffer is big enough.
+    if (!g_cbvCopyReadback || g_cbvCopyReadbackSize < copyBytes) {
+        if (g_cbvCopyReadback) g_cbvCopyReadback->Release();
+        g_cbvCopyReadback = nullptr;
+        g_cbvCopyReadbackSize = 0;
+        UINT64 stageSize = copyBytes < 4096 ? 4096 : copyBytes;
+        D3D12_HEAP_PROPERTIES rbProps = {};
+        rbProps.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rbDesc = {};
+        rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rbDesc.Width = stageSize;
+        rbDesc.Height = 1;
+        rbDesc.DepthOrArraySize = 1;
+        rbDesc.MipLevels = 1;
+        rbDesc.Format = DXGI_FORMAT_UNKNOWN;
+        rbDesc.SampleDesc.Count = 1;
+        rbDesc.SampleDesc.Quality = 0;
+        rbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rbDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        HRESULT hr = device->CreateCommittedResource(
+            &rbProps, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            __uuidof(ID3D12Resource), (void**)&g_cbvCopyReadback);
+        if (FAILED(hr) || !g_cbvCopyReadback) {
+            Log("xboxdev",
+                "CBV GPU copy: READBACK staging alloc failed hr=0x%08x",
+                (unsigned)hr);
+            return false;
+        }
+        g_cbvCopyReadbackSize = stageSize;
+    }
+    HRESULT hr = g_cbvCopyAlloc->Reset();
+    if (FAILED(hr)) {
+        Log("xboxdev", "CBV GPU copy: Alloc Reset failed hr=0x%08x",
+            (unsigned)hr);
+        return false;
+    }
+    hr = g_cbvCopyList->Reset(g_cbvCopyAlloc, nullptr);
+    if (FAILED(hr)) {
+        Log("xboxdev", "CBV GPU copy: List Reset failed hr=0x%08x",
+            (unsigned)hr);
+        return false;
+    }
+    // READBACK is already in COPY_DEST; no barrier needed (and the
+    // UPLOAD scratch must NOT be barriered — it cannot leave
+    // GENERIC_READ). The source is assumed in GENERIC_READ (which
+    // includes COPY_SOURCE); it is not barriered.
+    g_cbvCopyList->CopyBufferRegion(g_cbvCopyReadback, 0, src, offset,
+                                    copyBytes);
+    hr = g_cbvCopyList->Close();
+    if (FAILED(hr)) {
+        Log("xboxdev", "CBV GPU copy: List Close failed hr=0x%08x",
+            (unsigned)hr);
+        return false;
+    }
+    ID3D12CommandList* lists[1] = {g_cbvCopyList};
+    g_cbvCopyQueue->ExecuteCommandLists(1, lists);
+    ++g_cbvCopyFenceValue;
+    hr = g_cbvCopyQueue->Signal(g_cbvCopyFence, g_cbvCopyFenceValue);
+    if (FAILED(hr)) {
+        Log("xboxdev", "CBV GPU copy: Signal failed hr=0x%08x",
+            (unsigned)hr);
+        return false;
+    }
+    if (g_cbvCopyFence->GetCompletedValue() < g_cbvCopyFenceValue) {
+        hr = g_cbvCopyFence->SetEventOnCompletion(g_cbvCopyFenceValue,
+                                                  g_cbvCopyFenceEvent);
+        if (FAILED(hr)) {
+            Log("xboxdev",
+                "CBV GPU copy: SetEventOnCompletion failed hr=0x%08x",
+                (unsigned)hr);
+            return false;
+        }
+        DWORD wait = WaitForSingleObject(g_cbvCopyFenceEvent, 5000);
+        if (wait != WAIT_OBJECT_0) {
+            Log("xboxdev",
+                "CBV GPU copy: fence wait timed out (wait=%u), "
+                "falling back to zero-fill",
+                (unsigned)wait);
+            return false;
+        }
+    }
+    // Copy the staged bytes from the READBACK buffer into the UPLOAD
+    // scratch via CPU Map (both are CPU-accessible).
+    D3D12_RANGE rbRange = {0, (SIZE_T)copyBytes};
+    void* rbData = nullptr;
+    hr = g_cbvCopyReadback->Map(0, &rbRange, &rbData);
+    if (FAILED(hr) || !rbData) {
+        Log("xboxdev", "CBV GPU copy: READBACK Map failed hr=0x%08x",
+            (unsigned)hr);
+        return false;
+    }
+    void* dstData = nullptr;
+    D3D12_RANGE dstRange = {0, (SIZE_T)copyBytes};
+    hr = dst->Map(0, &dstRange, &dstData);
+    if (FAILED(hr) || !dstData) {
+        Log("xboxdev", "CBV GPU copy: scratch Map failed hr=0x%08x",
+            (unsigned)hr);
+        g_cbvCopyReadback->Unmap(0, &rbRange);
+        return false;
+    }
+    memcpy(dstData, rbData, (size_t)copyBytes);
+    dst->Unmap(0, &dstRange);
+    g_cbvCopyReadback->Unmap(0, &rbRange);
     return true;
 }
 
@@ -980,38 +1198,63 @@ static bool ScCbvFixUnalignedLocation(
     bool copied = false;
     ScCbvSourceRecord src;
     UINT64 offset = 0;
-    if (ScCbvFindSource(loc, &src, &offset) &&
-        src.heapType == D3D12_HEAP_TYPE_UPLOAD && src.resource) {
+    if (ScCbvFindSource(loc, &src, &offset) && src.resource) {
         UINT64 avail = (offset < src.size) ? (src.size - offset) : 0;
         UINT64 copyBytes = size < avail ? size : avail;
         if (copyBytes > 0) {
-            D3D12_RANGE readRange = {(SIZE_T)offset,
-                                     (SIZE_T)(offset + copyBytes)};
-            void* srcData = nullptr;
-            HRESULT mapHr = src.resource->Map(0, &readRange, &srcData);
-            if (SUCCEEDED(mapHr) && srcData) {
-                void* dstData = nullptr;
-                D3D12_RANGE writeRange = {0, (SIZE_T)size};
-                HRESULT dstHr = scratch->Map(0, &writeRange, &dstData);
-                if (SUCCEEDED(dstHr) && dstData) {
-                    memcpy(dstData, (const BYTE*)srcData + offset,
-                           (size_t)copyBytes);
-                    if (copyBytes < size) {
-                        memset((BYTE*)dstData + copyBytes, 0,
-                               (size_t)(size - copyBytes));
+            if (src.heapType == D3D12_HEAP_TYPE_UPLOAD) {
+                D3D12_RANGE readRange = {(SIZE_T)offset,
+                                         (SIZE_T)(offset + copyBytes)};
+                void* srcData = nullptr;
+                HRESULT mapHr = src.resource->Map(0, &readRange, &srcData);
+                if (SUCCEEDED(mapHr) && srcData) {
+                    void* dstData = nullptr;
+                    D3D12_RANGE writeRange = {0, (SIZE_T)size};
+                    HRESULT dstHr = scratch->Map(0, &writeRange, &dstData);
+                    if (SUCCEEDED(dstHr) && dstData) {
+                        memcpy(dstData, (const BYTE*)srcData + offset,
+                               (size_t)copyBytes);
+                        if (copyBytes < size) {
+                            memset((BYTE*)dstData + copyBytes, 0,
+                                   (size_t)(size - copyBytes));
+                        }
+                        scratch->Unmap(0, &writeRange);
+                        copied = true;
                     }
-                    scratch->Unmap(0, &writeRange);
+                    src.resource->Unmap(0, &readRange);
+                }
+            } else {
+                // Any non-UPLOAD heap is GPU-only: the game's buffers are
+                // typically CUSTOM-heap (Xbox-style, recorded verbatim by
+                // slot 127) or DEFAULT-heap (slot 133), neither of which
+                // is CPU-readable. GPU copy into the scratch (boot #173).
+                // (Boot #173 first ran this branch only for DEFAULT and
+                // the copy never fired: the sources are CUSTOM-heap.)
+                if (ScCbvCopyFromDefault(device, src.resource, offset,
+                                         scratch, copyBytes)) {
+                    if (copyBytes < size) {
+                        // Zero the tail the copy did not cover.
+                        void* dstData = nullptr;
+                        D3D12_RANGE writeRange = {(SIZE_T)copyBytes,
+                                                  (SIZE_T)size};
+                        if (SUCCEEDED(scratch->Map(0, &writeRange,
+                                                    &dstData)) && dstData) {
+                            memset(dstData, 0,
+                                   (size_t)(size - copyBytes));
+                            scratch->Unmap(0, &writeRange);
+                        }
+                    }
                     copied = true;
                 }
-                src.resource->Unmap(0, &readRange);
             }
         }
     }
     if (!copied) {
-        // Source not found or not CPU-readable: zero-fill the scratch so
-        // the CBV is still valid (the game proceeds; constants read
-        // zero). Loud log so the next boot shows whether the real copy
-        // path is needed (a GPU copy for DEFAULT-heap sources).
+        // Source not found, not a buffer we track, or the copy failed
+        // (UPLOAD Map failed, or the DEFAULT GPU copy failed/timed out):
+        // zero-fill the scratch so the CBV is still valid (the game
+        // proceeds; constants read zero). Loud log so the next boot shows
+        // whether the real copy path is working.
         void* dstData = nullptr;
         D3D12_RANGE writeRange = {0, (SIZE_T)size};
         if (SUCCEEDED(scratch->Map(0, &writeRange, &dstData)) && dstData) {
@@ -1022,8 +1265,8 @@ static bool ScCbvFixUnalignedLocation(
         if (zeroFilled < 8) {
             ++zeroFilled;
             Log("xboxdev",
-                "CBV unaligned loc=0x%llx size=%u: source not "
-                "CPU-readable, zero-filled scratch (constants read zero)",
+                "CBV unaligned loc=0x%llx size=%u: copy failed or source "
+                "not found, zero-filled scratch (constants read zero)",
                 (unsigned long long)loc, (unsigned)size);
         }
     }
@@ -1248,7 +1491,9 @@ static D3D12_HEAP_PROPERTIES* WINAPI XboxDevice_GetCustomHeapProperties(
 // unaligned location (loc mod 256 = 32, size 96) removes the device the
 // same way. ScCbvFixUnalignedLocation copies the data to an aligned
 // scratch buffer (see above); the location is never rounded down, which
-// would shift every constant the shader reads.
+// would shift every constant the shader reads. Boot #173: DEFAULT-heap
+// sources get a real GPU copy into the scratch (dedicated COPY queue +
+// fence); UPLOAD sources get a Map copy; anything else is zero-filled.
 static void WINAPI XboxDevice_CreateConstantBufferView(
     XboxDeviceWrapper* self,
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc,
@@ -2987,11 +3232,14 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
     // CBV fix (boot #171): record buffer resources by VA so an unaligned
     // CBV location can be resolved to its source data. Slot 133 resources
     // are DEFAULT-heap (not CPU-readable), so the CBV fix zero-fills for
-    // them; the record still lets the lookup name the source.
+    // them; the record still lets the lookup name the source. Record by
+    // the GUEST va (boot #175): Model A creates the resource via
+    // CreateCommittedResource, whose native VA differs from the guest va
+    // the game uses to reference it.
     if (SUCCEEDED(hr) && ppvResource && *ppvResource &&
         desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        ScCbvRecordSource((ID3D12Resource*)*ppvResource, desc.Width,
-                          D3D12_HEAP_TYPE_DEFAULT);
+        ScCbvRecordSourceAt((ID3D12Resource*)*ppvResource, va, desc.Width,
+                            D3D12_HEAP_TYPE_DEFAULT);
     }
     // Boot #56 instrumentation: dump the full desc (the boot #55 log
     // showed only va/hr/res — the desc fields are needed to correlate
