@@ -407,3 +407,31 @@ must publish a HAL object at `ctx+0`; the guest immediately executes
     0x1443AEDBA  call [rax]          ; with edx = 0x1000, r8d = 0x1000
 
 The `S_OK` stub writes nothing, so `[ctx]` is 0 and the load faults.
+
+### AcpHalCreate — measured contract (boots #191–#195)
+
+`AcpHalCreate(ctx, 0x20, 0xE0, 0xE0)` is an **out-pointer** call: it must publish
+an object at `*(void**)ctx` whose word 0 is a vtable. The guest loads it at
+`0x1443AEDA5` and immediately calls:
+
+- slot 0 with `(this, 0x1000, 0x1000)` — once, from `0x1443AEDBA`;
+- slot 0x10 with `(this, kind, filler, filler, struct*, 0)` — from
+  `0x1443AEE2F` (kind 2), `0x1443A73FF` (kind 5) and `0x140078509` (kind 0x12).
+  The two middle register arguments are constants the callers never vary
+  (`0xF0F0F0F0`/`0xFFFFFFFF`, `0xF1F1F1F1`/`0xFFFFFFFF`, `0xF6F6F6F6`/…), and
+  both call sites ignore the return value, so slot 2 is a generic command
+  channel rather than a typed method.
+
+Teardown reads `[ctx+8]` (the guest's own `CreateEventA` handle) and
+`[ctx+0x10]` (a status dword the guest polls with `Sleep(10)` while it is
+negative; the guest zeroes it first), then clears `[ctx]`. Implementation:
+`EraAcpHalObject` + `g_acpHalVtbl[16]`, every slot logs and returns `S_OK`.
+
+### ApuAlloc — the heap is not the whole address space
+
+The title declares a `0x226E00` heap through `ApuCreateHeap` and then asks
+`ApuAlloc` for **`0x1913AFA0` (421 MB)**, memsets the result and parses it.
+Requests that do not fit the heap are committed from a 64 KiB-aligned arena
+that rises from the heap end (`0x1C930000` in boot #192), so pointers stay in
+the title's APU VA neighbourhood instead of landing at unrelated host
+addresses.

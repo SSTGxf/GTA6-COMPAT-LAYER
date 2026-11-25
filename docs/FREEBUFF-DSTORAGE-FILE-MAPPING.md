@@ -133,3 +133,21 @@ pointer: the guest wrote to 0x20, i.e. through a null structure field).
 
 **Do not regress.** Never reuse a cached hash -> pack path without validating
 it against the current request's `(offset, compSize, destSize)`.
+
+## Boots #192–#195 — raw requests and the PSIN wall
+
+`ScDsResolvePack` proves a pack by zlib-inflating the requested span to exactly
+`destSize`, which **cannot** resolve a raw request (`compSize == destSize`, no
+zlib header). Boot #192 refused 139 sequential 64 KiB reads of id
+`0x307c02cc9eb90000` at `0x106609510 + i*0x10000` on that basis.
+
+Rule now in force (`ScDsContextPackForRaw`): a raw request whose id is unknown
+inherits the pack this boot resolved most recently (measured: every id that did
+resolve in boots #179–#195 resolved to `audio.rpf`, and the title streams one
+pack at a time), is pinned per id in the pack cache, and is only used when the
+chosen pack actually covers `offset+size`. Boot #194 served all 139 pages with
+one attribution log line and **zero refusals**.
+
+The next failure is not in DStorage: the title parses a 9,168,400-byte PSIN
+blob (extracted from the boot #195 dump) and the fourcc dispatcher rejects it.
+See `docs/BOOT191-195-DIAGNOSIS.md` §4.

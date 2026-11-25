@@ -2833,6 +2833,11 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
                     ->ExceptionInformation[1]);
         }
     }
+    // Boot #192-#194: the guest raises its own asserts with int3, and the
+    // fault IP is always the shared raise helper (0x1409DFC18), which says
+    // nothing about which subsystem asserted. Walk the faulting thread's
+    // stack for guest return addresses so the caller is in the log.
+    if (code == 0x80000003) WpLogStack(ep->ContextRecord);
     LogMountProbe();
     LogBoot55Probe(ep);
     LogBoot57Arena();

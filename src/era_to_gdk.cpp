@@ -486,6 +486,7 @@ extern "C" HRESULT EraApuCreateHeap(uintptr_t base, uintptr_t size,
 // kept *out = 0 and died writing through it (0xc0000005 write at 0x20 in
 // VCRUNTIME140, one line after the call).
 static uintptr_t g_apuAllocUsed = 0;  // bump offset inside the APU heap
+static uintptr_t g_apuArenaEnd = 0;   // first free VA above the APU heap
 
 extern "C" HRESULT EraApuAlloc(uintptr_t outPtr, uintptr_t flags,
                                uintptr_t size, uintptr_t align) {
@@ -525,13 +526,42 @@ extern "C" HRESULT EraApuAlloc(uintptr_t outPtr, uintptr_t flags,
     uintptr_t start = (g_apuHeapBase + g_apuAllocUsed + (gran - 1)) & ~(gran - 1);
     if (size > g_apuHeapSize || start < g_apuHeapBase || start + size < start ||
         start + size > heapEnd) {
+        // Boot #191: the title makes a second request far larger than the
+        // 0x226E00 heap it declared (0x1913AFA0 = 421 MB) and memsets through
+        // whatever comes back, so an exhausted window cannot just fail. The
+        // APU arena rises from the heap end, 64 KiB-aligned, so every pointer
+        // the title gets is still inside its own APU VA neighbourhood rather
+        // than some unrelated host allocation.
+        uintptr_t cur = g_apuArenaEnd ? g_apuArenaEnd
+                                      : (heapEnd + 0xFFFF) & ~(uintptr_t)0xFFFF;
+        uintptr_t want = (cur + (gran - 1)) & ~(gran - 1);
+        SIZE_T bytes = (SIZE_T)((size + 0xFFFF) & ~(uintptr_t)0xFFFF);
+        void* p = VirtualAlloc((LPVOID)want, bytes, MEM_RESERVE | MEM_COMMIT,
+                               PAGE_READWRITE);
+        if (!p) {
+            p = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
+                             PAGE_READWRITE);
+        }
+        if (!p) {
+            Log("era-acphal",
+                "ApuAlloc(out=%p size=0x%llx align=0x%llx) -> E_OUTOFMEMORY "
+                "(heap used 0x%llx of 0x%llx, arena request failed)",
+                (void*)outPtr, (unsigned long long)size,
+                (unsigned long long)align, (unsigned long long)g_apuAllocUsed,
+                (unsigned long long)g_apuHeapSize);
+            return E_OUTOFMEMORY;
+        }
+        g_apuArenaEnd = (uintptr_t)p + bytes;
+        *(void**)outPtr = p;
         Log("era-acphal",
-            "ApuAlloc(out=%p size=0x%llx align=0x%llx) -> E_OUTOFMEMORY "
-            "(used=0x%llx of 0x%llx in the APU heap)",
+            "ApuAlloc(out=%p size=0x%llx align=0x%llx) -> S_OK arena block=%p "
+            "(0x%llx bytes, too big for the 0x%llx heap at 0x%llx; committed "
+            "above it inside the APU VA space)",
             (void*)outPtr, (unsigned long long)size, (unsigned long long)align,
-            (unsigned long long)g_apuAllocUsed,
-            (unsigned long long)g_apuHeapSize);
-        return E_OUTOFMEMORY;
+            p, (unsigned long long)bytes,
+            (unsigned long long)g_apuHeapSize,
+            (unsigned long long)g_apuHeapBase);
+        return S_OK;
     }
     // The guest zeroes both sub-ranges itself, but the window is recycled host
     // memory, so hand out a clean block like an APU allocation would be.
@@ -582,12 +612,111 @@ extern "C" HRESULT EraAcpHalAllocateShapeContexts(uintptr_t ctx,
     return S_OK;
 }
 
-extern "C" HRESULT EraAcpHalCreate(uintptr_t a0, uintptr_t a1, uintptr_t a2,
-                                   uintptr_t a3) {
+// ---- the ACP HAL object the guest keeps at ctx+0 (boots #189/#190) ----
+// The audio init calls AcpHalCreate(&g_acpContext, 0x20, 0xE0, 0xE0) at
+// 0x1443AED91 and then, with no call in between, dereferences the slot it is
+// supposed to fill:
+//
+//   0x1443AEDA5  mov  rcx, [0x149AE98B8]   ; the slot AcpHalCreate must fill
+//   0x1443AEDB7  mov  rax, [rcx]           ; object[0] = vtable pointer
+//   0x1443AEDBA  call [rax]                ; slot 0: edx=0x1000, r8d=0x1000
+//
+// and later on the same object:
+//
+//   0x1443AEDFC  mov  rcx, [0x149AE98B8]
+//   0x1443AEE1F  mov  r10, [rcx]
+//   0x1443AEE2F  call [r10+0x10]           ; slot 2: edx=2, r8d=0xF0F0F0F0,
+//                                          ; r9d=0xFFFFFFFF,
+//                                          ; [rsp+0x20]=&{0xC0}, [rsp+0x28]=0
+//
+// Both returns are only sign-checked (`test eax,eax; js 0x1443AEE3A` -> the
+// init fails), so the contract at ctx+0 is exactly: a pointer to an object
+// whose first word is a vtable, whose slots 0 and 2 answer a non-negative
+// HRESULT. There is no DSP on desktop, so the methods are logged stubs; the
+// vtable covers 16 slots so any further slot the title calls answers honestly
+// instead of dereferencing a wild pointer.
+struct EraAcpHalObject;
+typedef HRESULT (*EraAcpHalMethod)(EraAcpHalObject* self, uintptr_t a1,
+                                  uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                                  uintptr_t a5);
+struct EraAcpHalObject {
+    EraAcpHalMethod* vtbl;
+};
+
+static HRESULT EraAcpHalObjectDispatch(int slot, EraAcpHalObject* self,
+                                       uintptr_t a1, uintptr_t a2,
+                                       uintptr_t a3, uintptr_t a4,
+                                       uintptr_t a5) {
+    if (slot == 0) {
+        Log("era-acphal",
+            "AcpHalObject::slot0(this=%p, 0x%llx, 0x%llx) -> S_OK "
+            "(stub: no DSP command ring on desktop)",
+            (void*)self, (unsigned long long)a1, (unsigned long long)a2);
+        return S_OK;
+    }
+    if (slot == 2) {
+        Log("era-acphal",
+            "AcpHalObject::slot2(this=%p, 0x%llx, 0x%llx, 0x%llx, out=%p, 0x%llx) "
+            "-> S_OK (stub: no DSP shapes; out not written)",
+            (void*)self, (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (void*)a4, (unsigned long long)a5);
+        return S_OK;
+    }
     Log("era-acphal",
-        "AcpHalCreate(ctx=%p, %p, %p, %p) -> S_OK "
-        "(stub: audio context is the guest's own struct)",
-        (void*)a0, (void*)a1, (void*)a2, (void*)a3);
+        "AcpHalObject::slot%d(this=%p, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) "
+        "-> S_OK (stub)",
+        slot, (void*)self, (unsigned long long)a1, (unsigned long long)a2,
+        (unsigned long long)a3, (unsigned long long)a4,
+        (unsigned long long)a5);
+    return S_OK;
+}
+
+#define ERA_ACP_SLOT(n)                                                     \
+    extern "C" HRESULT EraAcpHalSlot##n(EraAcpHalObject* self, uintptr_t a1, \
+                                         uintptr_t a2, uintptr_t a3,       \
+                                         uintptr_t a4, uintptr_t a5) {     \
+        return EraAcpHalObjectDispatch(n, self, a1, a2, a3, a4, a5);         \
+    }
+ERA_ACP_SLOT(0)
+ERA_ACP_SLOT(1)
+ERA_ACP_SLOT(2)
+ERA_ACP_SLOT(3)
+ERA_ACP_SLOT(4)
+ERA_ACP_SLOT(5)
+ERA_ACP_SLOT(6)
+ERA_ACP_SLOT(7)
+ERA_ACP_SLOT(8)
+ERA_ACP_SLOT(9)
+ERA_ACP_SLOT(10)
+ERA_ACP_SLOT(11)
+ERA_ACP_SLOT(12)
+ERA_ACP_SLOT(13)
+ERA_ACP_SLOT(14)
+ERA_ACP_SLOT(15)
+#undef ERA_ACP_SLOT
+
+static EraAcpHalMethod g_acpHalVtbl[16] = {
+    EraAcpHalSlot0,  EraAcpHalSlot1,  EraAcpHalSlot2,  EraAcpHalSlot3,
+    EraAcpHalSlot4,  EraAcpHalSlot5,  EraAcpHalSlot6,  EraAcpHalSlot7,
+    EraAcpHalSlot8,  EraAcpHalSlot9,  EraAcpHalSlot10, EraAcpHalSlot11,
+    EraAcpHalSlot12, EraAcpHalSlot13, EraAcpHalSlot14, EraAcpHalSlot15};
+static EraAcpHalObject g_acpHalObject = {g_acpHalVtbl};
+
+extern "C" HRESULT EraAcpHalCreate(uintptr_t ctx, uintptr_t a1, uintptr_t a2,
+                                   uintptr_t a3) {
+    if (ctx == 0) {
+        Log("era-acphal",
+            "AcpHalCreate(ctx=null, %p, %p, %p) -> E_INVALIDARG",
+            (void*)a1, (void*)a2, (void*)a3);
+        return E_INVALIDARG;
+    }
+    *(void**)ctx = &g_acpHalObject;
+    Log("era-acphal",
+        "AcpHalCreate(ctx=%p, %p, %p, %p) -> S_OK object=%p vtable=%p "
+        "(slot0(this,0x1000,0x1000) and slot2(this,2,0xF0F0F0F0,0xFFFFFFFF,out,0) "
+        "are the two the guest calls; both only sign-checked; S_OK stubs)",
+        (void*)ctx, (void*)a1, (void*)a2, (void*)a3, (void*)&g_acpHalObject,
+        (void*)g_acpHalVtbl);
     return S_OK;
 }
 

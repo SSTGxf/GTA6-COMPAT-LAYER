@@ -1448,13 +1448,20 @@ static bool TestNoEquiv(char* detail, size_t n) {
     // and AcpHalCreate and int3s at 0x1443AD94E if any of them fails, so
     // AcpHalCreate is now an S_OK stub instead of E_NOTIMPL. xg_x texture
     // tiling still has no equivalent and must keep failing honestly.
+    // Boots #189/#190: AcpHalCreate must publish an object in the guest's
+    // context slot. The guest loads [ctx] at 0x1443AEDA5 and then calls
+    // [obj] and [obj+0x10], so a bare S_OK with the slot left null is not
+    // enough (boots #187/#188 died at 0x1443AEDB7 doing exactly that).
     HRESULT hrXg = XGComputeTexture2DLayout(0, 0, 0, 0);
-    HRESULT hrAcp = AcpHalCreate(0, 0, 0, 0);
-    bool ok = (hrXg == E_NOTIMPL) && (hrAcp == S_OK);
+    void* acpSlot = nullptr;
+    HRESULT hrAcp = AcpHalCreate((uintptr_t)&acpSlot, 0x20, 0xE0, 0xE0);
+    void** acpObj = (void**)acpSlot;
+    bool published = acpObj != nullptr && acpObj[0] != nullptr;
+    bool ok = (hrXg == E_NOTIMPL) && (hrAcp == S_OK) && published;
     snprintf(detail, n,
              "XGComputeTexture2DLayout -> 0x%08x (want 0x80004001), "
-             "AcpHalCreate -> 0x%08x (want 0x00000000)",
-             (unsigned)hrXg, (unsigned)hrAcp);
+             "AcpHalCreate -> 0x%08x (want 0x00000000), object published: %s",
+             (unsigned)hrXg, (unsigned)hrAcp, published ? "yes" : "NO");
     return ok;
 }
 

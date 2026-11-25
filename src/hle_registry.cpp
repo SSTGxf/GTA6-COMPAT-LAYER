@@ -14,6 +14,7 @@
 #include <mmsystem.h>  // timeBeginPeriod (frame pacing, phase 3)
 #include <dxgi.h>  // IDXGIDevice / IDXGIAdapter (device QI forwarding)
 #include <string.h>
+#include <sys/stat.h>  // _stat64 (raw DStorage pack coverage check, boot #192)
 #include <vector>
 #include <utility>   // std::index_sequence (per-slot unimplemented stubs, build 82)
 #include <map>       // CBV source tracking (boot #171)
@@ -5220,6 +5221,23 @@ extern "C" void DsqEnqueueRequest(void* self, const void* req) {
     const uint32_t destSize = (uint32_t)w[3];
     const void* src = (const void*)w[4];
     const uint32_t srcSize = (uint32_t)w[5];
+    // Boot #192: the guest then streams 139 raw 64 KiB reads (id
+    // 0x307c02cc9eb90000, offsets 0x106609510 + i*0x100000) that no pack probe
+    // can resolve because compSize == destSize is not a zlib stream. The
+    // producer's guest address is the only way to tell which file it means, so
+    // record it for the first few file-sourced requests.
+    if (!(w[0] & 0x400000ull)) {
+        static int enqRetLogs = 0;
+        if (enqRetLogs < 6) {
+            ++enqRetLogs;
+            Log("dstorage",
+                "EnqueueRequest[%d] file source: id=0x%016llx offset=0x%llx "
+                "compSize=%u destSize=%u ret=0x%llx",
+                i, (unsigned long long)w[4], (unsigned long long)w[5],
+                (unsigned)w[6], destSize,
+                (unsigned long long)_ReturnAddress());
+        }
+    }
     if (g_dsDetailLogs < 32) {
         ++g_dsDetailLogs;
         Log("dstorage",
@@ -5263,6 +5281,46 @@ struct ScDsPackCacheEntry {
 };
 static ScDsPackCacheEntry g_dsPackCache[64];
 static int g_dsPackCacheCount = 0;
+// Boot #192/#193: raw requests (compSize == destSize) carry per-asset ids
+// that the zlib probe can never resolve, and the title enqueues them in the
+// middle of a pack's stream (every id that did resolve in this boot came
+// from audio.rpf).  Raw requests therefore inherit the pack most recently
+// resolved in this boot, pinned per id and only when that pack actually
+// covers the requested span.
+static const char* g_dsLastResolvedPack = nullptr;
+static void ScDsCachePack(uint64_t hash, const char* path) {
+    for (int i = 0; i < g_dsPackCacheCount; ++i) {
+        if (g_dsPackCache[i].hash == hash) {
+            g_dsPackCache[i].path = path;
+            return;
+        }
+    }
+    if (g_dsPackCacheCount < 64) {
+        g_dsPackCache[g_dsPackCacheCount].hash = hash;
+        g_dsPackCache[g_dsPackCacheCount].path = path;
+        ++g_dsPackCacheCount;
+    }
+}
+static uint64_t ScDsPackSize(const char* path) {
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return 0;
+    return (uint64_t)st.st_size;
+}
+static const char* ScDsContextPackForRaw(uint64_t hash, uint64_t fileOffset,
+                                         uint32_t compSize, int index) {
+    const char* pack = g_dsLastResolvedPack;
+    if (!pack) return nullptr;
+    const uint64_t sz = ScDsPackSize(pack);
+    if (sz < fileOffset || sz - fileOffset < compSize) return nullptr;
+    ScDsCachePack(hash, pack);
+    Log("dstorage",
+        "Submit[%d] raw copy via context pack %s (id 0x%016llx unknown to "
+        "the zlib probe; offset=0x%llx compSize=%u fits inside that pack, "
+        "which is the one this boot resolved last)",
+        index, pack, (unsigned long long)hash, (unsigned long long)fileOffset,
+        compSize);
+    return pack;
+}
 static const char* kDsPackCandidates[] = {
     "D:\\game\\game\\data.rpf",
     "D:\\game\\game\\shaders.rpf",
@@ -5314,6 +5372,7 @@ static const char* ScDsResolvePack(uint64_t hash, uint64_t fileOffset,
         if (hr == S_OK && outBuf && outLen == destSize) {
             free(outBuf);
             found = path;
+            g_dsLastResolvedPack = path;
             Log("dstorage",
                 "ResolvePack: hash 0x%016llx -> %s (offset=0x%llx "
                 "compSize=%u destSize=%u)",
@@ -5379,6 +5438,7 @@ static const char* ScDsReprobePack(const char* triedPath, uint64_t hash,
         if (ScDsReadInflateInto(path, fileOffset, compSize, destSize, dst) !=
             S_OK)
             continue;
+        g_dsLastResolvedPack = path;
         Log("dstorage",
             "Submit[%d] re-resolved hash 0x%016llx offset=0x%llx compSize=%u "
             "destSize=%u -> %s (cached pack %s held no matching stream)",
@@ -5424,13 +5484,17 @@ extern "C" void DsqSubmit(void* self) {
             // holds a zlib stream at this offset inflating to destSize.
             const char* packPath = ScDsResolvePack(hash, fileOffset,
                                                    compSize, destSize);
+            if (!packPath && compSize == destSize) {
+                packPath = ScDsContextPackForRaw(hash, fileOffset, compSize, i);
+            }
             if (!packPath) {
                 Log("dstorage",
                     "Submit[%d] refused: unresolvable source hash "
                     "0x%016llx (options=0x%016llx dest=%p destSize=%u "
-                    "offset=0x%llx compSize=%u) -> E_NOTIMPL",
+                    "offset=0x%llx compSize=%u ret=0x%llx) -> E_NOTIMPL",
                     i, (unsigned long long)hash, (unsigned long long)options,
-                    dest, destSize, (unsigned long long)fileOffset, compSize);
+                    dest, destSize, (unsigned long long)fileOffset, compSize,
+                    (unsigned long long)_ReturnAddress());
                 continue;
             }
             static bool dsInit = false;
@@ -5473,6 +5537,7 @@ extern "C" void DsqSubmit(void* self) {
             // 0x1443AD94E.
             if (compSize == destSize) {
                 memcpy((void*)dest, comp, destSize);
+                g_dsLastResolvedPack = packPath;
                 free(comp);
                 Log("dstorage",
                     "Submit[%d] raw copy (hash 0x%016llx offset=0x%llx "

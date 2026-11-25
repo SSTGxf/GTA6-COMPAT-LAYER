@@ -237,3 +237,25 @@ exactness is unverified until real Xbox tiled data lands).
 Resolved since this section was written: boot call order + first fatal dependency (mapped through boot #81); storage access pattern (DirectStorage queues real, hash→RPF resolved, Submit inflates from shaders.rpf); COM wrapper for real titles (works — device, queues, fences, allocators, lists); the allocator guard / F int3 wall (cleared in boots #3–#5).
 
 Still open: name queue slots 4 and 6 from code (disassemble 0x1400E88F0) and implement them; prove the VCRUNTIME140 memcpy overrun's cause (walk boot #81's dump); shader inventory used at boot + shader lifting (DXIL route, PSO-time capture not started); `MEM_GRAPHICS` usage pattern; BCPack decode (B1 spec written, not implemented); exact Xbox tiled-texture bit layout (Morton model unverified vs GDK tables); mesh-as-compute (CPU-only prototype); threading model details; runtime integrity checks (XCI / package-hash validation); GDK/GDKX version pinning.
+
+## Boots #191–#195 (2026-11-25) — AcpHal HAL object, APU arena, raw DStorage, PSIN wall
+
+Three walls cleared and the next one localized. Full evidence and disassembly in
+`docs/BOOT191-195-DIAGNOSIS.md`.
+
+| wall | evidence | outcome |
+|---|---|---|
+| `AcpHalCreate` must publish an object at `ctx+0` | guest `0x1443AEDA5`/`0x1443AEDB7`/`0x1443AEDBA` load `[ctx]`, then call slot 0 with `(0x1000,0x1000)`; `0x1443AEE2F` and three more sites call slot `0x10` with `(kind, filler, filler, struct*, 0)`, kinds `2/5/0x12`, returns unused | 16-slot logged `S_OK` vtable; `EraAcpHalCreate` writes `&g_acpHalObject`; boot #191 calls both slots and advances +478 lines |
+| `ApuAlloc` asked for 421 MB from a 2.2 MB heap | boot #191 `ApuAlloc(size=0x1913afa0) -> E_OUTOFMEMORY`, then a write at `0x217820` | allocator keeps the guest heap and commits a 64 KiB-aligned arena above it; boot #192 `S_OK arena block=0x1C930000` |
+| raw DStorage (`compSize == destSize`) never resolves through the zlib probe | boot #192 refused 139 sequential 64 KiB reads (`id 0x307c02cc9eb90000`, offsets `0x106609510 + i*0x10000`); every id that did resolve came from `audio.rpf` | raw requests inherit the boot's last resolved pack, pinned per id, only when that pack covers the span (`ScDsContextPackForRaw`); boot #194 **0 refused**, all 139 pages served |
+| **current** guest assert `0x80000003` at `0x1409DFC18` | stack walk `0x141621CA0` → read-allocate-parse; dump registers give buffer `0x221ce321a50`, size `0x9168400`; the buffer is a complete but rejected **PSIN** blob (`5053494e 003340c0 5c000000 30d50600 …`), not present verbatim in the small packs | dispatcher `0x14407E700` returns false in its chunk walker (`0x14407EB4A`, `[fourcc][BE len]` records, ≤99 chunks, `"pppp"` padding); blob saved at `D:\scarlett-dumps\psin_blob-195.bin` |
+
+New diagnostics that paid for themselves immediately: guest stack walk on
+`int3` (`WpLogStack` in the VEH), file-source return addresses in
+`DsqEnqueueRequest`, and offline minidump parsing (`dmpregs.py` /
+`dmpexc2.py` / `extract.py`) that turns "which buffer did it parse" into a
+register read.
+
+Gates on every binary booted here: `BUILD_EXIT=0`, all verdicts ALL PASS,
+`B1 result: 149 checks, 0 failed -> PASS`, `verify exit code: 0`.
+Dumps #191–#195 archived to `D:\scarlett-dumps`, F: back to 8.0 GB free.
