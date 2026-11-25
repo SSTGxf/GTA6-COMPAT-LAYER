@@ -261,3 +261,43 @@ in a helper it calls; that compare has not yet been reached in this pass.
 
 Boot #266's record stays as previously documented: `code=0x80000003 addr=0x1409dfc18` int3 in the
 stub region, compact `MiniDumpNormal` dump only (319,363 / 321,667 bytes), never full memory.
+
+## 2026-11-25: gate window 0x14407e765 onward (verbatim from committed slice)
+
+```
+0x14407e765: 4539c6                 cmp r14d, r8d
+0x14407e768: 7615                   jbe 0x14407e77f
+0x14407e76a: 4531d2                 xor r10d, r10d
+0x14407e76d: 4531db                 xor r11d, r11d
+0x14407e770: 31c0                   xor eax, eax
+0x14407e772: 4531e4                 xor r12d, r12d
+0x14407e775: 31ff                   xor edi, edi
+0x14407e777: 4531f6                 xor r14d, r14d
+0x14407e77a: e91b040000             jmp 0x14407eb9a
+0x14407e77f: 0f38f00a               movbe ecx, dword ptr [rdx]
+0x14407e783: 4489c5                 mov ebp, r8d
+0x14407e786: 4a8d1c32               lea rbx, [rdx + r14]
+0x14407e78a: 4801d5                 add rbp, rdx
+0x14407e78d: 81f947435350           cmp ecx, 0x50534347
+0x14407e793: 7f4a                   jg 0x14407e7df
+0x14407e795: 81f94253524c           cmp ecx, 0x4c525342
+0x14407e79b: 0f8fb5000000           jg 0x14407e856
+0x14407e7a1: 81f94c4e454c           cmp ecx, 0x4c454e4c
+0x14407e7a7: 0f8f30010000           jg 0x14407e8dd
+0x14407e7ad: 81f9534b4843           cmp ecx, 0x43484b53
+0x14407e7b3: 0f847a020000           je 0x14407ea33
+0x14407e7b9: 81f944495547           cmp ecx, 0x47554944
+0x14407e7bf: 0f85ff090000           jne 0x14407f1c4
+0x14407e7c5: 488d4208               lea rax, [rdx + 8]
+0x14407e7c9: 418d4ef8               lea ecx, [r14 - 8]
+0x14407e7cd: 48898680000000         mov qword ptr [rsi + 0x80], rax
+0x14407e7d4: 898e88000000           mov dword ptr [rsi + 0x88], ecx
+0x14407e7da: e93a030000             jmp 0x14407eb19
+0x14407e7df: 4531d2                 xor r10d, r10d
+0x14407e7e2: 4531ff                 xor r15d, r15d
+```
+
+What this shows: the walk compares the cursor r14d against the size r8d and
+branches on the chunk stride; the deciding false-return compare has NOT yet been
+pinned to a single instruction in this pass. Unknown remains: which branch is taken
+for the synthesized terminator.
