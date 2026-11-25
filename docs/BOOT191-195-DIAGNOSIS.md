@@ -226,3 +226,52 @@ reject it. The next concrete step is to identify the file the guest opened for
 this parse (the helper `0x141621C30` reads via `0x1451D2260` after a size query
 `0x140048A50`) and confirm which container member should carry `PSCG`, rather
 than fabricating one.
+
+## §7 File identification for the rejected parse (boot #195 dump, offline)
+
+Recovered from the dump without a rebuild. The faulting frame's `rdi` is the
+caller's parse context, and it is a stack struct whose bytes hold the resource
+path (little-endian qwords at `0x9673DFE638+0x18`):
+
+```
+platform:/anim/clip_sets/runtime/clip_sets.zmt
+s_secondary_motion
+rpf
+```
+
+So the rejected buffer (`r14 = 0x221CE321A50`, `rbx = 0x9168400`) is a member of
+**`clip_sets.zmt`**, the animation clip-set container reached through the
+`platform:/` mount, and the container exposes at least the members
+`s_secondary_motion` and `rpf`.
+
+Data-side checks performed on disk (`D:\game\game`):
+
+- `clip_sets.zmt` is not a file on disk; the `platform:/anim/...` path is served
+  from the packs.
+- The container is **not stored raw**: a full scan of `anim.rpf` (4.4 GB) and of
+  `data.rpf`, `common.rpf`, `packs.rpf`, `textures.rpf`, `script.rpf`,
+  `appdata0.rpf`, `navmeshes.rpf` finds neither `clip_sets` nor
+  `s_secondary_motion`. Its bytes only exist after the layer's DStorage inflate,
+  which is why the buffer's content is exact and self-consistent (see §5).
+- The served member is a complete `PSIN`/`LSCH`/`LENM`/`LSNS` chunk stream that
+  ends 116 bytes before the buffer end (zeros to `0x8BE610`), and it carries no
+  `PSCG` and no `STRF` chunk — the two chunk types that satisfy the
+  `0x14407EC98` gate (§6).
+
+Consequence for the fix, stated as evidence rather than guess: the parse is for a
+**clip-set member**, and the code path demands a chunk (`PSCG` → `r12`, or
+`STRF` → `[rsi+0x90]`) that this member does not contain. The two candidates that
+remain are (a) the member handed to this parse is not the one the descriptor
+belongs to (the container has an `rpf` member and others), or (b) the member's
+decompressed size was clipped at `0x9168400`, dropping trailing chunks.
+
+Discriminating test (next step, cheap): log the DStorage request that produced a
+`destSize` of `0x9168400` (id, offset, compSize, pack) and the inflated length
+returned by the inflater. If `outLen > destSize`, the member was clipped and the
+fix is in the inflate/descriptor path (serve the full length); if `outLen ==
+destSize`, the member really ends there and the descriptor/member pairing is
+wrong.
+
+No reboot was spent on this pass: the finding is offline evidence only, so the
+verified boot state is still #195/#196 (§ earlier) and the int3 at
+`0x1409DFC18` is **not** cleared.
