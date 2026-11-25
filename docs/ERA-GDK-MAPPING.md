@@ -435,3 +435,7 @@ Requests that do not fit the heap are committed from a 64 KiB-aligned arena
 that rises from the heap end (`0x1C930000` in boot #192), so pointers stay in
 the title's APU VA neighbourhood instead of landing at unrelated host
 addresses.
+
+### 0x1409DFC18 path (measured)
+
+0x1409df9d0 calls 0x1409dfc30 (0xF0-byte object) which calls the 0x14407e700 resource gate; false -> null -> assert. Not a TLS failure: guest TLS index 10 slot is populated with [+8]=1.

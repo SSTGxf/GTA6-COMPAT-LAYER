@@ -539,3 +539,50 @@ the guest is using low indices at runtime, not 0x7d3e0.
 Not done this pass and explicitly not claimed: no fix landed for
 `0x1409DFC18`, no new binary was booted, and the assert text was not recovered.
 The int3 was not patched and no value was forced.
+
+## §14 0x1409DFC18 is NOT the TLS check — runtime index and object measured from the dump
+
+Read from `D:\scarlett-dumps\scarlett_crash_boot203.dmp` (Memory64List, live values,
+not the image file):
+
+```
+runtime [0x146E08B2C] = 10 (0xa)          <- guest TLS index, low index as expected
+faulting tid=28276 teb=0x5ca8061000
+  TEB+0x58 tlsArray   = 0x1adfcb51230
+  slot[10]            = 0x19f7a0fd8f0     <- NON-NULL
+    [obj+8]           = 0x01              <- flag SET
+    [obj+0x10]        = 0x19f7a0fd910
+  slot[0]             = 0x19f7a09c790     <- guest CRT block, non-null
+exception: code=0x80000003 rip=0x1409dfc18 tid=28276 nparam=1 params=[0x0]
+context:   rax=0x0 rcx=0x1471c27c0 rdx=0x6e7400000001 r8=0xffffffff00000000
+```
+
+Therefore the TLS condition at `0x1409dfc01 cmp byte [rax+8],0` **passes** on the
+faulting thread and the boot does not stop for missing per-thread TLS state.
+
+Who reaches the pad (disassembled from the caller):
+
+```
+0x1409dfac4: call 0x1409dfc30
+0x1409dfac9: mov  r12, rax
+0x1409dfacc: test rax, rax
+0x1409dfacf: je   0x1409dfc18      ; <- rax == 0 lands on the int3
+```
+
+and inside `0x1409dfc30` the real work is:
+
+```
+0x1409dfc5d: mov  ecx, 0xf0
+0x1409dfc62: call 0x144f97130      ; allocate 0xF0-byte object
+0x1409dfcc1: call 0x14407e700      ; resource gate (same family as 0x14407ECF0)
+0x1409dfcc6: test al, al
+0x1409dfcc8: je   0x1409dfd04      ; gate returned false -> path returns 0
+```
+
+So the assert is a **null result from a resource open driven by the gate at
+0x14407e700**, i.e. the same resource/parse family as the PSIN gate, not TLS.
+
+Measured: the TLS object exists with `[+8]=1`; the gate call exists on this path.
+Inference (not proven): `0x14407e700` returns false for this resource and the
+caller treats null as a hard assert. Not patched, nothing forced, no value
+synthesised. No rebuild and no boot were run in this pass.

@@ -151,3 +151,7 @@ one attribution log line and **zero refusals**.
 The next failure is not in DStorage: the title parses a 9,168,400-byte PSIN
 blob (extracted from the boot #195 dump) and the fourcc dispatcher rejects it.
 See `docs/BOOT191-195-DIAGNOSIS.md` §4.
+
+### Deterministic raw attribution (boot #203/#204)
+
+`Submit[0] raw copy via deterministic pack D:\game\game\data.rpf (id 0x30000705a4fca4f8 offset=0x1c000 compSize=16)` in both boots; fixed candidate-order coverage scan replaced "last resolved pack".
