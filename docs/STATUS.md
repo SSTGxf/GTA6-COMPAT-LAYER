@@ -259,3 +259,9 @@ register read.
 Gates on every binary booted here: `BUILD_EXIT=0`, all verdicts ALL PASS,
 `B1 result: 149 checks, 0 failed -> PASS`, `verify exit code: 0`.
 Dumps #191–#195 archived to `D:\scarlett-dumps`, F: back to 8.0 GB free.
+
+Two-boot confirmation of this binary: boots #195 and #196 stop identically
+(`int3 0x80000003` at `0x1409DFC18`, stack `0x141621CA0`, 16,933 / 16,922
+lines, 0 refused DStorage requests in both), with `AcpHalObject::slot0`/`slot2`
+called and `ApuAlloc -> S_OK arena block=0x1C930000` in both. Dumps #195/#196
+archived to `D:\scarlett-dumps`.
