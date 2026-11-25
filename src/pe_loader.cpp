@@ -1034,40 +1034,48 @@ static void HookGuestImports(void* base) {
                 }
             }
             IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*)(img + imp->FirstThunk);
-            for (; thunk->u1.Function; ++thunk) {
-                void** slot = (void**)&thunk->u1.Function;
+            IMAGE_THUNK_DATA* nm = imp->OriginalFirstThunk
+                                       ? (IMAGE_THUNK_DATA*)(img + imp->OriginalFirstThunk)
+                                       : nullptr;
+            for (unsigned idx = 0; thunk[idx].u1.Function; ++idx) {
+                void** slot = (void**)&thunk[idx].u1.Function;
                 void* cur = *slot;
                 if (!cur) continue;
+                const char* tname = nullptr;
+                if (nm && !IMAGE_SNAP_BY_ORDINAL(nm[idx].u1.Ordinal))
+                    tname = (const char*)((IMAGE_IMPORT_BY_NAME*)
+                                              (img + nm[idx].u1.AddressOfData))->Name;
                 const char* want = nullptr;
                 void* repl = nullptr;
-                if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                                 "ReadFile")) {
-                    g_realReadFile = (ScReadFileFn)cur;
-                    want = "ReadFile"; repl = (void*)&ScHookReadFile;
-                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                                        "SetFilePointerEx")) {
-                    g_realSetFilePointerEx = (ScSetFilePointerExFn)cur;
-                    want = "SetFilePointerEx"; repl = (void*)&ScHookSetFilePointerEx;
-                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                                        "GetFileSizeEx")) {
-                    g_realGetFileSizeEx = (ScGetFileSizeExFn)cur;
-                    want = "GetFileSizeEx"; repl = (void*)&ScHookGetFileSizeEx;
-                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                                        "CreateFileW")) {
-                    g_hookCfW = (ScCreateFileWFn)cur;
-                    want = "CreateFileW"; repl = (void*)&ScHookCreateFileW;
-                } else if (cur == (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                                        "MapViewOfFile")) {
-                    g_realMapViewOfFile = (ScMapViewOfFileFn)cur;
-                    want = "MapViewOfFile"; repl = (void*)&ScHookMapViewOfFile;
+                if (tname) {
+                    auto has = [&](const char* a, const char* b) {
+                        return strcmp(tname, a) == 0 || (b && strcmp(tname, b) == 0);
+                    };
+                    if (has("ReadFile", "ReadFileA") || has("ReadFileW", "ReadFileEx")) {
+                        g_realReadFile = (ScReadFileFn)cur;
+                        want = tname; repl = (void*)&ScHookReadFile;
+                    } else if (has("SetFilePointerEx", "SetFilePointer")) {
+                        g_realSetFilePointerEx = (ScSetFilePointerExFn)cur;
+                        want = tname; repl = (void*)&ScHookSetFilePointerEx;
+                    } else if (has("GetFileSizeEx", "GetFileSize")) {
+                        g_realGetFileSizeEx = (ScGetFileSizeExFn)cur;
+                        want = tname; repl = (void*)&ScHookGetFileSizeEx;
+                    } else if (has("CreateFileW", "CreateFileA")) {
+                        g_hookCfW = (ScCreateFileWFn)cur;
+                        want = tname; repl = (void*)&ScHookCreateFileW;
+                    } else if (has("MapViewOfFile", "MapViewOfFileEx")) {
+                        g_realMapViewOfFile = (ScMapViewOfFileFn)cur;
+                        want = tname; repl = (void*)&ScHookMapViewOfFile;
+                    }
                 }
                 if (!want) continue;
-                DWORD old = 0;
-                if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+                DWORD old2 = 0;
+                if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old2)) {
                     *slot = repl;
-                    VirtualProtect(slot, sizeof(void*), old, &old);
+                    VirtualProtect(slot, sizeof(void*), old2, &old2);
                     ++hooked;
-                    Log("loader", "import-hook %s slot=%p real=%p", want, slot, cur);
+                    Log("loader", "import-hook %s #%u name=%s slot=%p real=%p hook=%p",
+                        mod, idx, want, slot, cur, repl);
                 }
             }
         }
