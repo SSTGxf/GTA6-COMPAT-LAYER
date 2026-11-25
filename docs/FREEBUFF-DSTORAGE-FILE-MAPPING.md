@@ -368,3 +368,14 @@ pointer derived from guest state, not an uncommitted arena page.
 Blocker stated concretely: clearing this needs the faulting instruction's operand decoded from
 the 0x144fc2100 region (same bounded-probe route as `ScDumpGateSlice`, offset `0xfc21f5`), which
 this pass had no room to add and boot.
+
+## 2026-11-25 (build_ga263): bounded arena slice captured for the 0x144fc21f5 fault
+
+Added `ScDumpArenaSlice()` beside `ScDumpGateSlice()`: it writes 768 bytes from
+`0x144fc2100` once per boot to `arena_fc2100.bin` and logs `arena-slice wrote ... at=0x144fc2100
+bytes=768`. Committed as `docs/arena_fc2100.bin` with its decode in
+`docs/arena-0x144fc21f5.asm`.
+
+Build: BUILD_EXIT=0, 149 checks 0 failed PASS, verify exit 0. The slice file was produced
+(768 bytes), so the code region around the fault is now readable on disk rather than inferred;
+the fix for the bad pointer at `rip=0x144fc21f5` (access `0x1e954ab78c5`) is not yet applied.

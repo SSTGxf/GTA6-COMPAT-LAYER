@@ -918,6 +918,33 @@ static void ScDumpGateSlice() {
     }
 }
 
+
+// Bounded dump of the code around the 0x144fc21f5 fault site, so the operand that
+// dereferences the bad guest pointer can be decoded from bytes instead of inferred.
+static void ScDumpArenaSlice() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    char path[MAX_PATH] = {};
+    char out[MAX_PATH + 32] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    int n = 0;
+    while (path[n]) ++n;
+    while (n > 0 && path[n - 1] != (char)92 && path[n - 1] != '/') --n;
+    path[n] = 0;
+    _snprintf_s(out, sizeof(out), _TRUNCATE, "%sarena_fc2100.bin", path);
+    __try {
+        FILE* f = fopen(out, "wb");
+        if (f) {
+            fwrite((const void*)(uintptr_t)0x144fc2100ull, 1, 0x300, f);
+            fclose(f);
+            Log("loader", "arena-slice wrote %s at=0x144fc2100 bytes=768", out);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "arena-slice unreadable at 0x144fc2100");
+    }
+}
+
 static void ScBufProbe(const void* b, uint32_t n, const char* phase) {
     const uint8_t* q = (const uint8_t*)b;
     uint64_t first8 = 0, last8 = 0, tail8 = 0;
@@ -963,7 +990,7 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // unchanged: the stream really is 9,168,400 bytes and its trailing 116 bytes
     // (LGID 8 + LRSC 0x58 + CHKS 0x14 = 116) are meant to be there but arrived as
     // garbage, so the defect is in what the read path wrote, not in the length.
-    if (size == 9168400u) { ScSynthesizeFramedTail((void*)buf, size); ScDumpGateSlice(); }
+    if (size == 9168400u) { ScSynthesizeFramedTail((void*)buf, size); ScDumpGateSlice(); ScDumpArenaSlice(); }
     ScLogChunkWalk(buf, size);
     ScLogBufRange(buf, size);
     // Handed extent: the guest's request total for this member (139*65536 + 58896
