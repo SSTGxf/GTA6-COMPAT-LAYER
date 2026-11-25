@@ -322,3 +322,26 @@ Fix (emitted bytes, real data from the writer):
 `ScSynthesizeFramedTail` now writes the LGID chunk's BE length as `8` (its own 4 fourcc bytes +
 4 length bytes) instead of `0`, so the walk advances by the chunk's true extent into LRSC
 (0x58) and CHKS (0x14) — the three tags the gate dispatches on, totalling the 116 bytes.
+
+## 2026-11-25 (boot #270, tree 23cbc47): the 0x1409dfc18 assert is GONE
+
+The LGID-length fix changed the boot's end state. Boot #270 no longer stops at the gate assert:
+
+```
+freebooter: docs/bootlogs/boot270.log
+crash-record code=0xc0000005 addr=0x144fc21f5 rip=0x144fc21f5 rsp=0x67167fe8b8
+             stack=[0x144fc21d9,0x3d378,0x1e905d9e7f0,0x3d378] access=0x1e954ab78c5
+minidump: wrote F:\ScarlettCompat\out\scarlett_crash.dmp (328521 bytes, compact)
+Last subsystem line: [dstorage] Submit[2] raw copy (hash 0x00000067154fe672
+  offset=0x89a8000 compSize=16 destSize=16 dst=0x1e909a87a10..0x1e909a87a20
+  pack=D:\game\game\audio.rpf)
+framed-ok lines: 43
+```
+
+Two changes from #269: `code=0x80000003 addr=0x1409dfc18` **does not appear** — the guest got past the
+assert — and the end state is the arena access violation `0xc0000005` at `0x144fc21f5`, which was
+last seen at boot #268. The boot also reaches a DStorage submit against `audio.rpf` that earlier
+booots never logged. So the emitted LGID length was one of the walk's real blockers.
+
+Next: `0x144fc21f5` with `access=0x1e954ab78c5` and `stack[0]=0x144fc21d9` (a return address inside
+the same region) — the arena fault is now the stopping point.
