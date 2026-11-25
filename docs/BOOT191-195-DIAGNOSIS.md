@@ -1091,3 +1091,24 @@ What differs is which gate call the boot reaches first: #224 ends on the small
 Also measured: `size != beLen` is **not** the reject rule — the 512-byte call has
 `beLen=0x80` with the next chunk at `0x88` (`LSCH len=0xa8`) and is accepted. The
 reject is specific to the large stream's tail. No fix landed in this commit.
+
+## §32 Boot #226 (tail32 build): the large PSIN call was never reached
+
+`build_ga226` (green: `BUILD_EXIT=0`, `149 checks, 0 failed`, `verify exit 0`) logs
+`tail32` only on the `size == 9168400` branch. Boot #226's log is 16,972 lines and
+contains **zero** occurrences of `9168400` — so the large call did not happen at all
+that boot, and `tail32` never fired. The streams it did walk are small:
+
+```
+walk size=2456  framedEnd=2456  chunks: [0]PSIN(len=0x210) [528]LSCH(len=0x128) ...
+walk size=74720 framedEnd=74720 chunks: [0]PSIN(len=0x6d70) [28016]LSCH(len=0x95b8) ...
+```
+
+Consequence for the "flip": across five boots of four builds the large call is
+reached only sometimes (#220, #221, #225 yes; #222, #224, #226 no). The verdict on it
+when reached has been `ret=0` every single time with identical bytes. What is
+boot-order dependent is **whether the guest makes that call**, not what the gate
+returns for it.
+
+Still needed: the tail of the buffer on a boot that does reach it (`tail32`), then
+cause (a) truncated assembly / (b) walk final-boundary — no fix landed.
