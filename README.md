@@ -96,7 +96,7 @@ Implemented / stubbed now:
 | `d3d12_xs.dll` | Device-method surface | implemented | Queues, allocators, lists, resources, heaps, root signatures, fences — through the shim device |
 | `XAudio2_9.dll` | `XAudio2Create` | stub | XMA2 decode is 0% everywhere |
 | `gameinput.dll` | `GameInputCreate` | stub | — |
-| `dstorage_xs.dll` | `DStorageGetFactory` | stub | No queues/files yet |
+| `dstorage_xs.dll` | `DStorageGetFactory` | implemented | Real factory: 17 queues (boot #74), Submit (slot 6) + EnqueueStatus (slot 4) |
 | — | `XAsync` | implemented | Synchronous completion model |
 | — | `XUser` | implemented | Silent default user ("Player") |
 | — | `XGameSave` | implemented | Local-only provider + full update flow (create update, blob writes/deletes, submit, read back) |
@@ -108,9 +108,9 @@ Tracked as not-implemented: `XGameSaveCreateUpdate` /
 `XPackageEnumeratePackages` are now implemented — the remaining gaps are
 whole areas not yet in the registry — XSAPI (live Xbox Live —
 stub/fail-soft only), XGameUI / TCUI, XDisplay, XSystem, XStore, Game
-Chat, AcpHal / XMA, DirectStorage queues + BCPack, shader lifting,
-texture de-tiling (`XBOX_TILEMODE_SCARLETT`), unified memory
-(`MEM_GRAPHICS`).
+Chat, AcpHal / XMA, BCPack, shader lifting (real-shader translation;
+the pipeline infrastructure Phases 0–5 is built), texture de-tiling
+(`XBOX_TILEMODE_SCARLETT`), unified memory (`MEM_GRAPHICS`).
 
 ### 3. Shim DLLs (`src/scarlett.cpp`, `defs/*.def`)
 
@@ -196,9 +196,11 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-24 (boots through #97, GitHub head `9686f0d`)
+## Status — 2026-11-24 (boots through #113, GitHub head `b4f0f1f`)
 
-**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, boots through #97 to a new furthest point; hash gate + memcpy overrun remain open).**
+**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (113 boots). No game frame yet, no menu yet.**
+
+**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, new stop int3 at 0x142474CE1; hash gate + memcpy overrun remain open).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -223,9 +225,13 @@ subsystem, not a dead harness.
 | Layout 261 (0x105) as 4 KiB-tile layout | ✅ | Boot #86, path=tiled status=SUCCESS size=4096 align=4096 |
 | TEXTURE1D in texture computer | ✅ | Boot #97, dim 2 256x1 fmt 29 → supported, copy S_OK |
 | CreatePlacedResourceX without device removal | ✅ | Boot #96: no device removal after slot 17 rounds CBV size up to 256 (commit 2ffcb48) |
+| Slots 27/39 implemented, null-array wall cleared | ✅ | Boots #102–#113, commit 84103ca |
+| Command signatures, root signatures, descriptor copies forwarded | ✅ | Commit d53d0b1 |
+| 0x1424840C5 crash cleared | ✅ | Boot #113, new stop int3 at 0x142474CE1 |
+| Shader pipeline Phases 0–5 (infrastructure + build gate) | ✅ | Phases 0–5 harness-green (125/35/804/728/236/151), /W4 /WX 0 warnings, on GitHub (commits 7c654f2 + b4f0f1f) |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
-| Shader capture / translation | ❌ | Phases 0–3 infrastructure built + harness-green (capture 128/128, DXIL backend 35/35, classifier 837/837); no corpus yet, no game shader translated |
+| Real shader translation from corpus | ❌ | No corpus yet (slots 86/16 don't create PSOs), no game shader translated |
 | First frame / menu on screen | ❌ | 0 presents (boot #78 segment) |
 | BCPack decode | ❌ | B1 spec written, not implemented |
 | Mesh-as-compute | ❌ | CPU-only prototype |
