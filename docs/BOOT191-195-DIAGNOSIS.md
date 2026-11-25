@@ -1133,3 +1133,32 @@ What is reproducible whenever the call *is* made (#220, #221, #225): identical b
 
 No gate tolerance, assert byte, stream byte, pack byte or verification constant was
 changed. The fix is not landed because the deciding bytes have not been observed.
+
+## §34 Whole-tree sweep: the 9,168,400 extent is not authored in our source
+
+Repository root directories: `defs/ docs/ fh2test/ include/ investigation/ out/ src/
+tests/ third_party/ wd_exports/`. Whole-tree `grep -rl` (binary files excluded):
+
+```
+9168400   -> only gta_boot205.log, gta_boot206.log, gta_boot207.log, gta_boot208.log (logs)
+8bf000    -> only gta_boot225.log, scarlett_boot225.log (logs)
+5053494e  -> docs/FREEBUFF-DSTORAGE-FILE-MAPPING.md and boot logs
+tail32    -> src/pe_loader.cpp (our instrument only)
+```
+
+No source file under `src/`, `include/`, `third_party/`, `defs/` or `tests/` contains the
+size constant `9168400` or the resident extent `0x8bf000`, and the PSIN magic appears in
+no source at all — only in docs and logs. The 9,168,400-byte extent therefore originates
+outside our layer (guest/descriptor-derived), and the only layer code that touches it is
+the observing stub in `src/pe_loader.cpp`.
+
+Attempted determinism instrumentation (offer sequence + repeat counter for identical
+(buf,size) offers at the stub) **regressed the build**: `build_ga227` printed
+`guest_opt FAILED` and exited 1. It was reverted; `build_ga228` is green
+(`BUILD_EXIT=0`, `B1 result: 149 checks, 0 failed -> PASS`, `=== verify exit code: 0 ===`).
+No determinism change is landed, and the sampled cause for the large stream therefore
+remains **not observable** — fourth attempt, same wall: whether the guest issues that
+call varies per boot and no boot in the window wrote `tail32`.
+
+Constraints held throughout: no gate tolerance, assert byte, stream/pack byte or
+verification constant changed.
