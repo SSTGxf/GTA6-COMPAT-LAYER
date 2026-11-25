@@ -5638,12 +5638,16 @@ extern "C" void DsqSubmit(void* self) {
                 // full 64 KiB pages plus a 58,896-byte partial page (framed end
                 // 9,168,284 inside a 9,168,400-byte offer). Record what this
                 // completion actually writes so a short final page is visible.
-                Log("mapping",
-                    "raw copy chunk dest=%llx src=%llx destSize=%llu compSize=%u "
-                    "framedEnd=9168284 offer=9168400",
+                // io: one line per delivery so the reader can match pointers and
+                // byte counts against the framed buffer (offer 9168400).
+                Log("io",
+                    "io copy dst=%llx src=%llx req=%llu got=%llu believedLen=%llu "
+                    "err=%lu framedBuf=9168400 offer=9168400",
                     (unsigned long long)(uintptr_t)dest,
                     (unsigned long long)(uintptr_t)comp,
-                    (unsigned long long)destSize, (unsigned)compSize);
+                    (unsigned long long)destSize,
+                    (unsigned long long)destSize,
+                    (unsigned long long)destSize, (unsigned long)GetLastError());
                 memcpy((void*)dest, comp, destSize);
                 g_dsLastResolvedPack = packPath;
                 free(comp);
