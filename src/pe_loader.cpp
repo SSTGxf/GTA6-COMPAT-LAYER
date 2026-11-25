@@ -1271,6 +1271,54 @@ static void PatchGateProbe(void* base) {
     }
 }
 
+// Dispatch probe (boot #274's stop, 0x145a99c66). The wrapper at
+// 0x142bd0120 is a CASE BODY of the status dispatcher at 0x1419f2d00
+// (mov eax,[rdx+0x90]; cmp 0x198/0x1b5/0x1db; jmp [table]). Nothing
+// calls the wrapper with `call rel32` — the only reference in the whole
+// image is the tail `jmp` at 0x1419f2da8, which is why the crash stack
+// carries no caller return address. This probe names the status word
+// that selects that case: the 6-byte `mov eax,[rdx+0x90]` at RVA
+// 0x19f2d0b is replaced by int3 and emulated in the VEH, so the read is
+// logged and execution continues unchanged. Only ids inside the switch
+// range are logged (200 max), and the last one seen is reported with the
+// crash record, so a capped log still names the state before the stop.
+static uint8_t g_dispOrig[6] = {};
+static uint64_t g_dispVa = 0;
+static volatile LONG g_dispHits = 0;
+static volatile LONG g_dispLogged = 0;
+static volatile LONG64 g_dispLastId = -1;
+static volatile LONG64 g_dispLastObj = 0;
+
+static void PatchDispatchProbe(void* base) {
+    const uint64_t rva = 0x19f2d0b;  // mov eax, dword ptr [rdx + 0x90]
+    __try {
+        uint8_t* p = (uint8_t*)base + rva;
+        static const uint8_t kWant[6] = {0x8b, 0x82, 0x90, 0x00, 0x00, 0x00};
+        for (int i = 0; i < 6; ++i) {
+            if (p[i] != kWant[i]) {
+                Log("loader",
+                    "dispatch-probe: byte %d is 0x%02x not 0x%02x; skipped",
+                    i, p[i], kWant[i]);
+                return;
+            }
+        }
+        memcpy(g_dispOrig, p, 6);
+        DWORD old = 0;
+        VirtualProtect(p, 8, PAGE_EXECUTE_READWRITE, &old);
+        p[0] = 0xCC;
+        FlushInstructionCache(GetCurrentProcess(), p, 8);
+        VirtualProtect(p, 8, old ? old : PAGE_EXECUTE_READ, &old);
+        g_dispVa = (uint64_t)(uintptr_t)p;
+        Log("loader",
+            "dispatch-probe armed at=0x%llx (mov eax,[rdx+0x90], int3 + "
+            "emulate)",
+            (unsigned long long)g_dispVa);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "dispatch-probe: patch faulted 0x%08lx",
+            GetExceptionCode());
+    }
+}
+
 static size_t PatchGaTlsReads(void* base, const IMAGE_NT_HEADERS64* nt) {
     DWORD slot = GaSlot();
     if (slot == TLS_OUT_OF_INDEXES) {
@@ -2425,6 +2473,7 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     // protections and before any image code (TLS callbacks) runs.
     PatchGaTlsReads(base, nt);
     PatchGateProbe(base);
+    PatchDispatchProbe(base);
 
     // Final page protections: per-section (text XR, rodata R, data RW).
     // Applied AFTER relocations + imports, which write into the image.
@@ -3415,6 +3464,82 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     // Catch both so the mount probe + dump fire at the AV too — the
     // 0x80000003-only gate is why boot #25 produced no probe.
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Dispatch probe trap: emulate `mov eax,[rdx+0x90]`, log the status
+    // word, and continue. Every other int3 keeps the crash handling.
+    if (code == 0x80000003 && g_dispVa &&
+        (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress ==
+            g_dispVa) {
+        CONTEXT* c = ep->ContextRecord;
+        const LONG n = InterlockedIncrement(&g_dispHits);
+        const uint64_t obj = (uint64_t)c->Rdx;
+        uint64_t id = 0;
+        bool ok = false;
+        __try {
+            id = *(const uint32_t*)(uintptr_t)(obj + 0x90);
+            ok = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        if (ok) {
+            g_dispLastId = (LONG64)id;
+            g_dispLastObj = (LONG64)obj;
+        }
+        // Only ids the switch actually tests (0x198..0x1db) are logged, so
+        // unrelated dispatches cannot exhaust the budget.
+        if (ok && id >= 0x190 && id <= 0x1e8 && g_dispLogged < 200) {
+            InterlockedIncrement(&g_dispLogged);
+            Log("loader",
+                "dispatch-probe #%ld obj=0x%llx id=0x%llx tid=%lu", n,
+                (unsigned long long)obj, (unsigned long long)id,
+                (unsigned long)GetCurrentThreadId());
+        }
+        // First hit: the dispatcher is entered through a virtual slot, so its
+        // caller's return address sits at [rsp+0x68] (5 pushes + 0x40 frame).
+        // Dump it plus the job object's header and vtable: that names both the
+        // owner of the job and the class, from the running guest.
+        if (ok && n == 1) {
+            uint64_t hdr[16] = {};
+            uint64_t vt[8] = {};
+            uint64_t vtp = 0, ret = 0;
+            __try {
+                ret = *(const uint64_t*)(uintptr_t)((uint64_t)c->Rsp + 0x68);
+                const uint64_t* q = (const uint64_t*)(uintptr_t)obj;
+                for (int i = 0; i < 16; ++i) hdr[i] = q[i];
+                vtp = hdr[0];
+                const uint64_t* v = (const uint64_t*)(uintptr_t)vtp;
+                for (int i = 0; i < 8; ++i) vt[i] = v[i];
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            Log("loader",
+                "dispatch-probe caller ret=0x%llx (rva 0x%llx) vtable=0x%llx",
+                (unsigned long long)ret,
+                (unsigned long long)(ret - (uint64_t)(uintptr_t)g_guestBaseForVeh),
+                (unsigned long long)vtp);
+            Log("loader",
+                "dispatch-probe obj hdr: %llx %llx %llx %llx %llx %llx %llx "
+                "%llx %llx %llx %llx %llx %llx %llx %llx %llx %llx",
+                (unsigned long long)hdr[0], (unsigned long long)hdr[1],
+                (unsigned long long)hdr[2], (unsigned long long)hdr[3],
+                (unsigned long long)hdr[4], (unsigned long long)hdr[5],
+                (unsigned long long)hdr[6], (unsigned long long)hdr[7],
+                (unsigned long long)hdr[8], (unsigned long long)hdr[9],
+                (unsigned long long)hdr[10], (unsigned long long)hdr[11],
+                (unsigned long long)hdr[12], (unsigned long long)hdr[13],
+                (unsigned long long)hdr[14], (unsigned long long)hdr[15]);
+            Log("loader",
+                "dispatch-probe vtable slots: %llx %llx %llx %llx %llx %llx "
+                "%llx %llx",
+                (unsigned long long)vt[0], (unsigned long long)vt[1],
+                (unsigned long long)vt[2], (unsigned long long)vt[3],
+                (unsigned long long)vt[4], (unsigned long long)vt[5],
+                (unsigned long long)vt[6], (unsigned long long)vt[7]);
+        }
+        if (ok) {
+            c->Rax = id;  // mov eax,[rdx+0x90] zero-extends into rax
+            c->Rip = g_dispVa + 6;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     // Boots #197-#200: guest threads that never passed through
     // ScarlettCreateThread (and were already running when the guest TLS
     // directory was parsed) execute guest code with
@@ -3628,6 +3753,13 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
         (unsigned long)code,
         ep->ExceptionRecord->ExceptionAddress,
         (unsigned long)GetCurrentThreadId());
+    if (g_dispVa) {
+        Log("loader",
+            "dispatch-probe summary: hits=%ld lastId=0x%llx "
+            "lastObj=0x%llx",
+            (long)g_dispHits, (unsigned long long)g_dispLastId,
+            (unsigned long long)g_dispLastObj);
+    }
     // Boot #46: the fault IP can be inside a system DLL (not the game
     // image), so resolve it to a module name + offset — otherwise the
     // crashing DLL is unknowable from the log alone.

@@ -496,3 +496,83 @@ A strict decode of every rip-relative reference to `0x147bdfaa8` in `.text` leav
 the read above and a 16-byte clear, `vmovups xmmword ptr [rip + 0x504e0bb], xmm6` at `0x142b919e5`
 (target `0x147bdfaa8`). So the global is populated by a path that did not run on #274 — the next
 step is naming and satisfying that creator, not the swapchain or the hash routine.
+
+## 2026-11-25 (boots #275-#277): the 0x145a99c66 stop is a status-dispatch case body
+
+A bounded probe now names the state machine that reaches the NULL. `dispatch-probe` replaces the
+6-byte `mov eax,[rdx+0x90]` at image RVA `0x19f2d0b` with `int3`, emulates the instruction in the
+VEH and logs the status word (only ids the switch tests, 200 max, plus a summary at the crash).
+Boot #275:
+
+```
+loader    ] dispatch-probe armed at=0x1419f2d0b (mov eax,[rdx+0x90], int3 + emulate)
+loader    ] dispatch-probe summary: hits=1 lastId=0xaa lastObj=0x23e1a23df50
+```
+
+The dispatcher (0x1419f2d00) is a two-table switch on that word:
+
+```
+0x1419f2cf0: 3d98010000    cmp  eax, 0x198
+0x1419f2d19: 7e55          jle  0x1419f2d70
+0x1419f2d70: 3da9000000    cmp  eax, 0xa9
+0x1419f2d75: 0f8ed8000000  jle  0x1419f2e53
+0x1419f2d7b: 8d8856ffffff  lea  ecx, [rax - 0xaa]
+0x1419f2d81: 83f915        cmp  ecx, 0x15
+0x1419f2d84: 0f8798010000  ja   0x1419f2f22
+0x1419f2d8a: 488d05fbdbd504 lea  rax, [rip + 0x4d5dbfb]   ; table for ids 0xaa..0xbf
+0x1419f2d91: 48630c88      movsxd rcx, dword ptr [rax + rcx*4]
+0x1419f2d95: 4801c1        add  rcx, rax
+0x1419f2d98: ffe1          jmp  rcx
+...
+0x1419f2d9a: 4889d1        mov  rcx, rdx              ; case body: rcx = the job object
+0x1419f2d9d: 4883c440      add  rsp, 0x40
+0x1419f2da1..:             pops rbx/rdi/rsi/r14/r15
+0x1419f2da8: e973d31d01    jmp  0x142bd0120            ; tail call into the wrapper
+```
+
+So `id=0xaa` is index 0 of the `0xaa..0xbf` table, and that case **tail-jumps** into
+`0x142bd0120` with `rcx = rdx` (the job object). That is why no `call` exists: the earlier
+`jmp` match at `0x1419f2da8` was an unaligned byte-scan hit, not a separate caller.
+
+The wrapper itself:
+
+```
+0x142bd0126: e8e5b5f102      call 0x145aeb710        ; formats a message, passes &G in r9
+0x142bd012b: 488b3576f90005  mov  rsi, [rip + 0x500f976]   ; -> 0x147bdfaa8 (NULL)
+0x142bd0134: e8b7422f03      call 0x145ec43f0
+0x142bd0139: 4889f1          mov  rcx, rsi
+0x142bd013c: 488935a539fa07  mov  [rip + 0x7fa39a5], rsi
+0x142bd0143: e8189bec02      call 0x145a99c60        ; cmp qword ptr [rcx+8],0 -> AV, rcx=0
+```
+
+`0x147bdfaa8` is a **member at +0x38 of the global at `0x147bdfa70`** (that base is taken with
+`lea rcx,[rip+...]` in `0x145b794f2` and `0x145ca7990`, and loaded with `mov rax,[...]` in
+`0x142bcea28`/`0x142bcffc8`), not a standalone pointer. The only static reference that writes G
+itself is the block clear in the large static initializer at `0x142b917xx`
+(`vmovups [0x147bdfaa8], xmm6`), so on this boot nothing ever populated it.
+
+### Correction: the arena fault is not gone, it is path-dependent
+
+Boots #276 and #277 never reached the dispatcher (`hits=0`) and died again at `0x144fc21f5`, with
+*different* stale string pointers:
+
+```
+#277: veh: av rip=0x144fc21f5 ... faultAddr=0x172f41ebb0e ... base=0x172f41eb000 regionsize=0x692000
+      veh: lazy-commit page=00000172F41EB000 ... -> 00000172F41EB000 (err 0)
+      veh: av rip=0x144fc21f5 ... faultAddr=0x1726db59f15 ... base=0x1726db59000 regionsize=0xd88000
+      veh: lazy-commit page=000001726DB59000 ... -> 0000000000000000 (err 87)
+#276: second pointer had state=0x10000 (MEM_FREE) - no reservation to commit at all
+```
+
+The clamp fixed the *commit-below-reservation* bug measured on #270 (`fa & ~0xFFFF` landing at
+`0x1e954ab0000` for a base of `0x1e954ab7000`, err 87). It cannot fix a genuinely stale pointer:
+on #277 the first page commits and the walk then steps into a region where `MEM_COMMIT` returns
+err 87, and on #276 it steps into free memory. So "the 0x144fc21f5 fault is gone" was true only for
+the #274/#275 path; the instruction still faults on other timing paths.
+
+### Next probe (implemented, no hit yet)
+
+The first dispatcher hit now also logs `[rsp+0x68]` (the dispatcher's caller return address, since
+it is invoked through a virtual slot), the job object's first 16 qwords and its vtable's first 8
+slots. That names both the job's owner and its class. Boots #276/#277 did not reach the dispatcher,
+so the dump has not printed yet.
