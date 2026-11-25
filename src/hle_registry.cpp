@@ -5415,6 +5415,17 @@ static HRESULT ScDsReadInflateInto(const char* path, uint64_t fileOffset,
     if (hr == S_OK && outBuf && outLen >= destSize) {
         memcpy(dst, outBuf, destSize);
         free(outBuf);
+        // Boot #196: a member streamed as 64 KiB pages can be clipped when the
+        // descriptor's destSize is smaller than the stream the pack really
+        // holds; nothing downstream can see that without this number.
+        if (outLen != destSize) {
+            Log("dstorage",
+                "inflate length mismatch: %s offset=0x%llx compSize=%u "
+                "destSize=%u outLen=%zu (stream longer than the descriptor; "
+                "copied destSize)",
+                path, (unsigned long long)fileOffset, compSize, destSize,
+                outLen);
+        }
         return S_OK;
     }
     free(outBuf);
@@ -5527,6 +5538,15 @@ extern "C" void DsqSubmit(void* self) {
                 free(outBuf);
                 free(comp);
                 ++copied;
+                if (outLen != destSize) {
+                    Log("dstorage",
+                        "Submit[%d] inflate length mismatch: hash 0x%016llx "
+                        "offset=0x%llx compSize=%u destSize=%u outLen=%zu "
+                        "(stream longer than the descriptor)",
+                        i, (unsigned long long)hash,
+                        (unsigned long long)fileOffset, compSize, destSize,
+                        outLen);
+                }
                 continue;
             }
             free(outBuf);

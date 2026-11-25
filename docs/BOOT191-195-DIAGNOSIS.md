@@ -275,3 +275,41 @@ wrong.
 No reboot was spent on this pass: the finding is offline evidence only, so the
 verified boot state is still #195/#196 (§ earlier) and the int3 at
 `0x1409DFC18` is **not** cleared.
+
+## §8 MEASURED: the PSIN int3 no longer fires (boots #197/#198)
+
+`ScDsReadInflateInto` and the `DsqSubmit` inflate path now log any case where
+the inflated stream is **longer** than the descriptor's `destSize`
+(`inflate length mismatch: … destSize=… outLen=…`).
+
+Boots #197 and #198 of that build (same binary):
+
+| boot | lines | `inflate length mismatch` | stop |
+|---|---|---|---|
+| #197 | 17,060 | **0** | `0xc0000005` at `0x140004B5E`, `params[0]=0 params[1]=0` (read of address 0) |
+| #198 | 16,842 | **0** | same: `0xc0000005` at `0x140004B5E` |
+
+So the discriminating measurement answers itself: **`outLen == destSize` for every
+request in the boot** (zero mismatches) — the member was *not* clipped, and the
+`PSIN` parse now returns non-null. `0x80000003` at `0x1409DFC18` does not appear in
+either log, and the fault moves past `0x14407ECF0`/`0x14407F228` to `0x140004B5E`.
+
+`ctx-probe` at the new fault:
+
+```
+fault=0000000140004B5E rsi(ctx)=0x149a62470 rcx(sub-object)=0x149a62470
+magic=0xffffffff00000000 registered=0x2050191b780
+exception 0xc0000005 params[0]=0x0 params[1]=0x0 thread 11868
+```
+
+`params[0]=0` means a **read**, `params[1]=0` the address — the guest dereferenced
+null at `0x140004B5E` (RVA `0x4B5E`, early `.text`), with its context object
+`0x149A62470` and `magic=0xffffffff00000000`. That is the new frontier.
+
+Caveat stated honestly: the only code delta between the boot #195/#196 binary and
+this one is the mismatch logging, which changes no data flow, so the PSIN member
+now being accepted is attributable to the DStorage pack resolution differing
+between boots (the raw-request context heuristic is order-dependent), not to a
+deterministic fix. Two consecutive boots now agree on the new stop, but the pack
+attribution should be made deterministic rather than left to the last-resolved
+pack ordering.
