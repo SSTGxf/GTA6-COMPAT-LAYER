@@ -3304,58 +3304,6 @@ static void FillUnimplementedDeviceSlots(std::index_sequence<I...>,
     for (std::size_t i = 0; i < sizeof...(I); ++i) vt[i] = stubs[i];
 }
 
-// Slot 86: CreatePipelineState (boot #154-#162).
-// The boot trace identifies Xbox device slot 86 as CreatePipelineState.
-// The handler uses the public D3D12 stream signature. Confirm the Xbox
-// slot ABI against a boot call before relying on it. Forward the
-// stream unchanged so the desktop runtime can validate/compile it. This does
-// not translate Xbox-only shader instructions or emulate mesh stages.
-static HRESULT WINAPI XboxDevice_CreatePipelineState(
-    XboxDeviceWrapper* self, const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc,
-    REFIID riid, void** ppPipelineState) {
-    if (!ppPipelineState) return E_POINTER;
-    *ppPipelineState = nullptr;
-    if (!self || !self->real || !pDesc) return E_POINTER;
-
-    ID3D12Device2* device2 = nullptr;
-    HRESULT hr = self->real->QueryInterface(
-        __uuidof(ID3D12Device2), (void**)&device2);
-    if (FAILED(hr) || !device2) {
-        if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
-        Log("xboxdev",
-            "CreatePipelineState(slot86) device2 QI failed hr=0x%08x "
-            "stream=%p out=%p ret=0x%llx",
-            (unsigned)hr, (const void*)pDesc, (void*)ppPipelineState,
-            (unsigned long long)_ReturnAddress());
-        return hr;
-    }
-
-    hr = device2->CreatePipelineState(pDesc, riid, ppPipelineState);
-    device2->Release();
-    if (FAILED(hr)) {
-        *ppPipelineState = nullptr;
-    } else if (!*ppPipelineState) {
-        // A successful COM create must return the requested interface.
-        hr = E_UNEXPECTED;
-    }
-
-    static LONG calls = 0;
-    LONG n = InterlockedIncrement(&calls);
-    if (n <= 8 || (n % 256) == 0 || FAILED(hr)) {
-        Log("xboxdev",
-            "CreatePipelineState(slot86) stream=%p riid={%08X-%04X-%04X-"
-            "%02X%02X-%02X%02X-%02X%02X-%02X%02X} -> hr=0x%08x "
-            "pso=%p call#%ld ret=0x%llx",
-            (const void*)pDesc, (unsigned)riid.Data1,
-            (unsigned)riid.Data2, (unsigned)riid.Data3,
-            riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
-            riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7],
-            (unsigned)hr, *ppPipelineState, (long)n,
-            (unsigned long long)_ReturnAddress());
-    }
-    return hr;
-}
-
 // Build the 192-slot Xbox device vtable once. Unimplemented slots get
 // the logging stub; known slots get their handlers.
 static void InitXboxDeviceVtable() {
@@ -3390,7 +3338,6 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[78] = (void*)XboxDevice_SetFrameIntervalX;
     g_xboxDeviceVtable[79] = (void*)XboxDevice_ScheduleFrameEventX;
     g_xboxDeviceVtable[80] = (void*)XboxDevice_WaitFrameEventX;
-    g_xboxDeviceVtable[86] = (void*)XboxDevice_CreatePipelineState;
     g_xboxDeviceVtable[127] =
         (void*)XboxDevice_CreateCommittedResource3;
     g_xboxDeviceVtable[133] = (void*)XboxDevice_CreatePlacedResourceX;
