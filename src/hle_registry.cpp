@@ -5639,8 +5639,11 @@ extern "C" void DsqSubmit(void* self) {
                 // 9,168,284 inside a 9,168,400-byte offer). Record what this
                 // completion actually writes so a short final page is visible.
                 Log("mapping",
-                    "raw copy chunk dest=%p src=%p destSize=0x%llx compSize=0x%x",
-                    (void*)dest, comp, (unsigned long long)destSize, compSize);
+                    "raw copy chunk dest=%llx src=%llx destSize=%llu compSize=%u "
+                    "framedEnd=9168284 offer=9168400",
+                    (unsigned long long)(uintptr_t)dest,
+                    (unsigned long long)(uintptr_t)comp,
+                    (unsigned long long)destSize, (unsigned)compSize);
                 memcpy((void*)dest, comp, destSize);
                 g_dsLastResolvedPack = packPath;
                 free(comp);
