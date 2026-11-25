@@ -885,6 +885,35 @@ static void ScSynthesizeFramedTail(void* b, uint32_t n) {
         (unsigned long long)(uintptr_t)t);
 }
 
+
+// Bounded dump of the guest gate's own bytes: the module at 0x144000000 is not in
+// the PE on disk, so the only way to decode the predicate is to copy the small
+// slice around 0x14407e700 out of a live boot. 512 bytes, never more.
+// Plain C locals only: __try cannot live in a function with object unwinding.
+static void ScDumpGateSlice() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    char path[MAX_PATH] = {};
+    char out[MAX_PATH + 32] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    int n = 0;
+    while (path[n]) ++n;
+    while (n > 0 && path[n - 1] != (char)92 && path[n - 1] != '/') --n;
+    path[n] = 0;
+    _snprintf_s(out, sizeof(out), _TRUNCATE, "%sgate_14407e700.bin", path);
+    __try {
+        FILE* f = fopen(out, "wb");
+        if (f) {
+            fwrite((const void*)(uintptr_t)0x14407e700ull, 1, 512, f);
+            fclose(f);
+            Log("loader", "gate-slice wrote %s base=0x144000000+0x7e700 bytes=512", out);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "gate-slice unreadable at 0x14407e700 (no bytes mapped)");
+    }
+}
+
 static void ScBufProbe(const void* b, uint32_t n, const char* phase) {
     const uint8_t* q = (const uint8_t*)b;
     uint64_t first8 = 0, last8 = 0, tail8 = 0;
@@ -930,7 +959,7 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // unchanged: the stream really is 9,168,400 bytes and its trailing 116 bytes
     // (LGID 8 + LRSC 0x58 + CHKS 0x14 = 116) are meant to be there but arrived as
     // garbage, so the defect is in what the read path wrote, not in the length.
-    if (size == 9168400u) ScSynthesizeFramedTail((void*)buf, size);
+    if (size == 9168400u) { ScSynthesizeFramedTail((void*)buf, size); ScDumpGateSlice(); }
     ScLogChunkWalk(buf, size);
     ScLogBufRange(buf, size);
     // Handed extent: the guest's request total for this member (139*65536 + 58896

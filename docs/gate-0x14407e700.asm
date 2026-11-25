@@ -20,3 +20,117 @@
 ; Therefore the guest gate 0x14407e700 does not live in this PE; it is mapped at
 ; a base 0x144000000 that is 0x4000000 above the PE image base and beyond its size,
 ; i.e. in a separately materialised region (allocated/JIT/shim), not in the file.
+
+; ---- live slice dumped from boot #269 (build_ga261) ----
+; base arithmetic: region base 0x144000000 + offset 0x7e700 = 0x14407e700
+; bytes=512 (out/gate_14407e700.bin), gate-slice log line: 'gate-slice wrote ... base=0x144000000+0x7e700 bytes=512'
+0x14407e700: 4157                   push r15
+0x14407e702: 4156                   push r14
+0x14407e704: 4155                   push r13
+0x14407e706: 4154                   push r12
+0x14407e708: 56                     push rsi
+0x14407e709: 57                     push rdi
+0x14407e70a: 55                     push rbp
+0x14407e70b: 53                     push rbx
+0x14407e70c: 4883ec68               sub rsp, 0x68
+0x14407e710: 4c8bac24d8000000       mov r13, qword ptr [rsp + 0xd8]
+0x14407e718: 4889ce                 mov rsi, rcx
+0x14407e71b: 4d85ed                 test r13, r13
+0x14407e71e: 7408                   je 0x14407e728
+0x14407e720: 41c7450000000000       mov dword ptr [r13], 0
+0x14407e728: 4584c9                 test r9b, r9b
+0x14407e72b: 7404                   je 0x14407e731
+0x14407e72d: 48895610               mov qword ptr [rsi + 0x10], rdx
+0x14407e731: 4885d2                 test rdx, rdx
+0x14407e734: 0f95c0                 setne al
+0x14407e737: 4585c0                 test r8d, r8d
+0x14407e73a: 0f95c1                 setne cl
+0x14407e73d: 84c8                   test al, cl
+0x14407e73f: 7516                   jne 0x14407e757
+0x14407e741: 4d85ed                 test r13, r13
+0x14407e744: 0f846a040000           je 0x14407ebb4
+0x14407e74a: 41c7450002000000       mov dword ptr [r13], 2
+0x14407e752: e95d040000             jmp 0x14407ebb4
+0x14407e757: 440f38f07204           movbe r14d, dword ptr [rdx + 4]
+0x14407e75d: 488bac24d0000000       mov rbp, qword ptr [rsp + 0xd0]
+0x14407e765: 4539c6                 cmp r14d, r8d
+0x14407e768: 7615                   jbe 0x14407e77f
+0x14407e76a: 4531d2                 xor r10d, r10d
+0x14407e76d: 4531db                 xor r11d, r11d
+0x14407e770: 31c0                   xor eax, eax
+0x14407e772: 4531e4                 xor r12d, r12d
+0x14407e775: 31ff                   xor edi, edi
+0x14407e777: 4531f6                 xor r14d, r14d
+0x14407e77a: e91b040000             jmp 0x14407eb9a
+0x14407e77f: 0f38f00a               movbe ecx, dword ptr [rdx]
+0x14407e783: 4489c5                 mov ebp, r8d
+0x14407e786: 4a8d1c32               lea rbx, [rdx + r14]
+0x14407e78a: 4801d5                 add rbp, rdx
+0x14407e78d: 81f947435350           cmp ecx, 0x50534347
+0x14407e793: 7f4a                   jg 0x14407e7df
+0x14407e795: 81f94253524c           cmp ecx, 0x4c525342
+0x14407e79b: 0f8fb5000000           jg 0x14407e856
+0x14407e7a1: 81f94c4e454c           cmp ecx, 0x4c454e4c
+0x14407e7a7: 0f8f30010000           jg 0x14407e8dd
+0x14407e7ad: 81f9534b4843           cmp ecx, 0x43484b53
+0x14407e7b3: 0f847a020000           je 0x14407ea33
+0x14407e7b9: 81f944495547           cmp ecx, 0x47554944
+0x14407e7bf: 0f85ff090000           jne 0x14407f1c4
+0x14407e7c5: 488d4208               lea rax, [rdx + 8]
+0x14407e7c9: 418d4ef8               lea ecx, [r14 - 8]
+0x14407e7cd: 48898680000000         mov qword ptr [rsi + 0x80], rax
+0x14407e7d4: 898e88000000           mov dword ptr [rsi + 0x88], ecx
+0x14407e7da: e93a030000             jmp 0x14407eb19
+0x14407e7df: 4531d2                 xor r10d, r10d
+0x14407e7e2: 4531ff                 xor r15d, r15d
+0x14407e7e5: 81f94d465453           cmp ecx, 0x5354464d
+0x14407e7eb: 0f8fa3000000           jg 0x14407e894
+0x14407e7f1: 81f94d495350           cmp ecx, 0x5053494d
+0x14407e7f7: 0f8f12010000           jg 0x14407e90f
+0x14407e7fd: 81f948435350           cmp ecx, 0x50534348
+0x14407e803: 0f844e020000           je 0x14407ea57
+0x14407e809: 41b900000000           mov r9d, 0
+0x14407e80f: b800000000             mov eax, 0
+0x14407e814: 41bc00000000           mov r12d, 0
+0x14407e81a: bf00000000             mov edi, 0
+0x14407e81f: 4c894c2428             mov qword ptr [rsp + 0x28], r9
+0x14407e824: 41b900000000           mov r9d, 0
+0x14407e82a: 4c894c2430             mov qword ptr [rsp + 0x30], r9
+0x14407e82f: 41b900000000           mov r9d, 0
+0x14407e835: 4c894c2440             mov qword ptr [rsp + 0x40], r9
+0x14407e83a: 41b900000000           mov r9d, 0
+0x14407e840: 4c894c2438             mov qword ptr [rsp + 0x38], r9
+0x14407e845: 81f947495350           cmp ecx, 0x50534947
+0x14407e84b: 0f84f9020000           je 0x14407eb4a
+0x14407e851: e96e090000             jmp 0x14407f1c4
+0x14407e856: 81f9524e534c           cmp ecx, 0x4c534e52
+0x14407e85c: 0f8f06010000           jg 0x14407e968
+0x14407e862: 81f94353524c           cmp ecx, 0x4c525343
+0x14407e868: 0f8425020000           je 0x14407ea93
+0x14407e86e: 81f94843534c           cmp ecx, 0x4c534348
+0x14407e874: 0f854a090000           jne 0x14407f1c4
+0x14407e87a: 488d4208               lea rax, [rdx + 8]
+0x14407e87e: 418d4ef8               lea ecx, [r14 - 8]
+0x14407e882: 488986b0000000         mov qword ptr [rsi + 0xb0], rax
+0x14407e889: 898eb8000000           mov dword ptr [rsi + 0xb8], ecx
+0x14407e88f: e985020000             jmp 0x14407eb19
+0x14407e894: 81f944525453           cmp ecx, 0x53545244
+0x14407e89a: 0f8f14010000           jg 0x14407e9b4
+0x14407e8a0: 81f94e465453           cmp ecx, 0x5354464e
+0x14407e8a6: 0f84fe010000           je 0x14407eaaa
+0x14407e8ac: 81f9534e5453           cmp ecx, 0x53544e53
+0x14407e8b2: 0f850c090000           jne 0x14407f1c4
+0x14407e8b8: 488b8424d0000000       mov rax, qword ptr [rsp + 0xd0]
+0x14407e8c0: f60002                 test byte ptr [rax], 2
+0x14407e8c3: 0f8550020000           jne 0x14407eb19
+0x14407e8c9: 488d4208               lea rax, [rdx + 8]
+0x14407e8cd: 418d4ef8               lea ecx, [r14 - 8]
+0x14407e8d1: 48894670               mov qword ptr [rsi + 0x70], rax
+0x14407e8d5: 894e78                 mov dword ptr [rsi + 0x78], ecx
+0x14407e8d8: e93c020000             jmp 0x14407eb19
+0x14407e8dd: 81f94d4e454c           cmp ecx, 0x4c454e4d
+0x14407e8e3: 0f84df010000           je 0x14407eac8
+0x14407e8e9: 81f94449474c           cmp ecx, 0x4c474944
+0x14407e8ef: 0f85cf080000           jne 0x14407f1c4
+0x14407e8f5: 488d4208               lea rax, [rdx + 8]
+0x14407e8f9: 418d4ef8               lea ecx, [r14 - 8]

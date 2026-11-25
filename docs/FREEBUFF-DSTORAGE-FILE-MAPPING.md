@@ -201,3 +201,38 @@ framed-ok lines: 84
 Same verdict, same assert: the earlier clamp was not what the gate objected to. The gate
 rejects the stream's content with the host-authored tail present, so `framed-ok` on our
 presence scan carries no weight with the game's parser.
+
+## 2026-11-25 (boot #269): the gate's own bytes, dumped and decoded
+
+Boot #266/#267 ended with `crash-record code=0x80000003 addr=0x1409dfc18` — an
+int3/STATUS_BREAKPOINT in our stub region after gate `0x14407e700` returned false — with a
+compact 319–321 KB MiniDumpNormal dump, never full memory.
+
+The gate is not in the on-disk PE (RVA 0x407e700 > image end 0x3a17800), so a new bounded
+probe copies 512 bytes from it on the first large offer:
+
+```
+gate-slice wrote F:\ScarlettCompat\out\gate_14407e700.bin base=0x144000000+0x7e700 bytes=512
+```
+
+Base arithmetic: region base `0x144000000` + offset `0x7e700` = `0x14407e700`. Full decode is
+committed as `docs/gate-0x14407e700.asm` (with the raw bytes as `docs/gate_14407e700.bin`).
+It starts:
+
+```
+0x14407e700: 4157                push r15
+0x14407e70c: 4883ec68            sub rsp, 0x68
+0x14407e710: 4c8bac24d8000000    mov r13, qword ptr [rsp + 0xd8]
+0x14407e718: 4889ce              mov rsi, rcx
+0x14407e71b: 4d85ed              test r13, r13
+0x14407e71e: 7408                je 0x14407e728
+0x14407e720: 41c7450000000000    mov dword ptr [r13], 0
+0x14407e728: 4584c9              test r9b, r9b
+0x14407e72b: 7404                je 0x14407e731
+0x14407e72d: 48895610            mov qword ptr [rsi + 0x10], rdx
+0x14407e731: 4885d2              test rdx, rdx
+```
+
+Boot #269 (build_ga261) still ends at `code=0x80000003 addr=0x1409dfc18` with 84 framed-ok
+lines, so the gate still answers false; the predicate inside this slice is now readable for the
+first time and is the next thing to satisfy.
