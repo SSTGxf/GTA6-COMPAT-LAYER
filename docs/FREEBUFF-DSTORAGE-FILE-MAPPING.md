@@ -236,3 +236,28 @@ It starts:
 Boot #269 (build_ga261) still ends at `code=0x80000003 addr=0x1409dfc18` with 84 framed-ok
 lines, so the gate still answers false; the predicate inside this slice is now readable for the
 first time and is the next thing to satisfy.
+
+## 2026-11-25 (boot #269 slice): full decode of the gate prologue and its first compares
+
+Source of bytes: `gate-slice wrote ... base=0x144000000+0x7e700 bytes=512`, i.e. region base
+`0x144000000` + offset `0x7e700`; slice committed as `docs/gate_14407e700.bin`, decode appended
+to `docs/gate-0x14407e700.asm` (50 compare/branch lines). Argument mapping read from the code:
+
+```
+0x14407e718: mov rsi, rcx                 ; rcx = object (rsi keeps it)
+0x14407e710: mov r13, [rsp+0xd8]          ; stack arg = status/out pointer
+0x14407e720: mov dword ptr [r13], 0       ; *status = 0
+0x14407e72d: mov [rsi+0x10], rdx          ; object+0x10 = rdx  (only when r9b != 0)
+0x14407e731: test rdx, rdx / setne al     ; al = (rdx != 0)
+0x14407e737: test r8d, r8d / setne cl     ; cl = (r8d != 0)
+0x14407e73d: test al, cl / jne 0x14407e757; both buffer and size must be non-zero
+0x14407e765: cmp r14d, r8d / jbe ...      ; r14d = cursor, r8d = size
+```
+
+So the gate's signature is `(obj=rcx, buf=rdx, size=r8d, flag=r9b, …, status=[rsp+0xd8])`, and its
+first decision discards the call when `buf == 0 || size == 0`. Both are non-zero for our buffer
+(`buf=0x…a520 size=9168400`), so the false return comes from a later compare inside the slice or
+in a helper it calls; that compare has not yet been reached in this pass.
+
+Boot #266's record stays as previously documented: `code=0x80000003 addr=0x1409dfc18` int3 in the
+stub region, compact `MiniDumpNormal` dump only (319,363 / 321,667 bytes), never full memory.
