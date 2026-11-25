@@ -1,6 +1,8 @@
 // ScarlettCompat shader pipeline - Phase 3: XS2 microcode discovery (MIT).
 #include "shader/sc_xs2.h"
 
+#include "shader/sc_isa.h"
+
 #include <algorithm>
 #include <cstdio>
 
@@ -54,11 +56,13 @@ std::string json_string_array(const std::vector<std::string>& values) {
     return out;
 }
 
-// Every 4-byte aligned s_endpgm word. Microcode is word-aligned, so an aligned
-// scan is the right granularity.
+// Every 4-byte aligned terminator word. Microcode is word-aligned, so an aligned
+// scan is the right granularity. The terminator table lives in the Phase 4 ISA
+// module (s_endpgm, s_endpgm_saved, s_endpgm_ordered_ps_done; s_code_end is not
+// a terminator), so there is exactly one copy of it.
 void find_terminators(const uint8_t* payload, uint32_t payload_size, std::vector<uint32_t>& out) {
     for (uint32_t off = 0; off + 4 <= payload_size; off += 4) {
-        if (rd32le(payload + off) == kXs2Endpgm) {
+        if (sc_isa_is_terminator_word(rd32le(payload + off))) {
             out.push_back(off);
         }
     }
@@ -187,14 +191,19 @@ sc_xs2_discovery sc_xs2_discover(const void* data, size_t size, uint32_t payload
         d.terminator_offsets.push_back(payload_offset + off);
     }
     if (terminators.empty()) {
-        d.evidence.push_back("observed: no s_endpgm word (0xBF810000) anywhere in the payload");
+        d.evidence.push_back("observed: no SOPP terminator word (s_endpgm, s_endpgm_saved or "
+                             "s_endpgm_ordered_ps_done) anywhere in the payload");
         d.open_questions.push_back(
-            "if the corpus shows XS2 payloads without s_endpgm, the terminator assumption is wrong for this title");
+            "if the corpus shows XS2 payloads without a documented terminator, the terminator assumption is "
+            "wrong for this title");
         return d;
     }
 
     const uint32_t first_terminator = terminators.front();
-    d.evidence.push_back("observed: " + std::to_string(terminators.size()) + " s_endpgm word(s) at 0x" +
+    const sc_isa_terminator first_kind =
+        sc_isa_decode_word(rd32le(payload + first_terminator)).terminator;
+    d.evidence.push_back("observed: " + std::to_string(terminators.size()) + " terminator word(s), first is " +
+                         std::string(sc_isa_terminator_name(first_kind)) + " at 0x" +
                          std::to_string(payload_offset + first_terminator));
     if (first_terminator / 4 + 1 < kMinCodeWords) {
         d.evidence.push_back("observed: first terminator after only " + std::to_string(first_terminator / 4) +

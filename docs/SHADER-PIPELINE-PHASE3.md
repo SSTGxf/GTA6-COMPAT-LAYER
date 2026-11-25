@@ -7,7 +7,7 @@ wired into the boot path, nothing was built into the layer, no boot was run, not
 or pushed, and `F:\ScarlettCompat` was not read, written, built or run in.
 
 - Tree: `D:\ScarlettCompat-shader` only.
-- Suites: Phase 0 **128/128**, Phase 2 **35/35**, Phase 3 full **798/798**, Phase 3 no-DXC **722/722**, all exit 0.
+- Suites: Phase 0 **125/125**, Phase 2 **35/35**, Phase 3 full **804/804**, Phase 3 no-DXC **728/728**, all exit 0.
   (Counts are after the review pass in §8, which deleted redundant fields and their assertions.)
 
 ---
@@ -123,7 +123,17 @@ DXBC-wrapped microcode -> kind=rdna2_xs2 envelope=dxbc-chunk:XS20
 two s_endpgm words -> 2 regions
 no terminator -> kind=unknown ; 4-word blob with terminator -> kind=unknown (both refused)
 unaligned payload -> kind=unknown
+terminator 0xbf9b0000 -> kind=rdna2_xs2 regions=1
+terminator 0xbf9e0000 -> kind=rdna2_xs2 regions=1
 ```
+
+The region scan accepts every documented SOPP terminator — `s_endpgm` (0xBF810000),
+`s_endpgm_saved` (0xBF9B0000) and `s_endpgm_ordered_ps_done` (0xBF9E0000) — because a pixel shader
+may end with the PS-done form, and a single-constant scan would have classified such a payload as
+unknown. `s_code_end` (0xBF9F0000) is a code marker and is **not** accepted. The table lives in
+`sc_isa.h` (Phase 4) so the prober and the instruction walker share one copy. Which forms this
+title's payloads actually use is for the corpus to show; the set is documented ISA, the choice to
+accept all three is inferred from "a shader can end any of these ways".
 
 ### 3.4 Unknown handling and fuzz
 
@@ -139,7 +149,7 @@ fuzz: 300 pseudo-random blobs (0..600 bytes) -> 300 unknown, 0 false reusable, n
 
 `build_frontend_test.bat` builds `sc_frontend_nodxc.exe` from `sc_sha256.cpp`, `sc_container.cpp`,
 `sc_xs2.cpp`, `sc_frontend.cpp` and the harness **without** `sc_dxil_emit.cpp` in the link line. It
-runs every non-dxc case: **722 checks, 0 failed**. If the frontend ever grows an emitter dependency,
+runs every non-dxc case: **728 checks, 0 failed**. If the frontend ever grows an emitter dependency,
 that build stops linking. HLSL→DXIL emission remains in `sc_dxil_backend` / `sc_dxil_emit`, optional
 and replaceable.
 
@@ -178,7 +188,7 @@ than a hole in it.
 
 Every discovery line is prefixed. Examples:
 
-- `observed: 1 s_endpgm word(s) at 0x6c` — the word at that offset really is `0xBF810000`.
+- `observed: 1 terminator word(s), first is s_endpgm at 0x6c` — the word at that offset really is `0xBF810000`.
 - `observed: payload size is not a multiple of 4` — measured, then the payload is rejected.
 - `inferred: header field @0 = 112 looks like payload_size` — a guess about layout.
 - `inferred: code region starts at the code_offset field value 16` — derived, not documented.
@@ -226,8 +236,8 @@ Re-copy `include/shader/`, `src/shader/` and `tests/shader/` wholesale. This age
 cd /d D:\ScarlettCompat-shader
 tests\shader\build_shader_tests.bat    :: Phase 0: 128 checks, 0 failed
 tests\shader\build_triangle_test.bat   :: Phase 2:  35 checks, 0 failed (real GPU)
-tests\shader\build_frontend_test.bat   :: Phase 3: 798 checks, 0 failed (full)
-                                       ::          722 checks, 0 failed (no-DXC build)
+tests\shader\build_frontend_test.bat   :: Phase 3: 804 checks, 0 failed (full)
+                                       ::          728 checks, 0 failed (no-DXC build)
 ```
 
 Phase 3 coverage: real SM 6.7 containers for vs/ps/gs/hs/ds/cs/ms; carving behind a 64-byte prefix;
@@ -251,9 +261,9 @@ source of truth:
 | `sc_xs2_confidence` enum | a two-level enum for one bit; now `code_start_corroborated` |
 | `sc_xs2_field_candidate::inferred`, `::consistent` | both were constant-true: a candidate is only reported when corroborated, and every header field is inferred by definition |
 | `sc_xs2_code_region::word_count` | derived from `end - begin` |
-| `sc_xs2_is_endpgm()` | unused helper; callers compare against `kXs2Endpgm` |
+| `sc_xs2_is_endpgm()` | unused helper; the scan now asks `sc_isa_is_terminator_word` (Phase 4) |
 | "count or version" header guesses | speculation with no testable rule |
 
 The counts moved because the deleted fields had assertions attached to them: Phase 3 full
-**837 -> 798**, no-DXC **747 -> 722**. No case was dropped — real dxc containers for vs/ps/gs/hs/ds/cs/ms,
+**837 -> 798**, no-DXC **747 -> 722** (later terminator work took them to **804** / **728**). No case was dropped — real dxc containers for vs/ps/gs/hs/ds/cs/ms,
 the synthetic eight-stage matrix, SM5, XS2, unknown/fuzz and JSON are all still covered.

@@ -40,7 +40,8 @@ set "LIB=%MSVC%\lib\x64;%SDKROOT%\Lib\%SDKVER%\ucrt\x64;%SDKROOT%\Lib\%SDKVER%\u
 
 if not exist "out\shader_tests" mkdir "out\shader_tests"
 
-set "FRONTEND_SRC=src\shader\sc_sha256.cpp src\shader\sc_container.cpp src\shader\sc_xs2.cpp src\shader\sc_frontend.cpp"
+rem sc_isa.cpp supplies the terminator table sc_xs2.cpp scans for.
+set "FRONTEND_SRC=src\shader\sc_sha256.cpp src\shader\sc_container.cpp src\shader\sc_isa.cpp src\shader\sc_xs2.cpp src\shader\sc_frontend.cpp"
 
 echo Using MSVC: %MSVC%
 echo Using SDK : %SDKVER%

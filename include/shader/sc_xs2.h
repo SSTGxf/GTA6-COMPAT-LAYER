@@ -11,8 +11,11 @@
 //   That is what is needed to triage the first real corpus dump.
 //
 // OBSERVED vs INFERRED
-//   OBSERVED: the terminator 0xBF810000 is the documented GCN/RDNA `s_endpgm`
-//   encoding; its presence and offsets are read from the blob. Evidence lines
+//   OBSERVED: a region ends on one of the documented SOPP terminators --
+//   s_endpgm (0xBF810000), s_endpgm_saved (0xBF9B0000) or
+//   s_endpgm_ordered_ps_done (0xBF9E0000). The table lives in sc_isa.h so there
+//   is one copy; s_code_end is a marker, not a terminator. Presence and offsets
+//   are read from the blob. Evidence lines
 //   that start with "observed:" report only such facts.
 //   INFERRED: no real Scarlett shader has been seen, so every header field is a
 //   candidate found by self-consistency (a dword equal to the payload size, a

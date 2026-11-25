@@ -5,8 +5,10 @@
 //
 // The encoding table is pinned against words produced by a real assembler
 // (LLVM MC test vectors, quoted with their source line next to each fixture), so
-// the decoder is not only self-consistent. The walk cases then cover every stop
-// reason, and the last section goes through the Phase 3 frontend so the
+// the decoder is not only self-consistent. Terminator opcodes come from AMD's
+// machine-readable RDNA2 ISA (not from an assembler), and are labelled as such.
+// The walk cases then cover every stop reason, including the settled MIMG stop,
+// and the last section goes through the Phase 3 frontend so the
 // frontend -> code region -> instruction stream seam is exercised end to end.
 #include "shader/sc_frontend.h"
 #include "shader/sc_isa.h"
@@ -55,21 +57,20 @@ std::vector<uint8_t> u32s(std::initializer_list<uint32_t> values) {
     return v;
 }
 
-struct word_fixture {
-    const char* label;
-    uint32_t word;
-    sc_isa_format format;
-    uint32_t words;
-    bool opcode_known;
-    uint16_t opcode;
-    sc_isa_extra extra;
-};
-
 // ------------------------------------------------------- assembler word table
 // Source: LLVM test/MC/AMDGPU (gfx10 disassembly/assembly tests). Each comment
 // keeps the quoted encoding line so the constant can be re-checked.
 void test_assembler_words() {
     banner("decoder table pinned to real assembler output (LLVM MC, gfx10)");
+    struct word_fixture {
+        const char* label;
+        uint32_t word;
+        sc_isa_format format;
+        uint32_t words;
+        bool opcode_known;
+        uint16_t opcode;
+        sc_isa_extra extra;
+    };
     const word_fixture fixtures[] = {
         // s_mov_b32 s1, s2      -> encoding: [0x02,0x03,0x81,0xbe]
         {"s_mov_b32 s1, s2", 0xBE810302u, sc_isa_format::sop1, 1, true, 3, sc_isa_extra::none},
@@ -84,11 +85,22 @@ void test_assembler_words() {
         // v_mov_b32_sdwa v0, s105 -> [0xf9,0x02,0x00,0x7e, 0x69,0x16,0x86,0x00]
         {"v_mov_b32_sdwa v0, s105", 0x7E0002F9u, sc_isa_format::vop1, 2, true, 1, sc_isa_extra::sdwa},
         // v_cmp_eq_f32_e64 s105, v0, s105 -> [0x69,0x00,0x02,0xd4, 0x00,0xd3,0x00,0x00]
-        {"v_cmp_eq_f32_e64 s105, v0, s105", 0xD4020069u, sc_isa_format::vop3, 2, false, 0, sc_isa_extra::none},
+        // VOP3 opcode is bits 25:16 (10 bits); 2 is v_cmp_eq_f32 in that space,
+        // confirmed across the 426 vop3 mnemonics of the conformance matrix.
+        {"v_cmp_eq_f32_e64 s105, v0, s105", 0xD4020069u, sc_isa_format::vop3, 2, true, 2, sc_isa_extra::none},
         // v_cmp_eq_f32_sdwa s105, v0, s105 -> [0xf9,0xd2,0x04,0x7c, 0x00,0xe9,0x06,0x86]
         {"v_cmp_eq_f32_sdwa s105, v0, s105", 0x7C04D2F9u, sc_isa_format::vopc, 2, true, 2, sc_isa_extra::sdwa},
         // flat_load_dword v1, v[3:4] -> [0x00,0x00,0x30,0xdc, 0x03,0x00,0x7d,0x01]
         {"flat_load_dword v1, v[3:4]", 0xDC300000u, sc_isa_format::flat, 2, false, 0, sc_isa_extra::none},
+        // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 2), 3
+        //   gfx1010: [0x01,0x08,0x80,0xba,0x03,0x00,0x00,0x00]  -> 64-bit SOPK, opcode 0x15
+        {"s_setreg_imm32_b32 hwreg(MODE,0,2), 3", 0xBA800801u, sc_isa_format::sopk, 2, true, 21,
+         sc_isa_extra::imm32},
+        // s_nop 0               -> encoding: [0x00,0x00,0x80,0xbf]
+        // (also the padding dword of SOPP's 64-bit relaxation form, see below)
+        {"s_nop 0", 0xBF800000u, sc_isa_format::sopp, 1, true, 0, sc_isa_extra::none},
+        // s_branch 2            -> encoding: [0x02,0x00,0x82,0xbf]
+        {"s_branch 2", 0xBF820002u, sc_isa_format::sopp, 1, true, 2, sc_isa_extra::none},
         // s_endpgm              -> encoding: [0x00,0x00,0x81,0xbf]
         {"s_endpgm", 0xBF810000u, sc_isa_format::sopp, 1, true, 1, sc_isa_extra::none},
     };
@@ -96,16 +108,71 @@ void test_assembler_words() {
     for (const auto& f : fixtures) {
         const sc_isa_instruction inst = sc_isa_decode_word(f.word);
         const bool match = inst.format == f.format && inst.words == f.words && inst.extra == f.extra &&
-                           inst.opcode_known == f.opcode_known && (!f.opcode_known || inst.opcode == f.opcode) &&
-                           inst.is_endpgm == (std::strcmp(f.label, "s_endpgm") == 0);
+                           inst.opcode_known == f.opcode_known && (!f.opcode_known || inst.opcode == f.opcode);
         CHECK(match);
         std::printf("   %-34s 0x%08x -> %-6s words=%u op=%s%u extra=%s%s\n", f.label, f.word,
                     sc_isa_format_name(inst.format), inst.words, inst.opcode_known ? "" : "?",
-                    inst.opcode, sc_isa_extra_name(inst.extra), inst.is_endpgm ? " ENDPGM" : "");
+                    inst.opcode, sc_isa_extra_name(inst.extra),
+                    inst.is_terminator() ? " TERMINATOR" : "");
         if (!match) {
             std::printf("      expected %s words=%u extra=%s\n", sc_isa_format_name(f.format), f.words,
                         sc_isa_extra_name(f.extra));
         }
+    }
+}
+
+// ------------------------------------------------------------ terminators
+// Opcode numbers: AMD machine-readable RDNA2 ISA (s_endpgm 1, s_endpgm_saved 27,
+// s_endpgm_ordered_ps_done 30, s_code_end 31). SOPP layout puts the opcode at
+// bits 22:16 over the 0xBF800000 base, so the whole words are as below. These are
+// documented encodings, not assembler-verified ones.
+void test_terminators() {
+    banner("terminators: every documented SOPP form, and s_code_end excluded");
+    struct term_case {
+        const char* label;
+        uint32_t word;
+        sc_isa_terminator expected;
+    };
+    const term_case cases[] = {
+        {"s_endpgm", 0xBF810000u, sc_isa_terminator::s_endpgm},
+        {"s_endpgm_saved", 0xBF9B0000u, sc_isa_terminator::s_endpgm_saved},
+        {"s_endpgm_ordered_ps_done", 0xBF9E0000u, sc_isa_terminator::s_endpgm_ordered_ps_done},
+        {"s_code_end (marker, not a terminator)", 0xBF9F0000u, sc_isa_terminator::none},
+        {"s_branch (SOPP opcode 2)", 0xBF820000u, sc_isa_terminator::none},
+    };
+    for (const auto& c : cases) {
+        const sc_isa_instruction inst = sc_isa_decode_word(c.word);
+        CHECK(inst.format == sc_isa_format::sopp);
+        CHECK(inst.terminator == c.expected);
+        CHECK(inst.is_terminator() == (c.expected != sc_isa_terminator::none));
+        CHECK(sc_isa_is_terminator_word(c.word) == (c.expected != sc_isa_terminator::none));
+        std::printf("   %-38s 0x%08x -> opcode=%u terminator=%s\n", c.label, c.word, inst.opcode,
+                    sc_isa_terminator_name(inst.terminator));
+    }
+
+    // Each form ends a stream cleanly when it is the last word.
+    for (const auto& c : cases) {
+        if (c.expected == sc_isa_terminator::none) {
+            continue;
+        }
+        const std::vector<uint8_t> bytes = u32s({0x7E000269u, c.word});
+        const sc_isa_walk w = sc_isa_walk_stream(bytes.data(), bytes.size());
+        CHECK(w.synced);
+        CHECK(w.stop == sc_isa_stop::terminator);
+        CHECK(w.terminator == c.expected);
+        CHECK(w.stop_offset == bytes.size());
+        std::printf("   walk ending in %-24s synced=%d bytes_covered=%u\n", c.label, w.synced ? 1 : 0,
+                    w.bytes_covered);
+    }
+
+    // s_code_end at the end of a region is not a termination: the walk must keep
+    // going and report that no terminator was found, not claim success.
+    {
+        const std::vector<uint8_t> bytes = u32s({0x7E000269u, 0xBF9F0000u});
+        const sc_isa_walk w = sc_isa_walk_stream(bytes.data(), bytes.size());
+        CHECK(!w.synced);
+        CHECK(w.stop == sc_isa_stop::no_terminator);
+        std::printf("   s_code_end last -> stop=%s (correctly not a terminator)\n", sc_isa_stop_name(w.stop));
     }
 }
 
@@ -137,16 +204,163 @@ void test_format_buckets() {
         std::printf("   %-8s 0x%08x -> %-8s words=%u\n", b.label, b.word, sc_isa_format_name(inst.format),
                     inst.words);
     }
-    // s_branch (SOPP opcode 2) must not be mistaken for a terminator.
-    const sc_isa_instruction branch = sc_isa_decode_word(0xBF820000u);
-    CHECK(!branch.is_endpgm);
+}
+
+// ------------------------------------------------ S_SETREG_IMM32_B32 (64-bit SOPK)
+// GFX10 encodes this as SOPK opcode 0x15 with the immediate in the second dword
+// (LLVM SOPK_Real64<0x015> for gfx6_gfx7_gfx10_gfx13; assembler bytes from the
+// gfx1010 setreg test lines). It used to be walked as one dword, which desynced
+// the rest of any stream containing it.
+void test_setreg_imm32() {
+    banner("S_SETREG_IMM32_B32: verified 64-bit SOPK form is stepped, not desynced");
+
+    // hwreg(HW_REG_MODE, 0, 2), 3 on gfx1010.
+    const uint32_t word0 = 0xBA800801u;
+    const uint32_t word1 = 0x00000003u;
+    const sc_isa_instruction inst = sc_isa_decode_word(word0);
+    CHECK(inst.format == sc_isa_format::sopk);
+    CHECK(inst.words == 2);
+    CHECK(inst.opcode_known);
+    CHECK(inst.opcode == 0x15);
+    CHECK(inst.extra == sc_isa_extra::imm32);
+    CHECK(std::string(sc_isa_extra_name(inst.extra)) == "imm32");
+    std::printf("   0x%08x -> %s opcode=0x%x words=%u extra=%s\n", word0, sc_isa_format_name(inst.format),
+                inst.opcode, inst.words, sc_isa_extra_name(inst.extra));
+
+    // Every other SOPK instruction stays one dword: s_addk_i32 s2, 6.
+    const sc_isa_instruction addk = sc_isa_decode_word(0xB7020006u);
+    CHECK(addk.format == sc_isa_format::sopk);
+    CHECK(addk.opcode == 0x0e);
+    CHECK(addk.words == 1);
+    CHECK(addk.extra == sc_isa_extra::none);
+    std::printf("   0x%08x -> s_addk_i32 opcode=0x%x words=%u (unchanged)\n", 0xB7020006u, addk.opcode,
+                addk.words);
+
+    // The stream keeps synchronisation across it: vop1; setreg+imm; s_endpgm.
+    {
+        const std::vector<uint8_t> bytes = u32s({0x7E000269u, word0, word1, 0xBF810000u});
+        const sc_isa_walk w = sc_isa_walk_stream(bytes.data(), bytes.size());
+        CHECK(w.synced);
+        CHECK(w.stop == sc_isa_stop::terminator);
+        CHECK(w.bytes_covered == bytes.size());
+        CHECK(w.instructions.size() == 3);
+        CHECK(w.instructions[1].offset == 4);
+        CHECK(w.instructions[1].words == 2);
+        CHECK(w.instructions[1].dwords[1] == word1);
+        CHECK(w.instructions[2].offset == 12);
+        std::printf("   walk through it -> synced=%d instructions=%zu bytes_covered=%u next_offset=%u\n",
+                    w.synced ? 1 : 0, w.instructions.size(), w.bytes_covered, w.instructions[2].offset);
+    }
+
+    // A setreg at the very end is a truncation, not a silent one-word step.
+    {
+        const std::vector<uint8_t> cut = u32s({word0});
+        const sc_isa_walk w = sc_isa_walk_stream(cut.data(), cut.size());
+        CHECK(!w.synced);
+        CHECK(w.stop == sc_isa_stop::truncated);
+        CHECK(w.stop_offset == 0);
+        CHECK(w.instructions.empty());
+        std::printf("   missing immediate -> stop=%s at %u\n", sc_isa_stop_name(w.stop), w.stop_offset);
+    }
+
+    // The GFX9 numbering (0x14) is not a GFX10 encoding: documented here so the
+    // distinction is visible rather than discovered by a wrong step later.
+    const sc_isa_instruction gfx9 = sc_isa_decode_word(0xBA000801u);
+    CHECK(gfx9.format == sc_isa_format::sopk);
+    CHECK(gfx9.opcode == 0x14);
+    CHECK(gfx9.words == 1);
+    std::printf("   0x%08x -> SOPK opcode=0x%x words=%u (GFX9 numbering, not stepped as the GFX10 form)\n",
+                0xBA000801u, gfx9.opcode, gfx9.words);
+}
+
+// ------------------------------------------ SOPP 64-bit relaxation / padding
+// LLVM's SOPP_Real_64 (used only by the branch-relaxation `_pad_s_nop` forms)
+// keeps the normal 32-bit SOPP word and appends a second dword with
+// Inst{63-55} = 0x17f and everything else zero, i.e. 0xBF800000 -- exactly the
+// assembler encoding of `s_nop 0`. So the 64-bit form is byte-identical to a
+// 32-bit SOPP followed by an s_nop 0, and one-dword stepping is the only reading
+// that does not invent a distinction.
+void test_sopp_relaxation() {
+    banner("SOPP 64-bit relaxation form: the pad dword is s_nop 0, so one-dword stepping is exact");
+
+    // Same derivation as the encoding class: bits 63:55 hold the SOPP prefix.
+    const uint32_t pad = 0xBF800000u;
+    CHECK(pad == (0x17Fu << 23));
+    const sc_isa_instruction pad_inst = sc_isa_decode_word(pad);
+    CHECK(pad_inst.format == sc_isa_format::sopp);
+    CHECK(pad_inst.words == 1);
+    CHECK(pad_inst.opcode == 0); // s_nop
+    CHECK(!pad_inst.is_terminator());
+    CHECK(!sc_isa_is_terminator_word(pad));
+    std::printf("   pad 0x%08x == 0x17F<<23 -> %s opcode=%u (s_nop) words=%u terminator=%s\n", pad,
+                sc_isa_format_name(pad_inst.format), pad_inst.opcode, pad_inst.words,
+                sc_isa_terminator_name(pad_inst.terminator));
+
+    // s_branch 2 -> [0x02,0x00,0x82,0xbf] (llvm/test/MC/AMDGPU/sopp.s).
+    const uint32_t branch = 0xBF820002u;
+    const sc_isa_instruction br = sc_isa_decode_word(branch);
+    CHECK(br.format == sc_isa_format::sopp);
+    CHECK(br.words == 1);
+    CHECK(br.opcode == 2);
+
+    // Relaxed form in a stream: branch + pad + endpgm. The pad is a nop, and the
+    // instruction after the pair is at the same offset under either reading.
+    {
+        const std::vector<uint8_t> bytes = u32s({branch, pad, 0xBF810000u});
+        const sc_isa_walk w = sc_isa_walk_stream(bytes.data(), bytes.size());
+        CHECK(w.synced);
+        CHECK(w.instructions.size() == 3);
+        CHECK(w.bytes_covered == bytes.size());
+        CHECK(w.instructions[0].offset == 0);
+        CHECK(w.instructions[1].offset == 4);
+        CHECK(w.instructions[1].opcode == 0);
+        CHECK(w.instructions[2].offset == 8);
+        std::printf("   branch + pad + endpgm -> synced=%d offsets=%u,%u,%u\n", w.synced ? 1 : 0,
+                    w.instructions[0].offset, w.instructions[1].offset, w.instructions[2].offset);
+    }
+
+    // Without a terminator both words are still consumed: no desync, just no end.
+    {
+        const std::vector<uint8_t> bytes = u32s({branch, pad});
+        const sc_isa_walk w = sc_isa_walk_stream(bytes.data(), bytes.size());
+        CHECK(!w.synced);
+        CHECK(w.stop == sc_isa_stop::no_terminator);
+        CHECK(w.instructions.size() == 2);
+        CHECK(w.bytes_covered == 8);
+        std::printf("   branch + pad alone -> stop=%s, %zu instructions, %u bytes (both words consumed)\n",
+                    sc_isa_stop_name(w.stop), w.instructions.size(), w.bytes_covered);
+    }
+
+    // The same bytes also spell vop1 + genuine s_nop 0 padding. Nothing in the
+    // bytes separates the two, which is why no length rule is attached to them.
+    {
+        const std::vector<uint8_t> genuine = u32s({0x7E000269u, pad, 0xBF810000u});
+        const sc_isa_walk w = sc_isa_walk_stream(genuine.data(), genuine.size());
+        CHECK(w.synced);
+        CHECK(w.instructions.size() == 3);
+        std::printf("   vop1 + s_nop 0 + endpgm -> synced=%d instructions=%zu (same reading)\n", w.synced ? 1 : 0,
+                    w.instructions.size());
+    }
+
+    // No GFX10 terminator has a 64-bit form (S_ENDPGM, S_ENDPGM_SAVED and
+    // S_ENDPGM_ORDERED_PS_DONE are all SOPP_Real_32 in LLVM), but padding after a
+    // terminator is reported rather than swallowed.
+    {
+        const std::vector<uint8_t> bytes = u32s({0xBF810000u, pad});
+        const sc_isa_walk w = sc_isa_walk_stream(bytes.data(), bytes.size());
+        CHECK(!w.synced);
+        CHECK(w.stop == sc_isa_stop::trailing_after_terminator);
+        CHECK(w.stop_offset == 4);
+        std::printf("   endpgm + pad -> stop=%s at %u (padding is reported, never swallowed)\n",
+                    sc_isa_stop_name(w.stop), w.stop_offset);
+    }
 }
 
 // --------------------------------------------------------------- stream walks
 void test_walk_cases() {
     banner("stream walk: every stop reason");
 
-    const struct {
+    struct walk_case {
         const char* label;
         std::vector<uint8_t> bytes;
     } cases[] = {
@@ -155,19 +369,20 @@ void test_walk_cases() {
         {"flat 64-bit", u32s({0xDC300000u, 0x017D0003u, 0xBF810000u})},
         {"two vop2 then endpgm", u32s({0x00000000u, 0x00000000u, 0xBF810000u})},
         {"dpp extra dword", u32s({0x7E0002FAu, 0x00000000u, 0xBF810000u})},
+        {"ordered_ps_done", u32s({0xBE810302u, 0xBF9E0000u})},
     };
     CHECK(cases[0].bytes.size() == 16);
 
     for (const auto& c : cases) {
         const sc_isa_walk w = sc_isa_walk_stream(c.bytes.data(), c.bytes.size());
         CHECK(w.synced);
-        CHECK(w.stop == sc_isa_stop::s_endpgm);
+        CHECK(w.stop == sc_isa_stop::terminator);
         CHECK(w.stop_offset == c.bytes.size());
         CHECK(w.bytes_covered == c.bytes.size());
         CHECK(!w.instructions.empty());
-        CHECK(w.instructions.back().is_endpgm);
-        std::printf("   %-24s synced=%d instructions=%zu literal_words=%u formats=%s\n", c.label, w.synced ? 1 : 0,
-                    w.instructions.size(), w.literal_words, w.format_histogram_json().c_str());
+        CHECK(w.instructions.back().is_terminator());
+        std::printf("   %-24s synced=%d instructions=%zu literal_words=%u terminator=%s\n", c.label, w.synced ? 1 : 0,
+                    w.instructions.size(), w.literal_words, sc_isa_terminator_name(w.terminator));
     }
 
     // The literal stream must consume its constant as a dword, not as an opcode.
@@ -186,6 +401,7 @@ void test_walk_cases() {
         CHECK(!w.synced);
         CHECK(w.stop == sc_isa_stop::no_terminator);
         CHECK(w.stop_offset == 4);
+        CHECK(w.terminator == sc_isa_terminator::none);
         std::printf("   no terminator -> stop=%s\n", sc_isa_stop_name(w.stop));
     }
     // Trailing bytes after the terminator.
@@ -193,11 +409,11 @@ void test_walk_cases() {
         const std::vector<uint8_t> trailing = u32s({0xBF810000u, 0x7E000269u});
         const sc_isa_walk w = sc_isa_walk_stream(trailing.data(), trailing.size());
         CHECK(!w.synced);
-        CHECK(w.stop == sc_isa_stop::trailing_after_endpgm);
+        CHECK(w.stop == sc_isa_stop::trailing_after_terminator);
         CHECK(w.stop_offset == 4);
-        std::printf("   trailing after endpgm -> stop=%s at %u\n", sc_isa_stop_name(w.stop), w.stop_offset);
+        std::printf("   trailing after terminator -> stop=%s at %u\n", sc_isa_stop_name(w.stop), w.stop_offset);
     }
-    // MIMG stops with an explicit reason instead of guessing NSA length.
+    // MIMG is the settled stop: the walk reports it and keeps the verified prefix.
     {
         const std::vector<uint8_t> img = u32s({0x7E000269u, 0xF0000000u, 0xBF810000u});
         const sc_isa_walk w = sc_isa_walk_stream(img.data(), img.size());
@@ -205,8 +421,13 @@ void test_walk_cases() {
         CHECK(w.stop == sc_isa_stop::mimg_unsupported);
         CHECK(w.stop_offset == 4);
         CHECK(w.instructions.size() == 1);
-        std::printf("   mimg -> stop=%s at %u (instructions=%zu)\n", sc_isa_stop_name(w.stop), w.stop_offset,
-                    w.instructions.size());
+        CHECK(w.bytes_covered == 4);
+        CHECK(w.stop_dword == 0xF0000000u);
+        std::printf("   mimg -> stop=%s at %u (verified prefix %u bytes, %zu instruction)\n",
+                    sc_isa_stop_name(w.stop), w.stop_offset, w.bytes_covered, w.instructions.size());
+        for (const auto& line : w.evidence) {
+            std::printf("      %s\n", line.c_str());
+        }
     }
     // Unknown encoding.
     {
@@ -245,7 +466,7 @@ void test_walk_cases() {
 }
 
 // ------------------------------------------------------------ region + seam
-std::vector<uint8_t> make_xs2_payload(const std::vector<uint8_t>& code) {
+std::vector<uint8_t> make_xs2_payload(const std::vector<uint8_t>& code, uint32_t terminator_word = 0xBF810000u) {
     const uint32_t code_words = static_cast<uint32_t>(code.size() / 4);
     const uint32_t total_words = 4 + code_words;
     std::vector<uint8_t> blob(total_words * 4u, 0);
@@ -254,6 +475,7 @@ std::vector<uint8_t> make_xs2_payload(const std::vector<uint8_t>& code) {
     wr32(blob, 8, 1u);
     wr32(blob, 12, 3u);
     std::memcpy(blob.data() + 16, code.data(), code.size());
+    wr32(blob, 16 + (code_words - 1) * 4u, terminator_word); // last code word
     return blob;
 }
 
@@ -277,23 +499,30 @@ void test_region_and_seam() {
     CHECK(!bad.synced);
     CHECK(bad.stop == sc_isa_stop::truncated);
 
-    // Frontend -> code region -> instruction stream.
-    const std::vector<uint8_t> payload = make_xs2_payload(code);
-    const sc_shader_classification c = sc_classify_shader(payload.data(), payload.size());
-    std::printf("   classify -> kind=%s regions=%zu found=%d\n", c.kind_name(), c.xs2.code_regions.size(),
-                c.xs2.found ? 1 : 0);
-    CHECK(c.kind == sc_payload_kind::rdna2_xs2);
-    CHECK(c.xs2.code_regions.size() == 1);
-    if (!c.xs2.code_regions.empty()) {
+    // Frontend -> code region -> instruction stream, for each documented
+    // termination form the prober accepts.
+    const uint32_t terminators[] = {0xBF810000u, 0xBF9B0000u, 0xBF9E0000u};
+    for (uint32_t term : terminators) {
+        const std::vector<uint8_t> payload = make_xs2_payload(code, term);
+        const sc_shader_classification c = sc_classify_shader(payload.data(), payload.size());
+        std::printf("   classify (term 0x%08x) -> kind=%s regions=%zu found=%d\n", term, c.kind_name(),
+                    c.xs2.code_regions.size(), c.xs2.found ? 1 : 0);
+        CHECK(c.kind == sc_payload_kind::rdna2_xs2);
+        CHECK(c.xs2.code_regions.size() == 1);
+        if (c.xs2.code_regions.empty()) {
+            continue;
+        }
         const sc_xs2_code_region& r = c.xs2.code_regions[0];
         const sc_isa_walk w = sc_isa_walk_region(payload.data(), payload.size(), r.begin, r.end);
         CHECK(w.synced);
-        CHECK(w.instructions.back().offset == r.terminator_offset);
+        CHECK(w.instructions.back().is_terminator());
         CHECK(w.stop_offset == r.end);
-        std::printf("   walk [%u,%u) -> synced=%d instructions=%zu formats=%s\n", r.begin, r.end, w.synced ? 1 : 0,
-                    w.instructions.size(), w.format_histogram_json().c_str());
-        for (const auto& line : w.evidence) {
-            std::printf("      %s\n", line.c_str());
+        std::printf("   walk [%u,%u) -> synced=%d instructions=%zu terminator=%s\n", r.begin, r.end, w.synced ? 1 : 0,
+                    w.instructions.size(), sc_isa_terminator_name(w.terminator));
+        if (term == 0xBF810000u) {
+            for (const auto& line : w.evidence) {
+                std::printf("      %s\n", line.c_str());
+            }
         }
     }
 }
@@ -306,7 +535,16 @@ void test_json() {
     CHECK(a.to_json() == b.to_json());
     const std::string json = a.to_json();
     CHECK(json.find("\"synced\":true") != std::string::npos);
-    CHECK(json.find("\"stop\":\"s_endpgm\"") != std::string::npos);
+    CHECK(json.find("\"stop\":\"terminator\"") != std::string::npos);
+    CHECK(json.find("\"terminator\":\"s_endpgm\"") != std::string::npos);
+    // A setreg walk must expose the 64-bit form in JSON as well.
+    const std::vector<uint8_t> setreg = u32s({0xBA800801u, 0x00000003u, 0xBF810000u});
+    const sc_isa_walk sw = sc_isa_walk_stream(setreg.data(), setreg.size());
+    const std::string sjson = sw.to_json();
+    CHECK(sw.synced);
+    CHECK(sjson.find("\"extra\":\"imm32\"") != std::string::npos);
+    CHECK(sjson.find("\"words\":2") != std::string::npos);
+    CHECK(sjson.find("\"sopk\":1") != std::string::npos);
     CHECK(json.find("\"sop1\":1") != std::string::npos);
     CHECK(json.find("\"vop1\":1") != std::string::npos);
     CHECK(json.find("\"sopp\":1") != std::string::npos);
@@ -325,7 +563,10 @@ int main(int argc, char** argv) {
     std::printf("output dir: %s (this harness writes nothing)\n", out_dir.c_str());
 
     test_assembler_words();
+    test_terminators();
     test_format_buckets();
+    test_setreg_imm32();
+    test_sopp_relaxation();
     test_walk_cases();
     test_region_and_seam();
     test_json();

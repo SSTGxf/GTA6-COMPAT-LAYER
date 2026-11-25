@@ -448,6 +448,20 @@ void test_xs2_fixtures() {
     CHECK(t.xs2.code_regions.size() == 2);
     std::printf("   two s_endpgm words -> %zu regions\n", t.xs2.code_regions.size());
 
+    // The other documented SOPP termination forms are recognised too (the table
+    // lives in sc_isa.h). A payload that ends in either still has a code region,
+    // otherwise a shader using the PS-done form would never reach Phase 4.
+    for (uint32_t term : {0xBF9B0000u, 0xBF9E0000u}) {
+        std::vector<uint8_t> alt = make_xs2_payload(16, true, true);
+        wr32(alt, 16 + 15 * 4, term);
+        const sc_shader_classification a = sc_classify_shader(alt.data(), alt.size());
+        CHECK(a.kind == sc_payload_kind::rdna2_xs2);
+        CHECK(a.xs2.found);
+        CHECK(a.xs2.code_regions.size() == 1);
+        std::printf("   terminator 0x%08x -> kind=%s regions=%zu\n", term, a.kind_name(),
+                    a.xs2.code_regions.size());
+    }
+
     // Negative cases that must NOT be called microcode.
     const std::vector<uint8_t> no_terminator = make_xs2_payload(24, false, true);
     const sc_shader_classification n = sc_classify_shader(no_terminator.data(), no_terminator.size());
