@@ -1066,3 +1066,28 @@ not a proven fix.
 
 Gate instability, measured: #220 `ret=0`, #221 `ret=0`, #222 `ret=1 al=1`,
 #223 `ret=0` — same gate code across those builds, so the verdict is not yet stable.
+
+## §31 #224/#225: the flip is which call is reached, not a race
+
+Same `build_ga224` binary, two boots:
+
+```
+#224 size=512 fourcc='PSIN' beLen=0x80 ret=1 al=1
+     atEnd8=4c534348000000a8 resPages=1/1 firstNonRes=0x0 resExtent=0x1000
+     -> 0xc0000005 at 0x144...
+#225 size=9168400 fourcc='PSIN' beLen=0x3340c0 ret=0 al=0
+     atEnd8=4c534348000004c8 resPages=2239/2239 firstNonRes=0x0 resExtent=0x8bf000
+     -> 0x80000003 at 0x1409DFC18
+```
+
+Residency is refuted: the 9,168,400-byte buffer is fully committed
+(`2239/2239`, `firstNonRes=0x0`, `resExtent=0x8bf000 >= 0x8be2d0`). Byte content is
+identical across boots (`head8`/`atEnd8`/`fourcc` unchanged).
+
+What differs is which gate call the boot reaches first: #224 ends on the small
+512-byte stream (`ret=1`) and dies later in the arena; #225 reaches the
+9,168,400-byte call and is rejected (`ret=0`), reproducibly (#220/#221/#225).
+
+Also measured: `size != beLen` is **not** the reject rule — the 512-byte call has
+`beLen=0x80` with the next chunk at `0x88` (`LSCH len=0xa8`) and is accepted. The
+reject is specific to the large stream's tail. No fix landed in this commit.
