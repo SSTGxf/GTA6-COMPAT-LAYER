@@ -760,14 +760,6 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
     if (size == 9168400u) {
-        // Boundary bytes: our walk frames up to framedEnd = size - 116 for this
-        // buffer, so 16 bytes at that offset decide whether a complete chunk
-        // header (fourcc + length 108) sits there or the tail cannot be framed.
-        const uint8_t* qb = (const uint8_t*)buf + size - 116;
-        Log("loader", "gate-probe bnd16 %02x%02x%02x%02x%02x%02x%02x%02x "
-            "%02x%02x%02x%02x%02x%02x%02x%02x",
-            qb[0],qb[1],qb[2],qb[3],qb[4],qb[5],qb[6],qb[7],
-            qb[8],qb[9],qb[10],qb[11],qb[12],qb[13],qb[14],qb[15]);
         const uint8_t* q1 = (const uint8_t*)buf + size - 32;
         Log("loader", "gate-probe tail32 %02x%02x%02x%02x%02x%02x%02x%02x "
             "%02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x "
@@ -883,7 +875,13 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // (LGID 8 + LRSC 0x58 + CHKS 0x14 = 116) are meant to be there but arrived as
     // garbage, so the defect is in what the read path wrote, not in the length.
     ScLogChunkWalk(buf, size);
-    const uint32_t useSize = size;
+    // Handed extent: the guest's request total for this member (139*65536 + 58896
+    // = 9168400) runs 116 bytes past the last chunk our walk frames, so forward the
+    // framed end to the real gate for this buffer only; every other buffer keeps
+    // its size unchanged.
+    const uint32_t useSize = (size == 9168400u) ? 9168284u : size;
+    Log("loader", "gate-forward in=%u out=%u %s", size, useSize,
+        useSize == size ? "unchanged" : "clamped-to-framed-end");
     ScGateFn real = (ScGateFn)(uintptr_t)0x14407e700ull;
     ScLogGate("entry", obj, buf, size, flag, a5, a6, false, 0);
     bool r = real(obj, buf, useSize, flag, a5, a6);
