@@ -548,6 +548,57 @@ tests\shader\build_conformance_test.bat
 rem -> 37,905 fixtures, 0 failures, out\shader_tests\gfx10_conformance.md
 ```
 
+### Standalone build and link contract
+
+The harness proves the matrix; this proves the code compiles and links as a unit, not just inside one
+test binary. From the repo root:
+
+```bat
+tests\shader\build_all_no_dxc.bat
+```
+
+Measured result (MSVC 14.44.35207, Windows SDK 10.0.26100.0), exit 0:
+
+- `cl -nologo -std:c++17 -EHsc -W4 -WX -DSC_FRONTEND_NO_DXC -Iinclude -c` over all ten no-DXC
+  sources (`sc_sha256`, `sc_container`, `sc_xs2`, `sc_frontend`, `sc_isa`, `sc_wave`, `sc_capture`,
+  `sc_dxil_backend`, `sc_gpu_render_test`, `sc_mesh_compute`): zero warnings at `/W4 /WX`.
+- `sc_dxil_emit.cpp` compiled on its own in its real configuration (without `SC_FRONTEND_NO_DXC`),
+  also zero warnings.
+- The ten objects archived to `out\shader_tests\sc_shader_nodxc.lib`.
+- The same nine compiled again with `-std:c++14`: zero warnings, so nothing here requires C++17.
+
+Only the C++ standard library and the Windows SDK are used. The SDK headers appear in exactly two
+files (`sc_dxil_emit.cpp`, `sc_gpu_render_test.cpp`: `d3d12.h`, `dxgi1_6.h`, `wrl/client.h`,
+`windows.h`); there is no third-party header, no `dxcompiler.h`, and no `dxcompiler.lib` or
+`d3dcompiler.lib` in the link.
+
+**Link contract.** `sc_dxil_backend.cpp` calls `sc_make_dxil_emitter`, which lives in
+`sc_dxil_emit.cpp`. That dependency is checked by a repo script, not by a scratch command:
+
+```bat
+tests\shader\build_link_smoke.bat
+rem -> exit 0, "link contract verified: LNK2019 for sc_make_dxil_emitter without
+rem    sc_dxil_emit.obj, clean link and correct decode with it (/W4 /WX, C++17)"
+```
+
+It compiles the twelve no-DXC sources (the BCn decode module is the twelfth) plus `tests\shader\link_smoke_main.cpp` (a 26-line program that
+decodes `flat_load_dword v5, v[1:2]` = `0xDC300000 0x057D0001`) at `/W4 /WX`, then links twice.
+The negative link — the no-DXC objects alone — must fail, and the script fails if it does not:
+
+```
+sc_dxil_backend.obj : error LNK2019: unresolved external symbol
+  "class std::unique_ptr<class sc::sc_dxil_emitter, ...> sc::sc_make_dxil_emitter(void)"
+  referenced in function sc::sc_dxil_backend::create
+out\shader_tests\link_smoke\link_no_emit.exe : fatal error LNK1120: 1 unresolved externals
+```
+
+The positive link adds `sc_dxil_emit.obj`, links cleanly, and the resulting binary must exit 0 on the
+FLAT row above (it also returns non-zero if the measured `vdst`/`vaddr`/`off` fields come back
+wrong). So a consumer that never touches `sc_dxil_backend` needs only the no-DXC set; any consumer
+of `sc_dxil_backend::create` must also compile and link `src\shader\sc_dxil_emit.cpp`. Nothing else
+is required — no define, no extra import library. `sc_dxil_emit.cpp` is deliberately absent from
+`sc_shader_nodxc.lib`.
+
 ## 9. Independent arbiter: rdna2-dis
 
 `rdna2-dis` (RDNA2/gfx10.3, MIT, tables generated from AMD's machine-readable ISA

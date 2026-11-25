@@ -45,15 +45,16 @@ set "LIB=%MSVC%\lib\x64;%SDKROOT%\Lib\%SDKVER%\ucrt\x64;%SDKROOT%\Lib\%SDKVER%\u
 if not exist "out\shader_tests\all" mkdir "out\shader_tests\all"
 del /q "out\shader_tests\all\*.obj" 2>nul
 
-rem The no-DXC set: everything the decode path may use.
-set "NODXC=src\shader\sc_sha256.cpp src\shader\sc_container.cpp src\shader\sc_xs2.cpp src\shader\sc_frontend.cpp src\shader\sc_isa.cpp src\shader\sc_wave.cpp src\shader\sc_capture.cpp src\shader\sc_dxil_backend.cpp src\shader\sc_gpu_render_test.cpp"
+rem The no-DXC set: everything the decode path may use. sc_bc_decode.cpp needs
+rem -Ithird_party for the vendored bcdec.h it owns; no other source includes it.
+set "NODXC=src\shader\sc_sha256.cpp src\shader\sc_container.cpp src\shader\sc_xs2.cpp src\shader\sc_frontend.cpp src\shader\sc_isa.cpp src\shader\sc_wave.cpp src\shader\sc_capture.cpp src\shader\sc_dxil_backend.cpp src\shader\sc_gpu_render_test.cpp src\shader\sc_mesh_compute.cpp src\shader\sc_pipeline_binding.cpp src\shader\sc_bc_decode.cpp"
 
 echo Using MSVC: %MSVC%
 echo Using SDK : %SDKVER%
 
 echo.
 echo [1/4] compile the no-DXC source set at /W4 /WX
-cl -nologo -std:c++17 -EHsc -W4 -WX -DSC_FRONTEND_NO_DXC -Iinclude -c ^
+cl -nologo -std:c++17 -EHsc -W4 -WX -DSC_FRONTEND_NO_DXC -Iinclude -Ithird_party -c ^
    -Fo:out\shader_tests\all\ %NODXC%
 if errorlevel 1 (
     echo BUILD FAILED all-sources: at least one shader source did not compile cleanly
@@ -66,7 +67,7 @@ echo [2/4] compile the DXC-facing file on its own at /W4 /WX (not linked)
 rem Deliberately WITHOUT -DSC_FRONTEND_NO_DXC: the emitter must be compiled in its
 rem real configuration. (It currently has no such branch, but compiling it under
 rem the no-DXC define would stop catching a stub if one was ever added.)
-cl -nologo -std:c++17 -EHsc -W4 -WX -Iinclude -c ^
+cl -nologo -std:c++17 -EHsc -W4 -WX -Iinclude -Ithird_party -c ^
    -Fo:out\shader_tests\all\ src\shader\sc_dxil_emit.cpp
 if errorlevel 1 (
     echo BUILD FAILED all-sources: sc_dxil_emit.cpp did not compile cleanly
@@ -88,7 +89,7 @@ echo.
 echo [4/4] compile the no-DXC set again at /std:c++14 (the layer's toolchain may not pass /std:c++17)
 if not exist "out\shader_tests\all14" mkdir "out\shader_tests\all14"
 del /q "out\shader_tests\all14\*.obj" 2>nul
-cl -nologo -std:c++14 -EHsc -W4 -WX -DSC_FRONTEND_NO_DXC -Iinclude -c ^
+cl -nologo -std:c++14 -EHsc -W4 -WX -DSC_FRONTEND_NO_DXC -Iinclude -Ithird_party -c ^
    -Fo:out\shader_tests\all14\ %NODXC%
 if errorlevel 1 (
     echo BUILD FAILED cxx14: the shader sources must not require C++17
