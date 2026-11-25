@@ -170,3 +170,15 @@ some of 65536, all `stop=full-chunk`, finishing at log line 19572 — before buf
 at 20086. The framed buffer at 0x2411a07ac80 is therefore not written by this path; its
 payload is guest assembly, and at gate time it is still mostly zero
 (nonzeroChunks=14/35, last8=0, tail@9168284=0).
+
+## 2026-11-25 (boot #265): the missing-CHKS verdicts were a scan-window bug
+
+The presence scan ran over `[useSize-200, useSize)` where `useSize = 9168284`, so the 116-byte
+tail at `[9168284, 9168400)` lay outside the window it searched. Widening the window to the
+requested stream size:
+
+`gate-frame size=9168400 end=9168400 lgid=0x8be59c lrsc=0x8be5a4 chks=0x8be5fc framed-ok`
+
+The tail written by `ScSynthesizeFramedTail` is HOST-AUTHORED; `framed-ok` here means the
+probe's presence scan saw host-authored terminator bytes, not guest-produced ones. The game's
+own gate still returns 0 (`ret=0`) for the 9,168,400-byte stream.

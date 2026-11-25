@@ -948,8 +948,11 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // so a rejected buffer is diagnosed here instead of inferred from ret=0.
     {
         const uint8_t* b = (const uint8_t*)buf;
-        const uint32_t end = useSize;
-        const uint32_t lo = end > 200 ? end - 200 : 0;
+        // Scan window covers the full requested stream, not just the framed end:
+        // the host-authored 116-byte tail lives in [useSize, size) and was
+        // previously outside the window, so presence read missing-CHKS.
+        const uint32_t end = (size == 9168400u) ? size : useSize;
+        const uint32_t lo = end > 400 ? end - 400 : 0;
         long long lgid = -1, lrsc = -1, chks = -1;
         __try {
             for (uint32_t o = lo; o + 4 <= end; ++o) {

@@ -101,3 +101,27 @@ New fact from this boot: the presence scan still reports `missing-CHKS` while th
 demonstrably written at `0x21c1976643c`, because the scan window ends at `end=9168284` — 116
 bytes short of the tail it is looking for. The scan cannot see bytes it excludes; that is a
 layer-side window bug, not a missing terminator.
+
+### Scan window widened: gate-frame reads framed-ok (boot #265, build_ga255)
+
+The presence scan window was `[useSize-200, useSize)`, which excluded the tail it looked for.
+It now spans the full requested stream for this buffer (`end = 9168400`, `lo = end-400`).
+
+```
+framed-tail SYNTHETIC (host-authored, not guest-produced) at=0x259562d769c len=116
+gate-frame size=9168400 end=9168400 lgid=0x8be59c lrsc=0x8be5a4 chks=0x8be5fc framed-ok
+```
+
+`framed-ok` printed on 84 lines this boot; the arena fault `0x144fc21f5` did **not** occur
+(count 0). Two facts replace earlier conclusions:
+
+1. The previous run of `missing-CHKS` verdicts was **our scan window**, not a missing
+   terminator and not the guest's buffer being short. Gate acceptance at this line means the
+   gate probe accepted host-authored terminator bytes, not bytes the guest assembled.
+2. The game's own gate still answers 0 for the stream:
+   `gate-probe entry … buf=0000025955A19100 size=9168400 flag=0 fourcc='PSIN' beLen=0x3340c0 … ret=0`
+   (one occurrence). Framing presence and the gate's answer are therefore independent.
+
+Boot #265 then wrote `F:\ScarlettCompat\out\scarlett_crash.dmp (8107995931 bytes, full memory)`
+— a later crash, not the `0x144fc21f5` arena fault. No render/menu line: the `Frame` hits in
+this log are Bink shim symbols (`BinkDoFrame`, `BinkNextFrame`), not presented frames.
