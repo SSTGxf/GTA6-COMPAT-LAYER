@@ -760,6 +760,14 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
     if (size == 9168400u) {
+        // Boundary bytes: our walk frames up to framedEnd = size - 116 for this
+        // buffer, so 16 bytes at that offset decide whether a complete chunk
+        // header (fourcc + length 108) sits there or the tail cannot be framed.
+        const uint8_t* qb = (const uint8_t*)buf + size - 116;
+        Log("loader", "gate-probe bnd16 %02x%02x%02x%02x%02x%02x%02x%02x "
+            "%02x%02x%02x%02x%02x%02x%02x%02x",
+            qb[0],qb[1],qb[2],qb[3],qb[4],qb[5],qb[6],qb[7],
+            qb[8],qb[9],qb[10],qb[11],qb[12],qb[13],qb[14],qb[15]);
         const uint8_t* q1 = (const uint8_t*)buf + size - 32;
         Log("loader", "gate-probe tail32 %02x%02x%02x%02x%02x%02x%02x%02x "
             "%02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x "

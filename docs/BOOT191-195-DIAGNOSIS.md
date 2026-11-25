@@ -1197,3 +1197,27 @@ gate's `ret=0` is therefore consistent with the bytes present; it is not a resid
 race artefact.
 
 No gate tolerance, assert byte, stream/pack byte or verification constant changed.
+
+## §36 Boundary bytes at size-116: not frameable, and not stable
+
+`bnd16` instrument (16 bytes at `buf + size - 116`, i.e. offset 9,168,284 for the
+9,168,400-byte call), same site as `tail32`, no state added:
+
+```
+232 big=0 tail=0                      (call not reached)
+233 big=3 tail=2 bnd16 0000000042000000 0000000001000200
+234 big=0 tail=0                      (call not reached)
+235 big=3 tail=2 bnd16 0000000000000000 0000000000000000
+```
+
+Two readings, both non-CHKS, neither a plausible fourcc followed by length 108:
+`00 00 00 00` then `42 00 00 00` in #233, and sixteen zero bytes in #235.
+
+Under the stated rule ("ambiguous => not frameable") the branch is: the trailing 116
+bytes are **not** a frameable chunk, so the extent handed to `0x14407e700` must be
+presented as the framed end `9,168,284`.
+
+New fact for the record: those bytes differ between boots (`42 00 00 00 00 00 00 00 01
+00 02 00` vs all zeros), so the region at the boundary is not written consistently —
+consistent with the copy covering only part of the extent, and further reason not to
+frame the tail.
