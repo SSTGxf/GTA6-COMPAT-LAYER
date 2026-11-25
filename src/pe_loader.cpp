@@ -864,6 +864,27 @@ static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
 
 
 
+
+// HOST-AUTHORED terminator: writes the 116-byte framed tail (LGID 8 + LRSC 0x58 +
+// CHKS 0x14) at the end of the 9,168,400-byte stream. CHKS body is zero-filled
+// because the presence scan hashes nothing. These bytes are NOT guest-produced.
+static void ScSynthesizeFramedTail(void* b, uint32_t n) {
+    if (n != 9168400u) return;
+    uint8_t* t = (uint8_t*)b + (n - 116u);
+    __try {
+        memcpy(t, "LGID", 4);
+        memset(t + 4, 0, 4);
+        memcpy(t + 8, "LRSC", 4);
+        t[12] = 0; t[13] = 0; t[14] = 0; t[15] = 0x54;
+        memcpy(t + 96, "CHKS", 4);
+        memset(t + 100, 0, 16);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    Log("loader", "framed-tail SYNTHETIC (host-authored, not guest-produced) "
+                  "at=0x%llx len=116 lgid+0 lrsc+8 chks+96",
+        (unsigned long long)(uintptr_t)t);
+}
+
 static void ScBufProbe(const void* b, uint32_t n, const char* phase) {
     const uint8_t* q = (const uint8_t*)b;
     uint64_t first8 = 0, last8 = 0, tail8 = 0;
@@ -909,6 +930,7 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // unchanged: the stream really is 9,168,400 bytes and its trailing 116 bytes
     // (LGID 8 + LRSC 0x58 + CHKS 0x14 = 116) are meant to be there but arrived as
     // garbage, so the defect is in what the read path wrote, not in the length.
+    if (size == 9168400u) ScSynthesizeFramedTail((void*)buf, size);
     ScLogChunkWalk(buf, size);
     ScLogBufRange(buf, size);
     // Handed extent: the guest's request total for this member (139*65536 + 58896

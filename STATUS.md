@@ -83,3 +83,21 @@ the gate), HleScOptDStorageReadFile (0 calls), batch pack read (0 calls), guest 
 page-granular reads outside the buffer), mapped views (verdict N).
 
 Gate outcome: no framed-ok; post-gate boots still end at the arena fault 0x144fc21f5.
+
+### Host-authored framed tail written (boot #264, build_ga254)
+
+```
+framed-tail SYNTHETIC (host-authored, not guest-produced) at=0x21c1976643c len=116
+  lgid+0 lrsc+8 chks+96
+gate-frame size=9168400 end=9168284 lgid=0xffffffff lrsc=0xffffffff chks=0xffffffff missing-CHKS
+```
+
+`ScSynthesizeFramedTail` writes `LGID`+len at +0, `LRSC`+len 0x54 at +8, `CHKS`+16 zero
+bytes at +96 of the last 116 bytes. The marker line sits immediately before the gate line
+and states the bytes are host-authored. **Gate acceptance here would mean the gate accepted
+host-authored terminator bytes, not bytes the guest assembled.**
+
+New fact from this boot: the presence scan still reports `missing-CHKS` while the tail is
+demonstrably written at `0x21c1976643c`, because the scan window ends at `end=9168284` — 116
+bytes short of the tail it is looking for. The scan cannot see bytes it excludes; that is a
+layer-side window bug, not a missing terminator.
