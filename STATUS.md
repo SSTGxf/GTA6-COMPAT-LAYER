@@ -125,3 +125,23 @@ gate-frame size=9168400 end=9168400 lgid=0x8be59c lrsc=0x8be5a4 chks=0x8be5fc fr
 Boot #265 then wrote `F:\ScarlettCompat\out\scarlett_crash.dmp (8107995931 bytes, full memory)`
 — a later crash, not the `0x144fc21f5` arena fault. No render/menu line: the `Frame` hits in
 this log are Bink shim symbols (`BinkDoFrame`, `BinkNextFrame`), not presented frames.
+
+### Compact crash record names the fault that ends boot #265's successor (boot #266, build_ga256)
+
+The unhandled-exception filter now logs the exception record before dumping, and the dump is
+`MiniDumpNormal` instead of full memory:
+
+```
+crash-record code=0x80000003 addr=0x1409dfc18 rip=0x1409dfc18 rsp=0xf9588fe240
+  stack=[0x10000000000e610,0x2f1dc8af640,0x8bd610,0x1478d57e0] access=0x0
+minidump: wrote F:\ScarlettCompat\out\scarlett_crash.dmp (319363 bytes, compact)
+framed-tail SYNTHETIC (host-authored, not guest-produced) at=0x2f1dd16cbdc len=116
+framed-ok lines: 84
+```
+
+Boot #266 therefore ends at a **breakpoint exception (0x80000003) at 0x1409dfc18** — an address
+inside our own gate/stub region — not at the arena fault and not at a guest module. Dump size
+fell from 8,107,995,931 bytes to 319,363 bytes, so boots no longer leave a multi-GB file.
+
+This is the next thing to fix: an int3 is executing inside the layer's stub area, which means a
+call is arriving at a stub slot that was never redirected.

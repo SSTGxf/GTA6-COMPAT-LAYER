@@ -2455,13 +2455,39 @@ static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* where) {
     mei.ThreadId = GetCurrentThreadId();
     mei.ExceptionPointers = ep;
     mei.ClientPointers = FALSE;
+    // Compact crash record first: the exception code, faulting address and the
+    // guest stack top are what name the failure; the dump itself is downscaled
+    // from full memory so a boot no longer leaves an 8 GB file behind.
+    if (ep && ep->ExceptionRecord) {
+        const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+        uint64_t ip = 0, sp = 0, st0 = 0, st1 = 0, st2 = 0, st3 = 0;
+        if (ep->ContextRecord) {
+            ip = (uint64_t)ep->ContextRecord->Rip;
+            sp = (uint64_t)ep->ContextRecord->Rsp;
+            __try {
+                const uint64_t* st = (const uint64_t*)(uintptr_t)sp;
+                st0 = st[0]; st1 = st[1]; st2 = st[2]; st3 = st[3];
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
+        Log("loader",
+            "crash-record code=0x%08lx addr=0x%llx rip=0x%llx rsp=0x%llx "
+            "stack=[0x%llx,0x%llx,0x%llx,0x%llx] access=0x%llx",
+            (unsigned long)er->ExceptionCode,
+            (unsigned long long)(uintptr_t)er->ExceptionAddress,
+            (unsigned long long)ip, (unsigned long long)sp,
+            (unsigned long long)st0, (unsigned long long)st1,
+            (unsigned long long)st2, (unsigned long long)st3,
+            (unsigned long long)(er->NumberParameters > 1
+                                     ? (uint64_t)er->ExceptionInformation[1] : 0));
+    }
     BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
-                                hFile, MiniDumpWithFullMemory, &mei,
+                                hFile, MiniDumpNormal, &mei,
                                 nullptr, nullptr);
     if (ok) {
         LARGE_INTEGER size = {};
         GetFileSizeEx(hFile, &size);
-        Log("loader", "minidump: wrote %ls (%lld bytes, full memory)",
+        Log("loader", "minidump: wrote %ls (%lld bytes, compact)",
             dumpPath, size.QuadPart);
     } else {
         Log("loader", "minidump: MiniDumpWriteDump failed (err %lu)",
