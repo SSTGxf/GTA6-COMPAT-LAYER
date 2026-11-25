@@ -155,3 +155,10 @@ See `docs/BOOT191-195-DIAGNOSIS.md` §4.
 ### Deterministic raw attribution (boot #203/#204)
 
 `Submit[0] raw copy via deterministic pack D:\game\game\data.rpf (id 0x30000705a4fca4f8 offset=0x1c000 compSize=16)` in both boots; fixed candidate-order coverage scan replaced "last resolved pack".
+
+## 2026-11-25: framed buffer is not a mapped view (boot #261)
+
+`bufRange=0x1c0da096bc0-0x1c0da9551d0 size=9168400` with `guestMapViewOfFile = 0` and
+`guestCreateFileW = 13` on the same boot: no map call, so no view overlap (verdict N).
+The 9,168,400-byte stream is assembled by the guest from page-granular reads, not mapped
+from the pack; the tail at 9,168,284 is the part never written.

@@ -4,3 +4,22 @@
 - The TLS wall (0x140004B5E) is cleared: guest TLS index is 10 at runtime, slot 10 non-null with [+8]=1 on the previously faulting thread.
 - Current wall: guest function 0x1409df9d0 -> 0x1409dfc30 -> gate 0x14407e700 returns false, caller asserts at 0x1409DFC18.
 - DStorage: 139/139 raw pages copied, 0 refused, deterministic pack attribution (data.rpf, id 0x30000705a4fca4f8 offset 0x1c000/16) identical in #203 and #204.
+
+## Mapped-view verdict for the 9,168,400-byte gate buffer (boot #261, build_ga249)
+
+Log `scarlett_boot261.log`: the boot reached the large offer 64 times and printed
+
+```
+bufRange=0x1c0da096bc0-0x1c0da9551d0 size=9168400
+guestMapViewOfFile lines: 0
+guestCreateFileW lines: 13
+```
+
+**Overlap verdict: N — no mapped view intersects the framed buffer**
+(0x1c0da096bc0-0x1c0da9551d0). The guest opens files (13 CreateFileW calls) but never
+calls MapViewOfFile on any boot observed, so the framed buffer is **not** a mapped view.
+
+Consequently the payload reaches the buffer neither by a hooked `ReadFile` destination
+(809 page-granular reads, none in range) nor by a mapped view. What remains is a guest-side
+copy from its own page reads into that buffer, which is invisible to our layer, plus the
+missing 116-byte terminator at offset 9,168,284.

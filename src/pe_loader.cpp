@@ -862,6 +862,13 @@ static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
     return off;
 }
 
+
+static void ScLogBufRange(const void* b, uint32_t n) {
+    Log("loader", "bufRange=0x%llx-0x%llx size=%u",
+        (unsigned long long)(uintptr_t)b,
+        (unsigned long long)((uintptr_t)b + n), n);
+}
+
 static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
                         void* a5, void* a6) {
     // Framing fix: the size the guest hands the parser is its DStorage request
@@ -875,6 +882,7 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // (LGID 8 + LRSC 0x58 + CHKS 0x14 = 116) are meant to be there but arrived as
     // garbage, so the defect is in what the read path wrote, not in the length.
     ScLogChunkWalk(buf, size);
+    ScLogBufRange(buf, size);
     // Handed extent: the guest's request total for this member (139*65536 + 58896
     // = 9168400) runs 116 bytes past the last chunk our walk frames, so forward the
     // framed end to the real gate for this buffer only; every other buffer keeps
@@ -1072,6 +1080,9 @@ static void HookGuestImports(void* base) {
                         g_realGetFileSizeEx = (ScGetFileSizeExFn)cur;
                         want = tname; repl = (void*)&ScHookGetFileSizeEx;
                     } else if (has("CreateFileW", "CreateFileA")) {
+                        g_hookCfW = (ScCreateFileWFn)cur;
+                        want = tname; repl = (void*)&ScHookCreateFileW;
+                    } else if (has("CreateFileMappingW", "CreateFileMappingA")) {
                         g_hookCfW = (ScCreateFileWFn)cur;
                         want = tname; repl = (void*)&ScHookCreateFileW;
                     } else if (has("MapViewOfFile", "MapViewOfFileEx")) {
