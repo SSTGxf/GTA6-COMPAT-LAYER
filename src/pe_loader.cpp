@@ -742,18 +742,40 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
         for (int i = 0; i < 8; ++i) eb[i] = e[i];
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+    unsigned resPages = 0, totPages = 0; long long firstNon = -1;
+    __try {
+        const uint8_t* q0 = (const uint8_t*)buf;
+        for (uint64_t o = 0; o < size; o += 0x1000) {
+            MEMORY_BASIC_INFORMATION m2 = {};
+            const uintptr_t a = (uintptr_t)(q0 + o);
+            ++totPages;
+            if (VirtualQuery((LPCVOID)a, &m2, sizeof(m2)) &&
+                m2.State == MEM_COMMIT &&
+                m2.Protect != PAGE_NOACCESS && (m2.Protect & PAGE_GUARD) == 0) {
+                ++resPages;
+            } else if (firstNon < 0) {
+                firstNon = (long long)o;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
     char fc[5] = {(char)(fourcc >> 24), (char)(fourcc >> 16),
                   (char)(fourcc >> 8), (char)fourcc, 0};
     Log("loader",
         "gate-probe %s tid=%lu obj=%p buf=%p size=%u flag=%u fourcc='%s' "
         "(0x%08x) beLen=0x%x a5=%p a6=%p status=%s%u ret=%d al=%u "
         "head8=%02x%02x%02x%02x%02x%02x%02x%02x "
-        "atEnd8=%02x%02x%02x%02x%02x%02x%02x%02x sumPrev=0x%llx sumNow=0x%llx",
+        "atEnd8=%02x%02x%02x%02x%02x%02x%02x%02x "
+        "resPages=%u/%u firstNonRes=0x%llx resExtent=0x%llx buf=%p "
+        "sumPrev=0x%llx sumNow=0x%llx",
         tag, (unsigned long)GetCurrentThreadId(), obj, buf, size, flag, fc,
         fourcc, blen, a5, a6, statusOk ? "" : "?", status, (int)ret,
         (unsigned)al,
         hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7],
         eb[0], eb[1], eb[2], eb[3], eb[4], eb[5], eb[6], eb[7],
+        resPages, totPages,
+        firstNon < 0 ? (unsigned long long)0 : (unsigned long long)firstNon,
+        (unsigned long long)(resPages * 0x1000ull), buf,
         (unsigned long long)g_gateSum,
         (unsigned long long)(g_gateSum + size));
     g_gateSum += size;
