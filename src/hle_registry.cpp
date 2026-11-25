@@ -2699,6 +2699,21 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
         useClear = &clearCopy;
         clearTranslated = true;
     }
+    // The console layout word (0x100|mode) is not a D3D12_TEXTURE_LAYOUT
+    // value, so forwarding it raw makes the runtime refuse the resource with
+    // E_INVALIDARG. Boot #158: this was the only E_INVALIDARG in the boot and
+    // it was the layout-0x102 resource (every layout-0 resource returned
+    // S_OK). Map it with the rule slot 127 already uses: anything above
+    // 64KB_STANDARD_SWIZZLE becomes UNKNOWN for textures, ROW_MAJOR for
+    // buffers. The console tiling itself is modelled by the layout engine,
+    // not by the desktop object.
+    if ((UINT)desc.Layout >
+        (UINT)D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
+        desc.Layout =
+            (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
     // Boot #88: the mapped-state create returned DXGI_ERROR_DEVICE_REMOVED
     // without any earlier failure, so record whether the device was already
     // gone before this call (reason before) and what it reports after.
@@ -2719,7 +2734,7 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
     Log("xboxdev",
         "CreatePlacedResourceX va=0x%llx desc: dim=%u align=%llu "
         "w=%llu h=%u depth=%u mips=%u fmt=%u sample=%u/%u "
-        "layout=%u flags=0x%x state=0x%x->0x%x clearFmt=%u->%u "
+        "layout=%u->%u flags=0x%x state=0x%x->0x%x clearFmt=%u->%u "
         "devReason=0x%08x/0x%08x ret=0x%llx thread=%lu -> hr=0x%08x res=%p",
         (unsigned long long)va,
         (unsigned)pDesc->Dimension,
@@ -2732,6 +2747,7 @@ static HRESULT WINAPI XboxDevice_CreatePlacedResourceX(
         (unsigned)pDesc->SampleDesc.Count,
         (unsigned)pDesc->SampleDesc.Quality,
         (unsigned)pDesc->Layout,
+        (unsigned)desc.Layout,
         (unsigned)pDesc->Flags,
         (unsigned)initialState,
         (unsigned)state,
