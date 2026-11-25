@@ -706,3 +706,18 @@ size accounting, rather than from the parser.
 No fix landed this pass; the gate is byte-identical, no int3 patch, no forced
 return. Fix target: make the loader supply the full declared chunk length when it
 assembles the stream, using the same path as clip_sets.zmt.
+
+### §17 correction (arithmetic error in the paragraph above)
+
+`0x589F64` is **5,807,972**, not 5,808,996. With `LSNS` at offset 3,360,312 the
+chunk ends at **9,168,284**, i.e. it *fits* inside the 9,168,400-byte buffer with
+**116 bytes left over**. So the stream is **not** short; what remains after the
+last chunk is 116 bytes that are not a valid chunk header (the walk reads
+`0x56d61794` / `0xb4e073cd` there), and the parser treats that trailing region as
+an unknown chunk and returns 0. The "908 bytes short" statement above is wrong and
+is superseded by this paragraph.
+
+Restated cause (measured): framing — the buffer handed to the gate does not end on
+a chunk boundary; 116 trailing bytes follow `LSNS` and are rejected. Whether those
+bytes belong to the stream (padding the parser should accept) or are extra bytes
+the loader should not have included is the open question.
