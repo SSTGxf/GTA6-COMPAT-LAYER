@@ -196,11 +196,11 @@ subsystem, not a dead harness.
 
 ---
 
-## Status — 2026-11-24 (boots through #113, GitHub head `b4f0f1f`)
+## Status — 2026-11-24 (boots through #155, GitHub head `5974f56b`)
 
-**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (113 boots). No game frame yet, no menu yet.**
+**GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (155 boots). No game frame yet, no menu yet.**
 
-**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, new stop int3 at 0x142474CE1; hash gate + memcpy overrun remain open).**
+**Progress: ~44% proven toward first menu, 45% when D1 closes (DEVICE_REMOVED root cause found + fixed, TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, game now hammering slot 86 for PSO creation; slot 86 still E_NOTIMPL, no frame yet).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -228,6 +228,12 @@ subsystem, not a dead harness.
 | Slots 27/39 implemented, null-array wall cleared | ✅ | Boots #102–#113, commit 84103ca |
 | Command signatures, root signatures, descriptor copies forwarded | ✅ | Commit d53d0b1 |
 | 0x1424840C5 crash cleared | ✅ | Boot #113, new stop int3 at 0x142474CE1 |
+| Slot 32: real SetDescriptorHeaps (unwraps heap wrappers) | ✅ | Commit 446b178e, boot #125 |
+| Slots 71/72: S_OK with payload logged | ✅ | Commit 446b178e |
+| WaitFrameEventX: 6-arg form (token is 6th arg) | ✅ | Commit 446b178e, boot #133 |
+| Slot 139: Reset + XMemMapPhysicalPages at guest's base | ✅ | Commit f0a46369, boot #111 |
+| VEH: crash-context logging (TEB, saved rbx, return address) | ✅ | Commit 5974f56b |
+| Game in PSO creation territory (slot 86, 24,000+ calls/boot) | ✅ | Boot #154, slot 86 from game 0x142479A8D |
 | Shader pipeline Phases 0–5 (infrastructure + build gate) | ✅ | Phases 0–5 harness-green (125/35/804/728/236/151), /W4 /WX 0 warnings, on GitHub (commits 7c654f2 + b4f0f1f) |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
