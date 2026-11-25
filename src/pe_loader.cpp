@@ -949,6 +949,17 @@ static BOOL WINAPI ScHookReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD got,
     BOOL r = g_realReadFile(h, buf, want, got, ov);
     const DWORD e = GetLastError();
     const unsigned long long fsz = ScHandleSize(h);
+    if (got && *got < want) {
+        // Short/empty read: record handle, position after the read and the size we
+        // report, so a failing last-partial-page read names its own cause.
+        LARGE_INTEGER z = {}, pos = {};
+        if (g_realSetFilePointerEx) g_realSetFilePointerEx(h, z, &pos, FILE_CURRENT);
+        Log("io",
+            "io shortRead h=%p dst=%llx req=%lu got=%lu pos=%lld fileLen=%llu ret=%d err=%lu",
+            h, (unsigned long long)(uintptr_t)buf, (unsigned long)want,
+            (unsigned long)*got, (long long)pos.QuadPart, ScHandleSize(h), (int)r,
+            (unsigned long)e);
+    }
     Log("io", "io guestReadFile dst=%llx req=%lu got=%lu fileLen=%llu ret=%d err=%lu",
         (unsigned long long)(uintptr_t)buf, (unsigned long)want,
         (unsigned long)(got ? *got : 0), fsz, (int)r, (unsigned long)e);
