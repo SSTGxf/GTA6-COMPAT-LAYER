@@ -69,6 +69,38 @@ typedef struct ScBc1Tables {
 
 void WINAPI ScBc1TablesDefault(ScBc1Tables* tables);
 
+// ---- codecs -------------------------------------------------------------
+//
+// B1 solved the BC1 entropy layer and block assembler. B2 adds the
+// entropy-only lane layouts of the other blocks formats the format
+// description covers. Their block semantics are NOT implemented (that is
+// later work): ScBcpackDecodeLanes returns the lane symbols only.
+//
+// No lane layout is published for BC2, so it stays unsupported.
+enum ScBcpackCodec {
+    SC_BCPACK_CODEC_BC1 = 1,
+    SC_BCPACK_CODEC_BC2 = 2,  // no published lane layout: rejected
+    SC_BCPACK_CODEC_BC3 = 3,
+    SC_BCPACK_CODEC_BC4 = 4,
+    SC_BCPACK_CODEC_BC5 = 5,
+    SC_BCPACK_CODEC_BC6H = 6,
+    SC_BCPACK_CODEC_BC7 = 7,
+};
+
+#define SC_BCPACK_MAX_LANES 16
+
+typedef struct ScBcpackCodecInfo {
+    uint32_t codec;
+    uint32_t lanes;
+    uint32_t widths[SC_BCPACK_MAX_LANES];
+    uint32_t unitsPerBlock;  // coding units (8 bytes) per block
+    uint32_t blockBytes;
+} ScBcpackCodecInfo;
+
+// Fills *out for a codec. Returns 0 when the codec has no known lane layout
+// (BC2), 1 otherwise.
+uint32_t WINAPI ScBcpackCodecLayout(uint32_t codec, ScBcpackCodecInfo* out);
+
 enum ScBcpackStatus {
     SC_BCPACK_OK = 0,
     SC_BCPACK_BAD_PARAMS = 1,        // null pointer / null tables
@@ -80,6 +112,7 @@ enum ScBcpackStatus {
     SC_BCPACK_TRAILING = 7,          // chunk bytes left after every lane ended
     SC_BCPACK_ROUND_LIMIT = 8,       // scheduler made no progress
     SC_BCPACK_NO_OUTPUT = 9,         // internal: assembly needed more symbols
+    SC_BCPACK_UNSUPPORTED_CODEC = 10,// no lane layout (BC2)
 };
 
 const char* WINAPI ScBcpackStatusName(uint32_t status);
@@ -88,8 +121,9 @@ typedef struct ScBcpackDiag {
     uint32_t status;
     uint32_t rounds;
     uint32_t bytesConsumed;
-    uint32_t units;        // completed coding units (BC1 blocks)
-    uint32_t symbols[SC_BCPACK_BC1_LANES];
+    uint32_t units;        // completed coding units (8 output bytes each)
+    uint32_t lanes;        // lanes of the codec that was decoded
+    uint32_t symbols[SC_BCPACK_MAX_LANES];
 } ScBcpackDiag;
 
 // Decode one BC1 chunk: srcBytes of packed chunk, outBytes of standard BC1
@@ -99,6 +133,14 @@ uint32_t WINAPI ScBcpackDecodeBc1(const void* src, uint32_t srcBytes,
                                   uint32_t outBytes,
                                   const ScBc1Tables* tables, void* dst,
                                   ScBcpackDiag* diag);
+
+// Decode only the entropy layer: the lane symbols of `outBytes` of BCn data,
+// written lane after lane (lane 0's symbols, then lane 1's, ...). No block
+// semantics are applied for BC3..BC7. `laneSymbols` must hold
+// lanes * (outBytes / 8) bytes. Fails closed like the BC1 entry point.
+uint32_t WINAPI ScBcpackDecodeLanes(uint32_t codec, const void* src,
+                                   uint32_t srcBytes, uint32_t outBytes,
+                                   void* laneSymbols, ScBcpackDiag* diag);
 
 // ---- model tables (shared with the harness) ------------------------------
 
@@ -120,6 +162,14 @@ uint32_t WINAPI ScBcpackBuildStream(const uint8_t* const laneBytes[SC_BCPACK_BC1
                                     uint32_t outBytes, void* stream,
                                     uint32_t streamCap, uint32_t* streamLen,
                                     ScBcpackDiag* diag);
+
+// Same interleaver for any codec's lane layout (BC3..BC7 use 12 or 16 lanes;
+// the widths matter because they bound each record's width reduction).
+uint32_t WINAPI ScBcpackBuildStreamEx(
+    uint32_t codec, const uint8_t* const laneBytes[SC_BCPACK_MAX_LANES],
+    const uint32_t laneLens[SC_BCPACK_MAX_LANES], uint32_t outBytes,
+    void* stream, uint32_t streamCap, uint32_t* streamLen,
+    ScBcpackDiag* diag);
 
 #ifdef __cplusplus
 }

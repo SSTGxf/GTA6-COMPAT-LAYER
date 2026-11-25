@@ -1,7 +1,9 @@
-# BCPack milestone B1 — the BC1 entropy layer and block rebuilder
+# BCPack milestones B1 and B2 — the entropy layer and the BC1 rebuilder
 
-Scope: `docs/FREEBUFF-BCPACK-TEXTURE-SPEC.md` Part 1 (B1 only). No BC2–BC7, no
-BC6H history calibration, no DirectStorage wiring, no game data, no GPU.
+Scope: `docs/FREEBUFF-BCPACK-TEXTURE-SPEC.md` Part 1 (B1) plus the B2
+extension: entropy-only lane layouts for BC3, BC4, BC5, BC6H and BC7. No
+block semantics for those formats, no BC6H history calibration, no
+DirectStorage wiring, no game data, no GPU.
 
 Files: `include/bcpack.h`, `src/bcpack.cpp`, `tests/bcpack_b1.cpp` (harness,
 including the only encoder in this tree). The module is built and run by
@@ -58,6 +60,35 @@ deltas. From the block bytes and the encoder's symbols alone, the harness
 recovers every history entry and every quadrant code, requires both passes to
 agree, and compares the recovered tables with the decoder's. Result: 255/255
 history entries and 256/256 quadrant codes recovered, identical.
+
+## B2 — entropy-only lane layouts (BC3, BC4, BC5, BC6H, BC7)
+
+`ScBcpackCodecLayout` exposes the per-codec lane table and
+`ScBcpackDecodeLanes` runs the same records, models and scheduler without any
+block semantics, returning the lane symbols (lane after lane, matching the
+reference's `lanes` output):
+
+| codec | lanes | base widths | units/block | block bytes |
+| --- | --- | --- | --- | --- |
+| BC1 | 12 | 8,8,5,6,5,5,6,5,8,8,8,8 | 1 | 8 |
+| BC3 | 12 | 4,4,8,6,6,6,6,5,6,5,8,8 | 2 | 16 |
+| BC4 | 12 | 8,8,8,8,6,6,6,6,6,6,6,6 | 1 | 8 |
+| BC5 | 12 | 4,4,8,8,6,6,6,6,6,6,6,6 | 2 | 16 |
+| BC6H | 16 | 4,4,8,8,8,5,5,5,6,6,6,8,8,8,8,5 | 2 | 16 |
+| BC7 | 16 | 4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5 | 2 | 16 |
+
+BC7's lane 15 is 5 bits wide (reading it as 8 desynchronises the lane). BC2 has
+no published lane layout in either source and is refused with
+`SC_BCPACK_UNSUPPORTED_CODEC`.
+
+Proof in the harness: for every codec, random symbols → our encoder → our
+scheduler → our lane decoder reproduce the same symbols at 1, 16, 64 and 256
+blocks (in coding units: BC3/BC5/BC6H/BC7 carry two units per block). One
+third of the lanes use a width reduction so that path is covered too.
+
+Cross-check: `lanes --codec <c> --size N` from the independent reference over
+the same chunks — **24/24 codec/block comparisons identical** (6 codecs × 4
+block counts), in addition to the B1 checks.
 
 ## Cross-check against an independent implementation
 

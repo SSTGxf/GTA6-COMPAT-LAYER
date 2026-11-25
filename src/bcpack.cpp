@@ -30,9 +30,49 @@
 static const uint32_t kScale = 1u << 16;
 static const uint32_t kL = 1u << 24;
 
-// BC1 lane layout: base widths, one symbol per coding unit (8 output bytes).
-static const uint32_t kWidths[SC_BCPACK_BC1_LANES] = {8, 8, 5, 6, 5,
-                                                      5, 6, 5, 8, 8, 8, 8};
+// Lane layouts. Base widths, one symbol per coding unit (8 output bytes).
+// BC1 is B1; BC3..BC7 are the B2 entropy-only layouts from the format
+// description (BC7's lane 15 is 5 bits wide, not 8). BC2 has no published
+// layout and is rejected.
+typedef struct CodecLayout {
+    uint32_t lanes;
+    uint32_t widths[SC_BCPACK_MAX_LANES];
+    uint32_t unitsPerBlock;
+    uint32_t blockBytes;
+} CodecLayout;
+
+static const CodecLayout kLayouts[8] = {
+    {0, {0}, 0, 0},                                             // 0 unused
+    {12, {8, 8, 5, 6, 5, 5, 6, 5, 8, 8, 8, 8}, 1, 8},           // BC1
+    {0, {0}, 0, 0},                                             // BC2
+    {12, {4, 4, 8, 6, 6, 6, 6, 5, 6, 5, 8, 8}, 2, 16},          // BC3
+    {12, {8, 8, 8, 8, 6, 6, 6, 6, 6, 6, 6, 6}, 1, 8},           // BC4
+    {12, {4, 4, 8, 8, 6, 6, 6, 6, 6, 6, 6, 6}, 2, 16},          // BC5
+    {16, {4, 4, 8, 8, 8, 5, 5, 5, 6, 6, 6, 8, 8, 8, 8, 5}, 2, 16},  // BC6H
+    {16, {4, 4, 8, 8, 8, 8, 8, 7, 7, 5, 6, 8, 8, 8, 8, 5}, 2, 16},  // BC7
+};
+
+// BC1 lane widths, used by the block assembler.
+static const uint32_t* kWidths = kLayouts[SC_BCPACK_CODEC_BC1].widths;
+
+static const CodecLayout* LayoutFor(uint32_t codec) {
+    if (codec < 1 || codec > 7) return nullptr;
+    const CodecLayout* L = &kLayouts[codec];
+    return L->lanes ? L : nullptr;
+}
+
+uint32_t WINAPI ScBcpackCodecLayout(uint32_t codec, ScBcpackCodecInfo* out) {
+    const CodecLayout* L = LayoutFor(codec);
+    if (!L) return 0;
+    if (!out) return 1;
+    memset(out, 0, sizeof *out);
+    out->codec = codec;
+    out->lanes = L->lanes;
+    memcpy(out->widths, L->widths, sizeof out->widths);
+    out->unitsPerBlock = L->unitsPerBlock;
+    out->blockBytes = L->blockBytes;
+    return 1;
+}
 
 // Endpoint moduli for {R0,G0,B0,R1,G1,B1}.
 static const uint32_t kMod[6] = {32, 64, 32, 32, 64, 32};
@@ -174,9 +214,9 @@ typedef struct Source {
     const uint8_t* stream;
     uint32_t streamLen, streamPos;
     // record mode (harness encoder): one byte queue per lane
-    const uint8_t* queue[SC_BCPACK_BC1_LANES];
-    uint32_t queueLen[SC_BCPACK_BC1_LANES];
-    uint32_t queuePos[SC_BCPACK_BC1_LANES];
+    const uint8_t* queue[SC_BCPACK_MAX_LANES];
+    uint32_t queueLen[SC_BCPACK_MAX_LANES];
+    uint32_t queuePos[SC_BCPACK_MAX_LANES];
     uint8_t* out;
     uint32_t outCap, outLen;
     bool recording;
@@ -253,13 +293,15 @@ static bool RecordEnded(const Lane* L) {
 
 // Runs the shared byte-scheduler. symOut (when non-null) receives
 // lane-major symbols: symOut[lane * units + index].
-static uint32_t RunScheduler(Source* src, uint32_t outBytes,
-                             uint8_t* symOut, ScBcpackDiag* diag) {
+static uint32_t RunScheduler(Source* src, const CodecLayout* layout,
+                             uint32_t outBytes, uint8_t* symOut,
+                             ScBcpackDiag* diag) {
     const uint32_t units = outBytes / SC_BCPACK_BC1_UNIT_BYTES;
-    Lane lanes[SC_BCPACK_BC1_LANES];
+    const uint32_t laneCount = layout->lanes;
+    Lane lanes[SC_BCPACK_MAX_LANES];
     memset(lanes, 0, sizeof lanes);
-    for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
-        lanes[l].baseWidth = kWidths[l];
+    for (uint32_t l = 0; l < laneCount; ++l) {
+        lanes[l].baseWidth = layout->widths[l];
         lanes[l].phase = PH_HEADER;
         lanes[l].buf = -1;
     }
@@ -269,7 +311,7 @@ static uint32_t RunScheduler(Source* src, uint32_t outBytes,
 
     for (;;) {
         bool allDone = true;
-        for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+        for (uint32_t l = 0; l < laneCount; ++l) {
             if (lanes[l].phase != PH_DONE) allDone = false;
         }
         if (allDone) break;
@@ -280,8 +322,8 @@ static uint32_t RunScheduler(Source* src, uint32_t outBytes,
         ++rounds;
 
         // 1. Requests: the first 8 lanes (by number) that want a byte.
-        bool want[SC_BCPACK_BC1_LANES] = {false};
-        for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+        bool want[SC_BCPACK_MAX_LANES] = {false};
+        for (uint32_t l = 0; l < laneCount; ++l) {
             const Lane* L = &lanes[l];
             if (L->phase == PH_HEADER) {
                 want[l] = true;
@@ -292,14 +334,14 @@ static uint32_t RunScheduler(Source* src, uint32_t outBytes,
         }
         uint32_t serve[8];
         uint32_t nserve = 0;
-        bool served[SC_BCPACK_BC1_LANES] = {false};
-        for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES && nserve < 8; ++l) {
+        bool served[SC_BCPACK_MAX_LANES] = {false};
+        for (uint32_t l = 0; l < laneCount && nserve < 8; ++l) {
             if (want[l]) {
                 serve[nserve++] = l;
                 served[l] = true;
             }
         }
-        for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+        for (uint32_t l = 0; l < laneCount; ++l) {
             lanes[l].stalled =
                 want[l] && !served[l] && lanes[l].phase == PH_RUN;
         }
@@ -325,7 +367,7 @@ static uint32_t RunScheduler(Source* src, uint32_t outBytes,
         }
 
         // 3. Decoding, in lane order.
-        for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+        for (uint32_t l = 0; l < laneCount; ++l) {
             Lane* L = &lanes[l];
             if (L->phase != PH_RUN) continue;
             if (L->fresh) {
@@ -396,14 +438,14 @@ static uint32_t RunScheduler(Source* src, uint32_t outBytes,
 
         // 4. Unit synchronisation.
         bool sync = true;
-        for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+        for (uint32_t l = 0; l < laneCount; ++l) {
             const Lane* L = &lanes[l];
             const bool ok = (L->pending == 1) ||
                             (L->phase == PH_DONE && L->symbols > unitsDone);
             if (!ok) sync = false;
         }
         if (sync) {
-            for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l)
+            for (uint32_t l = 0; l < laneCount; ++l)
                 lanes[l].pending = 0;
             ++unitsDone;
         }
@@ -411,7 +453,7 @@ static uint32_t RunScheduler(Source* src, uint32_t outBytes,
 
     // Post-conditions: every lane carried exactly its symbols, no record bytes
     // are left over, and (decoding) the chunk was fully consumed.
-    for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+    for (uint32_t l = 0; l < laneCount; ++l) {
         if (lanes[l].symbols != units) return SC_BCPACK_BAD_SIZE;
         if (lanes[l].budget != 0 || lanes[l].buf >= 0)
             return SC_BCPACK_TRAILING;
@@ -425,7 +467,7 @@ static uint32_t RunScheduler(Source* src, uint32_t outBytes,
     if (!src->recording && src->streamPos != src->streamLen)
         return SC_BCPACK_TRAILING;
     if (src->recording) {
-        for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+        for (uint32_t l = 0; l < laneCount; ++l) {
             if (src->queuePos[l] != src->queueLen[l])
                 return SC_BCPACK_TRAILING;
         }
@@ -509,6 +551,7 @@ const char* WINAPI ScBcpackStatusName(uint32_t status) {
     case SC_BCPACK_TRAILING: return "TRAILING";
     case SC_BCPACK_ROUND_LIMIT: return "ROUND_LIMIT";
     case SC_BCPACK_NO_OUTPUT: return "NO_OUTPUT";
+    case SC_BCPACK_UNSUPPORTED_CODEC: return "UNSUPPORTED_CODEC";
     default: return "?";
     }
 }
@@ -533,6 +576,52 @@ const char* WINAPI ScBcpackChunkStorageName(uint32_t storage) {
     }
 }
 
+// Shared decoder: fills sym (lanes * units bytes) and validates the chunk.
+static uint32_t DecodeInto(const CodecLayout* layout, const void* src,
+                           uint32_t srcBytes, uint32_t outBytes,
+                           uint8_t* sym, ScBcpackDiag* diag) {
+    Source s;
+    memset(&s, 0, sizeof s);
+    s.stream = (const uint8_t*)src;
+    s.streamLen = srcBytes;
+    const uint32_t st = RunScheduler(&s, layout, outBytes, sym, diag);
+    if (diag) {
+        diag->lanes = layout->lanes;
+        diag->status = st;
+    }
+    return st;
+}
+
+uint32_t WINAPI ScBcpackDecodeLanes(uint32_t codec, const void* src,
+                                   uint32_t srcBytes, uint32_t outBytes,
+                                   void* laneSymbols, ScBcpackDiag* diag) {
+    if (diag) memset(diag, 0, sizeof *diag);
+    const CodecLayout* layout = LayoutFor(codec);
+    if (!src || !laneSymbols) {
+        if (diag) diag->status = SC_BCPACK_BAD_PARAMS;
+        return SC_BCPACK_BAD_PARAMS;
+    }
+    if (!layout) {
+        if (diag) diag->status = SC_BCPACK_UNSUPPORTED_CODEC;
+        return SC_BCPACK_UNSUPPORTED_CODEC;
+    }
+    if (outBytes == 0 || (outBytes % SC_BCPACK_BC1_UNIT_BYTES) != 0) {
+        if (diag) diag->status = SC_BCPACK_BAD_SIZE;
+        return SC_BCPACK_BAD_SIZE;
+    }
+    const uint32_t units = outBytes / SC_BCPACK_BC1_UNIT_BYTES;
+    const size_t total = (size_t)layout->lanes * units;
+    uint8_t* sym = (uint8_t*)calloc(total, 1);
+    if (!sym) {
+        if (diag) diag->status = SC_BCPACK_BAD_PARAMS;
+        return SC_BCPACK_BAD_PARAMS;
+    }
+    const uint32_t st = DecodeInto(layout, src, srcBytes, outBytes, sym, diag);
+    if (st == SC_BCPACK_OK) memcpy(laneSymbols, sym, total);  // fail closed
+    free(sym);
+    return st;
+}
+
 uint32_t WINAPI ScBcpackDecodeBc1(const void* src, uint32_t srcBytes,
                                   uint32_t outBytes,
                                   const ScBc1Tables* tables, void* dst,
@@ -547,7 +636,9 @@ uint32_t WINAPI ScBcpackDecodeBc1(const void* src, uint32_t srcBytes,
         return SC_BCPACK_BAD_SIZE;
     }
     const uint32_t units = outBytes / SC_BCPACK_BC1_UNIT_BYTES;
-    uint8_t* sym = (uint8_t*)calloc((size_t)SC_BCPACK_BC1_LANES * units, 1);
+    const CodecLayout* layout = &kLayouts[SC_BCPACK_CODEC_BC1];
+    uint8_t* sym =
+        (uint8_t*)calloc((size_t)SC_BCPACK_BC1_LANES * units, 1);
     uint8_t* out = (uint8_t*)malloc(outBytes);
     if (!sym || !out) {
         free(sym);
@@ -555,11 +646,7 @@ uint32_t WINAPI ScBcpackDecodeBc1(const void* src, uint32_t srcBytes,
         if (diag) diag->status = SC_BCPACK_BAD_PARAMS;
         return SC_BCPACK_BAD_PARAMS;
     }
-    Source s;
-    memset(&s, 0, sizeof s);
-    s.stream = (const uint8_t*)src;
-    s.streamLen = srcBytes;
-    uint32_t st = RunScheduler(&s, outBytes, sym, diag);
+    uint32_t st = DecodeInto(layout, src, srcBytes, outBytes, sym, diag);
     if (st == SC_BCPACK_OK) st = AssembleBc1(sym, units, tables, out);
     if (st == SC_BCPACK_OK) memcpy(dst, out, outBytes);  // fail closed
     if (diag) diag->status = st;
@@ -568,13 +655,14 @@ uint32_t WINAPI ScBcpackDecodeBc1(const void* src, uint32_t srcBytes,
     return st;
 }
 
-uint32_t WINAPI ScBcpackBuildStream(
-    const uint8_t* const laneBytes[SC_BCPACK_BC1_LANES],
-    const uint32_t laneLens[SC_BCPACK_BC1_LANES], uint32_t outBytes,
+static uint32_t BuildStreamCore(
+    const CodecLayout* layout,
+    const uint8_t* const laneBytes[SC_BCPACK_MAX_LANES],
+    const uint32_t laneLens[SC_BCPACK_MAX_LANES], uint32_t outBytes,
     void* stream, uint32_t streamCap, uint32_t* streamLen,
     ScBcpackDiag* diag) {
     if (diag) memset(diag, 0, sizeof *diag);
-    if (!laneBytes || !laneLens || !stream || !streamLen) {
+    if (!layout || !laneBytes || !laneLens || !stream || !streamLen) {
         if (diag) diag->status = SC_BCPACK_BAD_PARAMS;
         return SC_BCPACK_BAD_PARAMS;
     }
@@ -585,14 +673,49 @@ uint32_t WINAPI ScBcpackBuildStream(
     Source s;
     memset(&s, 0, sizeof s);
     s.recording = true;
-    for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+    for (uint32_t l = 0; l < layout->lanes; ++l) {
         s.queue[l] = laneBytes[l];
         s.queueLen[l] = laneLens[l];
     }
     s.out = (uint8_t*)stream;
     s.outCap = streamCap;
-    uint32_t st = RunScheduler(&s, outBytes, nullptr, diag);
+    const uint32_t st = RunScheduler(&s, layout, outBytes, nullptr, diag);
     if (st == SC_BCPACK_OK) *streamLen = s.outLen;
-    if (diag) diag->status = st;
+    if (diag) {
+        diag->lanes = layout->lanes;
+        diag->status = st;
+    }
     return st;
+}
+
+uint32_t WINAPI ScBcpackBuildStream(
+    const uint8_t* const laneBytes[SC_BCPACK_BC1_LANES],
+    const uint32_t laneLens[SC_BCPACK_BC1_LANES], uint32_t outBytes,
+    void* stream, uint32_t streamCap, uint32_t* streamLen,
+    ScBcpackDiag* diag) {
+    const uint8_t* lane[SC_BCPACK_MAX_LANES] = {0};
+    uint32_t lens[SC_BCPACK_MAX_LANES] = {0};
+    for (uint32_t l = 0; l < SC_BCPACK_BC1_LANES; ++l) {
+        lane[l] = laneBytes ? laneBytes[l] : nullptr;
+        lens[l] = laneLens ? laneLens[l] : 0;
+    }
+    return BuildStreamCore(&kLayouts[SC_BCPACK_CODEC_BC1], lane, lens,
+                           outBytes, stream, streamCap, streamLen, diag);
+}
+
+uint32_t WINAPI ScBcpackBuildStreamEx(
+    uint32_t codec, const uint8_t* const laneBytes[SC_BCPACK_MAX_LANES],
+    const uint32_t laneLens[SC_BCPACK_MAX_LANES], uint32_t outBytes,
+    void* stream, uint32_t streamCap, uint32_t* streamLen,
+    ScBcpackDiag* diag) {
+    const CodecLayout* layout = LayoutFor(codec);
+    if (!layout) {
+        if (diag) {
+            memset(diag, 0, sizeof *diag);
+            diag->status = SC_BCPACK_UNSUPPORTED_CODEC;
+        }
+        return SC_BCPACK_UNSUPPORTED_CODEC;
+    }
+    return BuildStreamCore(layout, laneBytes, laneLens, outBytes, stream,
+                           streamCap, streamLen, diag);
 }

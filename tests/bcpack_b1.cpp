@@ -219,6 +219,127 @@ static uint32_t BuildChunk(int mode, uint32_t blocks, const ScBc1Tables* tables,
     return len;
 }
 
+// ---- B2: entropy-only lane layouts --------------------------------------
+
+static const char* CodecName(uint32_t codec) {
+    switch (codec) {
+    case SC_BCPACK_CODEC_BC1: return "bc1";
+    case SC_BCPACK_CODEC_BC3: return "bc3";
+    case SC_BCPACK_CODEC_BC4: return "bc4";
+    case SC_BCPACK_CODEC_BC5: return "bc5";
+    case SC_BCPACK_CODEC_BC6H: return "bc6h";
+    case SC_BCPACK_CODEC_BC7: return "bc7";
+    default: return "?";
+    }
+}
+
+// Random lane symbols with a width reduction on every third lane, so both
+// the base widths and the reduction path are exercised.
+static void GenerateSymbols(const ScBcpackCodecInfo* ci, uint32_t units,
+                            uint32_t red[SC_BCPACK_MAX_LANES],
+                            uint32_t effW[SC_BCPACK_MAX_LANES],
+                            uint8_t* sym) {
+    for (uint32_t l = 0; l < ci->lanes; ++l) {
+        const uint32_t base = ci->widths[l];
+        const uint32_t r = (base > 1 && (l % 3) == 0) ? 1u : 0u;
+        red[l] = r;
+        effW[l] = base - r;
+        const uint32_t mask = (1u << effW[l]) - 1u;
+        for (uint32_t i = 0; i < units; ++i)
+            sym[(size_t)l * units + i] = (uint8_t)(Rnd() & mask);
+    }
+}
+
+static uint32_t BuildChunkCodec(uint32_t codec, uint32_t units, uint8_t* sym,
+                                uint8_t* stream, uint32_t cap) {
+    ScBcpackCodecInfo ci;
+    if (!ScBcpackCodecLayout(codec, &ci)) return 0;
+    uint32_t red[SC_BCPACK_MAX_LANES], effW[SC_BCPACK_MAX_LANES];
+    GenerateSymbols(&ci, units, red, effW, sym);
+    static uint8_t rec[SC_BCPACK_MAX_LANES][1 << 17];
+    const uint8_t* lp[SC_BCPACK_MAX_LANES];
+    uint32_t ll[SC_BCPACK_MAX_LANES];
+    for (uint32_t l = 0; l < ci.lanes; ++l) {
+        ll[l] = EncodeRecord(sym + (size_t)l * units, units, (l * 5 + 3) % 16,
+                             ci.widths[l], red[l], rec[l], sizeof rec[l]);
+        if (!ll[l]) {
+            printf("  encode failed: %s lane %u units %u\n", CodecName(codec),
+                   l, units);
+            return 0;
+        }
+        lp[l] = rec[l];
+    }
+    uint32_t len = 0;
+    const uint32_t st = ScBcpackBuildStreamEx(codec, lp, ll, units * 8, stream,
+                                              cap, &len, nullptr);
+    if (st != SC_BCPACK_OK) {
+        printf("  interleave failed: %s %s\n", CodecName(codec),
+               ScBcpackStatusName(st));
+        return 0;
+    }
+    return len;
+}
+
+// Proves the B2 layouts: for every codec, random symbols -> our encoder ->
+// our scheduler -> our lane decoder -> the same symbols, at 1/16/64/256
+// blocks (in coding units: BC3/BC5/BC6H/BC7 carry two units per block).
+static void TestCodecRoundTrips() {
+    static const uint32_t codecs[6] = {SC_BCPACK_CODEC_BC1, SC_BCPACK_CODEC_BC3,
+                                       SC_BCPACK_CODEC_BC4, SC_BCPACK_CODEC_BC5,
+                                       SC_BCPACK_CODEC_BC6H, SC_BCPACK_CODEC_BC7};
+    static const uint32_t counts[4] = {1, 16, 64, 256};
+    enum { kUnits = 512 };
+    static uint8_t sym[SC_BCPACK_MAX_LANES * kUnits];
+    static uint8_t got[SC_BCPACK_MAX_LANES * kUnits];
+    static uint8_t stream[1 << 21];
+    for (int c = 0; c < 6; ++c) {
+        ScBcpackCodecInfo ci;
+        Check(ScBcpackCodecLayout(codecs[c], &ci) == 1, "codec layout");
+        uint32_t okCounts = 0, unitsAt256 = 0, lenAt256 = 0;
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t units = counts[k] * ci.unitsPerBlock;
+            const uint32_t total = ci.lanes * units;
+            const uint32_t len = BuildChunkCodec(codecs[c], units, sym, stream,
+                                                 sizeof stream);
+            Check(len > 0, "B2 chunk build");
+            if (!len) continue;
+            memset(got, 0xCC, total);
+            ScBcpackDiag diag;
+            const uint32_t st = ScBcpackDecodeLanes(codecs[c], stream, len,
+                                                    units * 8, got, &diag);
+            Check(st == SC_BCPACK_OK, "B2 lane decode status");
+            Check(memcmp(got, sym, total) == 0, "B2 lane symbols");
+            Check(diag.lanes == ci.lanes && diag.units == units,
+                  "B2 diag lanes/units");
+            if (st == SC_BCPACK_OK && memcmp(got, sym, total) == 0) ++okCounts;
+            if (counts[k] == 256) {
+                unitsAt256 = units;
+                lenAt256 = len;
+            }
+        }
+        char line[200];
+        snprintf(line, sizeof line,
+                 "B2 lanes: %-4s %u lanes, %u unit(s)/block, %u/%u block "
+                 "counts symbol-exact (%u units, %u chunk bytes at 256)",
+                 CodecName(codecs[c]), ci.lanes, ci.unitsPerBlock, okCounts, 4u,
+                 unitsAt256, lenAt256);
+        printf("%s\n", line);
+        Check(okCounts == 4, "B2 all block counts");
+    }
+    // BC2 has no published lane layout and must be refused.
+    {
+        uint8_t dummy[64];
+        ScBcpackCodecInfo ci;
+        Check(ScBcpackCodecLayout(SC_BCPACK_CODEC_BC2, &ci) == 0,
+              "BC2 has no layout");
+        Check(ScBcpackDecodeLanes(SC_BCPACK_CODEC_BC2, dummy, sizeof dummy, 8,
+                                  dummy, nullptr) ==
+                  SC_BCPACK_UNSUPPORTED_CODEC,
+              "BC2 rejected");
+        printf("B2 lanes: bc2 refused (no published lane layout)\n");
+    }
+}
+
 // ---- self-tests ----------------------------------------------------------
 
 static void TestRoundTrips(const ScBc1Tables* tables) {
@@ -673,6 +794,75 @@ static void CrossChunks(const char* refExe, const char* dir,
            agreed, compared);
 }
 
+// B2 cross-check: the entropy-only layouts over the reference's `lanes`
+// command, for every codec and every block count.
+static void CrossLanes(const char* refExe, const char* dir) {
+    static const uint32_t codecs[6] = {SC_BCPACK_CODEC_BC1, SC_BCPACK_CODEC_BC3,
+                                       SC_BCPACK_CODEC_BC4, SC_BCPACK_CODEC_BC5,
+                                       SC_BCPACK_CODEC_BC6H, SC_BCPACK_CODEC_BC7};
+    static const uint32_t counts[4] = {1, 16, 64, 256};
+    static uint8_t sym[SC_BCPACK_MAX_LANES * 512];
+    static uint8_t other[1 << 20];
+    static uint8_t stream[1 << 21];
+    uint32_t agreed = 0, compared = 0;
+    for (int c = 0; c < 6; ++c) {
+        ScBcpackCodecInfo ci;
+        if (!ScBcpackCodecLayout(codecs[c], &ci)) continue;
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t units = counts[k] * ci.unitsPerBlock;
+            const uint32_t total = ci.lanes * units;
+            const uint32_t len = BuildChunkCodec(codecs[c], units, sym, stream,
+                                                 sizeof stream);
+            ++compared;
+            if (!len) {
+                printf("  cross lanes: %s %u blocks could not be built\n",
+                       CodecName(codecs[c]), counts[k]);
+                continue;
+            }
+            char inPath[1024], outPath[1024], cmd[4096], text[2048];
+            snprintf(inPath, sizeof inPath, "%s\\b2-%s-%u.bin", dir,
+                     CodecName(codecs[c]), counts[k]);
+            snprintf(outPath, sizeof outPath, "%s\\b2-%s-%u.lanes", dir,
+                     CodecName(codecs[c]), counts[k]);
+            if (!WriteFileBytes(inPath, stream, len)) {
+                printf("  cross lanes: cannot write %s\n", inPath);
+                continue;
+            }
+            snprintf(cmd, sizeof cmd,
+                     "\"%s\" lanes --codec %s --size %u \"%s\" \"%s\"",
+                     refExe, CodecName(codecs[c]), units * 8, inPath, outPath);
+            int rc = -1;
+            if (!RunProcess(cmd, &rc, text, sizeof text) || rc != 0) {
+                printf("  cross lanes: reference failed for %s at %u blocks "
+                       "(rc=%d)\n",
+                       CodecName(codecs[c]), counts[k], rc);
+                continue;
+            }
+            size_t got = 0;
+            if (!ReadFileBytes(outPath, other, sizeof other, &got) ||
+                got != total) {
+                printf("  cross lanes: %s at %u blocks produced %u/%u bytes\n",
+                       CodecName(codecs[c]), counts[k], (unsigned)got,
+                       total);
+                continue;
+            }
+            if (memcmp(other, sym, total) == 0) {
+                ++agreed;
+            } else {
+                printf("  DISAGREEMENT in %s lane symbols at %u blocks\n",
+                       CodecName(codecs[c]), counts[k]);
+                DumpHex("chunk", stream, len);
+                DumpHex("ours", sym, total);
+                DumpHex("reference", other, total);
+            }
+        }
+    }
+    Check(agreed == compared && compared > 0,
+          "B2 lane symbols agree with the reference");
+    printf("B2 cross-check lanes: %u/%u codec/block comparisons identical to "
+           "the reference\n", agreed, compared);
+}
+
 // ---- main ---------------------------------------------------------------
 
 int main(int argc, char** argv) {
@@ -702,6 +892,7 @@ int main(int argc, char** argv) {
     TestRoundTrips(&tables);
     TestMalformed(&tables);
     TestLearnTables(&tables);
+    TestCodecRoundTrips();
 
     // Chunk-table storage detection (bits 26..29), detection only.
     {
@@ -722,6 +913,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--cross") == 0 && i + 2 < argc) {
             CrossModels(argv[i + 1]);
             CrossChunks(argv[i + 1], argv[i + 2], &tables);
+            CrossLanes(argv[i + 1], argv[i + 2]);
             break;
         }
     }
