@@ -576,3 +576,64 @@ The first dispatcher hit now also logs `[rsp+0x68]` (the dispatcher's caller ret
 it is invoked through a virtual slot), the job object's first 16 qwords and its vtable's first 8
 slots. That names both the job's owner and its class. Boots #276/#277 did not reach the dispatcher,
 so the dump has not printed yet.
+
+## 2026-11-25 (boot #280): the framing veto was starving every pack page
+
+`ScDsExtentLooksFramed` accepts an extent only when its first and last 8 bytes are printable ASCII
+or zero. As a *selector* between pack candidates that is fine, but it was also used as a veto on
+raw copies, and a plain RPF page is binary, so every page-sized read from `packs.rpf` was dropped:
+
+```
+loader    ] Submit[138] raw copy REFUSED (extent does not frame): hash 0x... offset=0x106819510 compSize=65536 pack=D:\game\game\packs.rpf
+```
+
+Thousands of sequential 64 KiB pages (offsets `0x106819510`, `0x106829510`, ... stride `0x10000`)
+never reached their destinations, so the streamer ran on zeroed buffers. The veto was added because
+one 58,896-byte copy clobbered the tail of the gate's framed member, and that buffer is the only
+place a bad extent can do that damage.
+
+Fix: the gate now registers the buffer it forwards and the veto only fires when the copy's
+destination overlaps it.
+
+```
+// pe_loader.cpp
+static const void* g_scGateFramedBuf = nullptr;
+static uint32_t g_scGateFramedSize = 0;
+extern "C" bool ScFramedBufferOverlaps(const void* p, size_t n) { ... }
+// hle_registry.cpp (DsqSubmit)
+if (compSize == destSize && compSize >= 0x1000 &&
+    ScFramedBufferOverlaps(dest, destSize) &&
+    !ScDsExtentLooksFramed(packPath, fileOffset, compSize)) { ... refused ... }
+```
+
+Boot #280 (built from the edited sources, gate green):
+
+```
+refusals: 0                                  (was ~4400 per boot)
+loader    ] gate-frame size=9168400 end=9168400 lgid=0x8be59c lrsc=0x8be5a4 chks=0x8be5fc framed-ok
+loader    ] dispatch-probe summary: hits=1 lastId=0xaa lastObj=0x1f32ac1a4e0
+loader    ] crash-record code=0xc0000005 addr=0x7ffe99c791d1 rip=0x7ffe99c791d1 ... access=0xffffffffffffffff
+```
+
+The 0x145a99c66 AV is absent from #280, and the 9.17 MB framed member still validates. The boot
+does not reach a menu: it now dies inside a **host** callback with a corrupted argument
+(`rsi(ctx)=0x9b9b0fd801`, `rcx=0`, `rd=0x6d726f6674616c70` = "platform").
+
+### Correction: the `0xaa` status reading is not a status
+
+The dispatcher probe's first-hit dump shows the "job object" is a character buffer:
+
+```
+dispatch-probe obj hdr: 6d726f6674616c70 632f6d696e612f3a 737465735f70696c 656d69746e75722f
+                        65735f70696c635f 7374 0 0 0 0 0 0 0 0 0 0 712074696d627501
+```
+
+That is `"platform"`, `":/anim/c"`, `"lip_sets"`, `"/runtime"`, `"_clip_se"`, `"ts"`, ... i.e.
+`platform:/anim/clip_sets/runtime_clip_sets...`. So `[rdx+0x90]` in the probe is string data, not a
+status field, and "status 0xaa" must not be read as a real dispatcher id. What the dump does prove
+is that a **path string is being used where the state machine expects an object**, and the crash
+stack carries `rd=0x6d726f6674616c70` at the host callback as well.
+
+The animation clip-set path is a pack asset, so this reading is consistent with the starvation above
+being the producer of the corrupted pointers rather than an unrelated bug. Boots after #280 decide
+whether the corruption persists once the pages are actually delivered.

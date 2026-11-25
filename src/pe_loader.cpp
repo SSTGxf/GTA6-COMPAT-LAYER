@@ -978,6 +978,24 @@ static void ScLogBufRange(const void* b, uint32_t n) {
         (unsigned long long)((uintptr_t)b + n), n);
 }
 
+// Boot #279: the DStorage shim's "raw copy REFUSED (extent does not frame)"
+// veto was added because one 58,896-byte raw copy clobbered the tail of the
+// gate's framed member. It must not veto every raw copy: ScDsExtentLooksFramed
+// only accepts extents whose first/last 8 bytes are printable or zero, so a
+// plain binary RPF page always fails it. Boots #274/#279 dropped every 64 KiB
+// packs.rpf page this way (compSize=65536, sequential offsets) and the streamer
+// ran on zeroed buffers. Scope the veto to the buffer the gate actually
+// forwards, which is the only place a bad extent can clobber framed bytes.
+static const void* g_scGateFramedBuf = nullptr;
+static uint32_t g_scGateFramedSize = 0;
+extern "C" bool ScFramedBufferOverlaps(const void* p, size_t n) {
+    if (!g_scGateFramedBuf || !p || !n) return false;
+    const uintptr_t a = (uintptr_t)p, b = a + n;
+    const uintptr_t ga = (uintptr_t)g_scGateFramedBuf;
+    const uintptr_t gb = ga + (uintptr_t)g_scGateFramedSize;
+    return a < gb && ga < b;
+}
+
 static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
                         void* a5, void* a6) {
     // Framing fix: the size the guest hands the parser is its DStorage request
@@ -1000,6 +1018,8 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // The 116-byte terminator is now present (host-authored), so forward the full
     // requested length: the earlier clamp existed only because the tail was absent.
     const uint32_t useSize = size;
+    g_scGateFramedBuf = buf;
+    g_scGateFramedSize = size;
     if (size == 9168400u) ScBufProbe(buf, size, "pre");
     Log("loader", "gate-forward in=%u out=%u %s", size, useSize,
         useSize == size ? "unchanged" : "clamped-to-framed-end");

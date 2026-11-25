@@ -5530,6 +5530,8 @@ static const char* ScDsReprobePack(const char* triedPath, uint64_t hash,
     return nullptr;
 }
 
+extern "C" bool ScFramedBufferOverlaps(const void* p, size_t n);
+
 extern "C" void DsqSubmit(void* self) {
     ScDsQueue* q = (ScDsQueue*)self;
     int copied = 0, refused = 0, fileSource = 0;
@@ -5633,6 +5635,7 @@ extern "C" void DsqSubmit(void* self) {
             // 58,896-byte tail page was under the old 0x10000 threshold, so gate
             // every page-sized raw copy, not just the larger ones.
             if (compSize == destSize && compSize >= 0x1000 &&
+                ScFramedBufferOverlaps(dest, destSize) &&
                 !ScDsExtentLooksFramed(packPath, fileOffset, compSize)) {
                 Log("dstorage",
                     "Submit[%d] raw copy REFUSED (extent does not frame): "
