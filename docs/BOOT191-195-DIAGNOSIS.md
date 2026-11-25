@@ -408,3 +408,28 @@ the first layer entry rather than only at thread attach — i.e. call
 `ScGuestTlsThreadAttach()` from the HLE dispatch path (and from the guest's
 thread-start trampolines), which covers threads that were already running when
 `g_guestTlsReady` became 1, including the one that dies at `0x140004B5E`.
+
+## §11 Boot #201 — attach callback measured; the missing per-thread state is the /GA view, not the TLS array
+
+Measured (boot #201, DLL from `build_ga201`): `thread-attach: callback tid=... ready=1`
+appears **63 times, all `ready=1`**. So last turn's inference was wrong: the DLL
+TLS callback *does* run, and it runs after the guest TLS directory is parsed. It
+simply never had anything to do — every one of those threads already carried our
+TLS block.
+
+The fault is therefore not the TLS array. The guest's `mov rax,gs:[58h]` is
+rewritten by `PatchGaTlsReads` to read `TlsSlots[gaSlot]` (the per-thread /GA
+view at TEB+0x1480+8*slot), so `rax` came from a **missing /GA view**, while
+`arr[g_tlsInfo.index]` was set — which is exactly why the VEH bootstrap probe
+(`arr[index]`) found "already initialised" and never fired. Boot #201: 0
+`guest TLS bootstrap on faulting thread` lines, still `veh: exception
+0xc0000005 at 0x140004B5E thread 11124`.
+
+Fix applied after #201: the VEH probe now tests `TlsSlots()[gaSlot]` (the view the
+guest actually dereferences) and bootstraps through `EnsureThreadTls()` when it
+is absent, so the guest CRT's own `.CRT$XLB` callbacks run for that thread and
+slot 0 stays the CRT's.
+
+Unverified: `build_ga202` reports `guest_minimal FAILED` (BUILD_EXIT=1) before the
+verify stage — `B1 result: 149 checks, 0 failed -> PASS` still prints. That gate
+must be green again before the VEH fix can be booted and claimed.

@@ -887,6 +887,14 @@ static volatile LONG g_guestTlsBusy = 0;
 static void CleanupThreadTls();  // defined below (detach path)
 
 extern "C" void ScGuestTlsThreadAttach() {
+    // Unconditional identity log: boot #200 showed the attach callback never
+    // produced a bootstrap line, so the mechanism's coverage (which thread,
+    // and whether the guest TLS directory existed yet) has to be measurable,
+    // not inferred from disassembly.
+    static volatile LONG attachCalls = 0;
+    const long n = InterlockedIncrement(&attachCalls);
+    Log("loader", "thread-attach: callback tid=%lu ready=%ld call#%ld",
+        (unsigned long)GetCurrentThreadId(), (long)g_guestTlsReady, n);
     if (!g_guestTlsReady || !g_tlsInfo.valid) return;
     // Re-entrancy guard: the guest TLS callbacks are guest code and may
     // create threads themselves.
@@ -934,7 +942,7 @@ extern "C" __declspec(allocate(".CRT$XLB"))
 // DLL, which is what makes the loader run g_scLayerTlsCallback on every
 // thread start (DLL_THREAD_ATTACH) — including threads created by Windows
 // internals that never pass through ScarlettCreateThread.
-__declspec(thread) volatile int g_scLayerTlsAnchor = 0;
+volatile int g_scLayerTlsAnchor = 0;
 
 // Tear down TLS for the calling thread: DLL_THREAD_DETACH callbacks,
 // clear the slot, free the block.
@@ -2766,6 +2774,38 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     // Catch both so the mount probe + dump fire at the AV too — the
     // 0x80000003-only gate is why boot #25 produced no probe.
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Boots #197-#200: guest threads that never passed through
+    // ScarlettCreateThread (and were already running when the guest TLS
+    // directory was parsed) execute guest code with
+    // TEB->ThreadLocalStoragePointer == 0 and die at 0x140004B5E reading
+    // [gs:58] -> [rax] -> [rax+0x1454]. Rather than special-casing that PC,
+    // complete the thread's missing TLS state with the loader's own
+    // bootstrap (PE TLS template + SizeOfZeroFill + .CRT$XLB callback list,
+    // i.e. the guest CRT's per-thread init) and retry the same instruction.
+    // Nothing is fabricated: slot 0 remains the guest CRT's and is written
+    // only by its own callbacks.
+    if (code == 0xc0000005 && g_guestTlsReady && g_tlsInfo.valid) {
+        // The guest's `mov r64, gs:[58h]` is rewritten to read the /GA view
+        // at TlsSlots[gaSlot] (TEB+0x1480+8*slot), so *that* is the per-thread
+        // state to probe; the real TLS array can hold our block while the
+        // view is still missing.
+        PVOID* arr = (PVOID*)__readgsqword(0x58);
+        PVOID ours = (g_gaSlot != TLS_OUT_OF_INDEXES)
+                         ? TlsSlots()[g_gaSlot] : nullptr;
+        if (!ours) {
+            ScGuestTlsThreadAttach();
+            arr = (PVOID*)__readgsqword(0x58);
+            ours = (g_gaSlot != TLS_OUT_OF_INDEXES)
+                       ? TlsSlots()[g_gaSlot] : nullptr;
+            Log("loader",
+                "veh: guest TLS bootstrap on faulting thread %lu rip=0x%llx "
+                "tlsArray=%p ourSlot=%p slot0=%p -> retry faulting insn",
+                (unsigned long)GetCurrentThreadId(),
+                (unsigned long long)ep->ContextRecord->Rip, (void*)arr, ours,
+                arr ? arr[0] : nullptr);
+            if (ours) return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     // Build 84: hardware write-watchpoint traps (DR0). Logged and resumed
     // in place; never treated as a crash.
     if (code == 0x80000004) {
