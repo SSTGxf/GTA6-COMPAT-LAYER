@@ -1245,3 +1245,31 @@ missing-CHKS`, and the guest re-offers the stream after each refusal.
 Open: which path populates that 9,168,400-byte buffer (guest-side file read into a
 mapped view, or a streaming path other than the raw-copy submit), and why its final
 116 bytes never contain the terminator. No stream byte was authored; clamp untouched.
+
+## §38 Boot #255: both DStorage read entries are never called
+
+`build_ga238`, one boot:
+
+```
+io packreadbatch = 0    io packread = 0    gate offers of the 9,168,400-byte buffer = 50
+```
+
+So neither the single-entry (`HleScOptDStorageReadFile`) nor the batch-entry
+(`HleScOptDStorageReadFileBatch`) pack read shim participates in delivering this member.
+Combined with #253 (45 deliveries, every one 16 bytes through the raw-copy submit), all
+three instrumented delivery routes are excluded by measurement:
+
+| route | instrument | evidence |
+|---|---|---|
+| raw-copy submit | `io copy` | 45 lines, all req=16 got=16 |
+| pack read (single) | `io packread` | 0 lines in #254, #255 |
+| pack read (batch) | `io packreadbatch` | 0 lines in #255 |
+
+The validator still reports, on every offer, `size=9168400 end=9168284
+lgid=0xffffffff lrsc=0xffffffff chks=0xffffffff missing-CHKS`.
+
+Remaining surface, unmeasured: the layer's handle-level translation of the guest's own
+`ReadFile`/`SetFilePointerEx`/`GetFileSize`/`MapViewOfFile` calls against its mapped view.
+No line exists yet for the read that should place `9,109,504..9,168,400` in the framed
+buffer, which is why no fix has been applied: the deciding number (`req` vs `got` for that
+read, and the file length we report) has never been printed.
