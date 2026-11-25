@@ -77,7 +77,19 @@ void WriteLogLine(const char* line) {
         fflush(g_logFile);
     }
     ULONGLONG now = GetTickCount64();
-    if (now - g_lastLogFlush >= 200) {
+    static int flushEveryLine = -1;
+    if (flushEveryLine < 0) {
+        char v[8] = {};
+        flushEveryLine = GetEnvironmentVariableA("SCARLETT_FLUSH_LOG", v,
+                                                 sizeof(v)) > 0
+                             ? 1
+                             : 0;
+    }
+    if (flushEveryLine) {
+        fflush(stderr);
+        if (g_logFile) fflush(g_logFile);
+        g_lastLogFlush = now;
+    } else if (now - g_lastLogFlush >= 200) {
         fflush(stderr);
         if (g_logFile) fflush(g_logFile);
         g_lastLogFlush = now;
@@ -254,6 +266,17 @@ extern "C" HRESULT HleXMemAllocatePhysicalPages(void) {
     return (HRESULT)1;
 }
 
+// Reservations owned by the layer's XMem mappings (both the base form and
+// the scatter form), released once by XMemFreePhysicalPages.
+struct ScatterReservation {
+    void* base;
+    SIZE_T span;
+    uint32_t pages;
+    bool owned;  // true when this layer reserved the span
+};
+static ScatterReservation g_scatterMaps[8];
+static int g_scatterMapCount = 0;
+
 static void ScatterUnmapAll();
 
 extern "C" HRESULT HleXMemFreePhysicalPages(void) {
@@ -266,24 +289,86 @@ extern "C" HRESULT HleXMemFreePhysicalPages(void) {
 
 // XMemMapPhysicalPages / XMemMapPhysicalPagesScatter — map Xbox
 // physical pages into a desktop VA. On desktop there is no separate
-// physical-page pool, so this commits ordinary memory and returns its
-// VA. Signature ASSUMED (GDKX-gated): (pages, pageCount, attrs,
-// protect). The size is guarded: a bogus page count (wrong signature)
-// cannot reserve more than 256 MB or less than 64 KB.
+// physical-page pool, so this commits ordinary memory at the guest's
+// own address and returns that address (the scatter form below has
+// always worked that way).
+//
+// Boot #111 (0x14018849C) proved the base form was wrong: the guest
+// called XMemMapPhysicalPages(pages=0x28AD4140000, count=432) and then
+// wrote a free-list node at 0x28AD415FFE8 (base + 0x1FFE8). The layer
+// ignored the requested base, VirtualAlloc'ed an unrelated VA
+// (0x28ADF920000) and returned it; nothing ever committed the guest's
+// range, so the store took an AV. The dump has no page at
+// 0x28AD4140000 / 0x28AD4150000 / 0x28AD415FFE8 and does have the
+// returned 0x28ADF920000 (zero-filled). Treat pPhysicalPages as the
+// base VA, reserve the span when free, commit one 64 KiB page per
+// count unit (the scatter path measured 64 KiB descriptors; a 4 KiB
+// commit left the rest of each page unmapped in boot #83), and return
+// the base. A non-aligned argument keeps the old fresh-allocation
+// behaviour so a descriptor-array caller cannot be mis-reserved.
 extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
                                          uint32_t dwPageCount,
                                          DWORD dwMemoryAttributes,
                                          DWORD flProtect) {
-    SIZE_T bytes = (SIZE_T)dwPageCount * 4096;
-    if (bytes < 64 * 1024) bytes = 64 * 1024;
-    if (bytes > 256 * 1024 * 1024) bytes = 256 * 1024 * 1024;
-    void* p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
-                           PAGE_READWRITE);
+    void* caller = _ReturnAddress();
+    if (!pPhysicalPages || dwPageCount == 0) {
+        Log("xmem",
+            "XMemMapPhysicalPages(pages %p, count %u) from %p -> NULL "
+            "(no range)",
+            (const void*)pPhysicalPages, dwPageCount, caller);
+        return nullptr;
+    }
+    void* base = (void*)(uintptr_t)pPhysicalPages;
+    const SIZE_T kPage = 0x10000;  // Xbox page-pool granularity
+    SIZE_T span = (SIZE_T)dwPageCount * kPage;
+    if (span < 64 * 1024) span = 64 * 1024;
+    if (span > 256 * 1024 * 1024) span = 256 * 1024 * 1024;
+
+    void* p = nullptr;
+    bool owned = false;
+    bool aligned = (((uintptr_t)base & (kPage - 1)) == 0);
+    if (aligned) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        VirtualQuery(base, &mbi, sizeof(mbi));
+        if (mbi.State == MEM_FREE) {
+            if (!VirtualAlloc(base, span, MEM_RESERVE, PAGE_NOACCESS)) {
+                Log("xmem",
+                    "XMemMapPhysicalPages: reserve %p span %llu failed "
+                    "err=%lu",
+                    base, (unsigned long long)span, GetLastError());
+            } else {
+                owned = true;
+            }
+        }
+        if (owned || mbi.State != MEM_FREE) {
+            p = VirtualAlloc(base, span, MEM_COMMIT, PAGE_READWRITE);
+        }
+    }
+    if (!p) {
+        // Fallback: keep the old behaviour for callers that use the
+        // returned VA (and log loudly — a guest that writes at the
+        // requested base will fault if this path is taken).
+        p = VirtualAlloc(nullptr, span, MEM_COMMIT | MEM_RESERVE,
+                         PAGE_READWRITE);
+        Log("xmem",
+            "XMemMapPhysicalPages: could not commit [%p,%p) -> FALLBACK "
+            "allocation %p (%llu bytes)",
+            base, (void*)((uintptr_t)base + span), p,
+            (unsigned long long)span);
+        if (owned) {
+            VirtualFree(base, 0, MEM_RELEASE);
+            owned = false;
+        }
+        base = p;
+    } else if (g_scatterMapCount < 8) {
+        g_scatterMaps[g_scatterMapCount++] =
+            ScatterReservation{base, span, dwPageCount, owned};
+    }
     Log("xmem",
         "XMemMapPhysicalPages(pages %p, count %u, attrs 0x%x, protect "
-        "0x%x) -> %p (%llu bytes, ordinary memory)",
+        "0x%x) from %p -> %p (%llu bytes at %p, reservedByLayer=%d)",
         (const void*)pPhysicalPages, dwPageCount, dwMemoryAttributes,
-        flProtect, p, (unsigned long long)bytes);
+        flProtect, caller, p, (unsigned long long)span, base, (int)owned);
     return p;
 }
 
@@ -306,15 +391,6 @@ extern "C" void* HleXMemMapPhysicalPages(const uint64_t* pPhysicalPages,
 //     at the guest's own addresses (reserve the span if free, commit one
 //     page at each descriptor) and the reservation is tracked so it is
 //     released exactly once.
-struct ScatterReservation {
-    void* base;
-    SIZE_T span;
-    uint32_t pages;
-    bool owned;  // true when this layer reserved the span
-};
-static ScatterReservation g_scatterMaps[8];
-static int g_scatterMapCount = 0;
-
 static void ScatterUnmapAll() {
     for (int i = 0; i < g_scatterMapCount; ++i) {
         ScatterReservation& r = g_scatterMaps[i];
@@ -2930,13 +3006,16 @@ static ULONG WINAPI XboxList_Release(XboxCommandListWrapper* self) {
 // caller's return address (so the game call site — and therefore the
 // slot — can be identified from the disassembly) and returns E_NOTIMPL.
 // NOTE: only correct for HRESULT-returning methods.
-static HRESULT WINAPI XboxList_Unimplemented(XboxCommandListWrapper* self) {
-    (void)self;
+static HRESULT WINAPI XboxList_Unimplemented(XboxCommandListWrapper* self,
+                                             UINT64 a, UINT64 b,
+                                             UINT64 c) {
     Log("xboxlist",
-        "UNIMPLEMENTED Xbox command-list slot called from game %p -> "
-        "E_NOTIMPL (identify the slot from the call site, then "
-        "implement it)",
-        _ReturnAddress());
+        "UNIMPLEMENTED Xbox command-list slot called from game %p "
+        "(self %p real %p a=0x%llx b=0x%llx c=0x%llx) -> E_NOTIMPL "
+        "(identify the slot from the call site, then implement it)",
+        _ReturnAddress(), self, self ? self->real : nullptr,
+        (unsigned long long)a, (unsigned long long)b,
+        (unsigned long long)c);
     return E_NOTIMPL;
 }
 
@@ -2947,6 +3026,39 @@ static HRESULT WINAPI XboxList_Close(XboxCommandListWrapper* self) {
     if (!self || !self->real) return E_POINTER;
     HRESULT hr = self->real->Close();
     Log("xboxlist", "Close -> hr=0x%08x", (unsigned)hr);
+    return hr;
+}
+
+// Slot 139: Xbox Reset(pAllocator, pInitialState). Boot #113 proved it:
+// the guest helper 0x142474CC0 calls [vtable+0x458] with rdx = the
+// allocator returned by CreateCommandAllocator (0x21C7DA2D590 in that
+// boot), r8 = r9 = 0, and int3s at 0x142474CE1 when the HRESULT is not
+// S_OK. That is exactly ID3D12GraphicsCommandList::Reset's signature;
+// the allocator is the raw desktop object (see
+// XboxDevice_CreateCommandAllocator), so forward it directly. The Xbox
+// vtable places Reset at 139, not at the desktop slot 10.
+static HRESULT WINAPI XboxList_Reset(XboxCommandListWrapper* self,
+                                     ID3D12CommandAllocator* allocator,
+                                     ID3D12PipelineState* initialState) {
+    if (!self || !self->real) return E_POINTER;
+    void** allocVt = nullptr;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (allocator && VirtualQuery(allocator, &mbi, sizeof(mbi)) &&
+        mbi.State == MEM_COMMIT &&
+        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                        PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
+        allocVt = *(void***)allocator;
+    }
+    Log("xboxlist",
+        "Reset(slot139) ENTER real=%p allocator=%p avt=%p initialState=%p",
+        self->real, allocator, allocVt, initialState);
+    if (g_logFile) fflush(g_logFile);
+    HRESULT hr = self->real->Reset(allocator, initialState);
+    Log("xboxlist",
+        "Reset(slot139) allocator=%p initialState=%p -> hr=0x%08x",
+        allocator, initialState, (unsigned)hr);
+    if (g_logFile) fflush(g_logFile);
     return hr;
 }
 
@@ -2988,6 +3100,7 @@ static void InitXboxCommandListVtable() {
     g_xboxCommandListVtable[9] = (void*)XboxList_Close;
     g_xboxCommandListVtable[131] = (void*)XboxList_Stub131;
     g_xboxCommandListVtable[132] = (void*)XboxList_Stub132;
+    g_xboxCommandListVtable[139] = (void*)XboxList_Reset;
     g_xboxCommandListVtableInit = true;
 }
 
