@@ -128,3 +128,49 @@ Next step: decide which chunk fourcc rejects the blob. The blob is saved at
 These made "what was the guest parsing when it asserted" answerable in one
 boot instead of a manual dump hunt, and are the recommended first move on
 every future assert.
+
+## §5 The PSIN blob is structurally valid (rules out wrong-pack data)
+
+Walked offline with `[fourcc][BE length]` at each offset, the buffer from boot
+#195 is a **complete, exact chunk stream**:
+
+| # | offset | fourcc | length | ends |
+|---|--------|--------|--------|------|
+| 0 | 0x0 | `PSIN` | 0x3340C0 (3,358,912) | 0x3340C0 |
+| 1 | 0x3340C0 | `LSCH` | 0x4C8 | 0x334588 |
+| 2 | 0x334588 | `LENM` | 0xB0 | 0x334638 |
+| 3 | 0x334638 | `LSNS` | 0x589F64 (5,807,972) | 0x8BE59C |
+| — | 0x8BE59C | zeros | — | 0x8BE610 (buffer end) |
+
+Every length lands exactly on the next chunk and the stream terminates in the
+buffer's own trailing zero padding, so the data is what the title expects.
+That kills the "wrong pack / short read" hypotheses: `r14` (buffer) and `rbx`
+(size 0x8BE610) hold a legitimate resource.
+
+The header field at `+4` is a size, not a hash: valid PSIN blobs from
+`data.rpf` (inflated offline, offsets 0x1C2767F0 → 472 B and 0x1AF39910 →
+1008 B) carry `0x00000080` and `0x00000160` there, and ours carries
+`0x003340C0` — the first chunk's length. The `0xaaaaaaaa` qwords seen in the
+head are format sentinels, not unwritten memory (they occur in the known-good
+blobs too).
+
+All four fourccs are handled by the dispatcher (`PSIN` → `0x14407EADF`,
+`LSNS` → `0x14407EB04`, `LENM` → `0x14407EAC8`, `LSCH` → `0x14407E...`), and
+the chunk walker's bounds test passes for each, so the reject is **after** the
+chunk walk, in the post-walk gate at `0x14407EC98`:
+
+```
+0x14407EC98: cmp qword ptr [rsi+0x90], 0   ; STRE/STRF stream chunk present?
+0x14407ECA0: je  0x14407ECDB
+0x14407ECDB: test r12,r12 / test rdi,rdi / test r14,r14
+0x14407ECF0: je  0x14407F228               ; -> returns edi = 0 (reject)
+```
+
+`[rsi+0x90]` is only ever written by the `STRE`/`STRF` chunk arms
+(`0x14407EA93`: `[rsi+0x90] = buf+8`, `[rsi+0x98] = len-8`), and this resource
+has no such chunk. The other branch needs `r12`, `rdi` and `r14` (the values
+the walker keeps for the chunk it just consumed) to be non-zero. So the next
+question is exactly: which of `r12`/`rdi`/`r14` is zero at `0x14407ECDB`, and
+which chunk arm was supposed to set it — the four candidate arms are
+`0x14407EA93` (STRE/STRF), `0x14407EAAA`, `0x14407E968` (LSNS) and
+`0x14407E9B4`.
