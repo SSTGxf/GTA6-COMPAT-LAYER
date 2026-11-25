@@ -3795,6 +3795,59 @@ static void FillUnimplementedDeviceSlots(std::index_sequence<I...>,
     for (std::size_t i = 0; i < sizeof...(I); ++i) vt[i] = stubs[i];
 }
 
+// Slot 86: CreatePipelineState (boot #154-#162; Codex branch
+// codex/slot86-create-pipeline-state, commit ee9d3fd5).
+// The boot trace identifies Xbox device slot 86 as CreatePipelineState.
+// The handler uses the public D3D12 stream signature. Confirm the Xbox
+// slot ABI against a boot call before relying on it. Forward the
+// stream unchanged so the desktop runtime can validate/compile it. This does
+// not translate Xbox-only shader instructions or emulate mesh stages.
+static HRESULT WINAPI XboxDevice_CreatePipelineState(
+    XboxDeviceWrapper* self, const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc,
+    REFIID riid, void** ppPipelineState) {
+    if (!ppPipelineState) return E_POINTER;
+    *ppPipelineState = nullptr;
+    if (!self || !self->real || !pDesc) return E_POINTER;
+
+    ID3D12Device2* device2 = nullptr;
+    HRESULT hr = self->real->QueryInterface(
+        __uuidof(ID3D12Device2), (void**)&device2);
+    if (FAILED(hr) || !device2) {
+        if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
+        Log("xboxdev",
+            "CreatePipelineState(slot86) device2 QI failed hr=0x%08x "
+            "stream=%p out=%p ret=0x%llx",
+            (unsigned)hr, (const void*)pDesc, (void*)ppPipelineState,
+            (unsigned long long)_ReturnAddress());
+        return hr;
+    }
+
+    hr = device2->CreatePipelineState(pDesc, riid, ppPipelineState);
+    device2->Release();
+    if (FAILED(hr)) {
+        *ppPipelineState = nullptr;
+    } else if (!*ppPipelineState) {
+        // A successful COM create must return the requested interface.
+        hr = E_UNEXPECTED;
+    }
+
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 8 || (n % 256) == 0 || FAILED(hr)) {
+        Log("xboxdev",
+            "CreatePipelineState(slot86) stream=%p riid={%08X-%04X-%04X-"
+            "%02X%02X-%02X%02X-%02X%02X-%02X%02X} -> hr=0x%08x "
+            "pso=%p call#%ld ret=0x%llx",
+            (const void*)pDesc, (unsigned)riid.Data1,
+            (unsigned)riid.Data2, (unsigned)riid.Data3,
+            riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
+            riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7],
+            (unsigned)hr, *ppPipelineState, (long)n,
+            (unsigned long long)_ReturnAddress());
+    }
+    return hr;
+}
+
 // Build the 192-slot Xbox device vtable once. Unimplemented slots get
 // the logging stub; known slots get their handlers.
 static void InitXboxDeviceVtable() {
@@ -3829,6 +3882,7 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[78] = (void*)XboxDevice_SetFrameIntervalX;
     g_xboxDeviceVtable[79] = (void*)XboxDevice_ScheduleFrameEventX;
     g_xboxDeviceVtable[80] = (void*)XboxDevice_WaitFrameEventX;
+    g_xboxDeviceVtable[86] = (void*)XboxDevice_CreatePipelineState;
     g_xboxDeviceVtable[127] =
         (void*)XboxDevice_CreateCommittedResource3;
     g_xboxDeviceVtable[133] = (void*)XboxDevice_CreatePlacedResourceX;
@@ -5250,6 +5304,87 @@ static const char* ScDsPackPath() {
     return (env && *env) ? env : kDsMeasuredPack;
 }
 
+// Hash-gate resolver (boot #178): the game requests many pack hashes, not
+// just the measured shaders.rpf one (0xACA58068328F107A). Resolve a hash to
+// its RPF by probing: read compSize bytes at fileOffset from each candidate
+// RPF; the pack whose bytes are a zlib stream inflating to exactly destSize
+// is the source. Proven offline for 0xb76e17e552 / 0xa01f10e922 -> data.rpf
+// (offset 0x1c2767f0, compSize 259, destSize 472). Results are cached
+// (hash -> pack path, or "none") so each hash probes once.
+struct ScDsPackCacheEntry {
+    uint64_t hash;
+    const char* path;  // nullptr = probed, no pack found
+};
+static ScDsPackCacheEntry g_dsPackCache[64];
+static int g_dsPackCacheCount = 0;
+static const char* kDsPackCandidates[] = {
+    "D:\\game\\game\\data.rpf",
+    "D:\\game\\game\\shaders.rpf",
+    "D:\\game\\game\\packs.rpf",
+    "D:\\game\\game\\textures.rpf",
+    "D:\\game\\game\\anim.rpf",
+    "D:\\game\\game\\levels.rpf",
+    "D:\\game\\game\\audio.rpf",
+    "D:\\game\\game\\movies.rpf",
+    "D:\\game\\game\\navmeshes.rpf",
+    "D:\\game\\game\\common.rpf",
+    "D:\\game\\game\\script.rpf",
+    "D:\\game\\game\\appdata0.rpf",
+};
+static const char* ScDsResolvePack(uint64_t hash, uint64_t fileOffset,
+                                   uint32_t compSize, uint32_t destSize) {
+    if (hash == kDsMeasuredHash) return ScDsPackPath();
+    for (int i = 0; i < g_dsPackCacheCount; ++i) {
+        if (g_dsPackCache[i].hash == hash) return g_dsPackCache[i].path;
+    }
+    const char* found = nullptr;
+    for (size_t p = 0;
+         p < sizeof(kDsPackCandidates) / sizeof(kDsPackCandidates[0]); ++p) {
+        const char* path = kDsPackCandidates[p];
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "rb") != 0 || !f) continue;
+        if (_fseeki64(f, (int64_t)fileOffset, SEEK_SET) != 0) {
+            fclose(f);
+            continue;
+        }
+        uint8_t* comp = (uint8_t*)malloc(compSize);
+        if (!comp) { fclose(f); continue; }
+        size_t got = fread(comp, 1, compSize, f);
+        fclose(f);
+        if (got != compSize) { free(comp); continue; }
+        if (comp[0] != 0x78 ||
+            (comp[1] != 0x01 && comp[1] != 0x5e && comp[1] != 0x9c &&
+             comp[1] != 0xda)) {
+            free(comp);
+            continue;
+        }
+        uint8_t* outBuf = (uint8_t*)malloc(destSize);
+        size_t outLen = 0;
+        HRESULT hr = outBuf ? ScOpt_DStorageDecompress(
+                                  SC_OPT_DS_DECOMP_ZLIB, comp, compSize,
+                                  outBuf, destSize, &outLen)
+                            : E_OUTOFMEMORY;
+        free(comp);
+        if (hr == S_OK && outBuf && outLen == destSize) {
+            free(outBuf);
+            found = path;
+            Log("dstorage",
+                "ResolvePack: hash 0x%016llx -> %s (offset=0x%llx "
+                "compSize=%u destSize=%u)",
+                (unsigned long long)hash, path,
+                (unsigned long long)fileOffset, compSize, destSize);
+            break;
+        }
+        free(outBuf);
+    }
+    if (g_dsPackCacheCount < 64) {
+        g_dsPackCache[g_dsPackCacheCount].hash = hash;
+        g_dsPackCache[g_dsPackCacheCount].path = found;
+        ++g_dsPackCacheCount;
+    }
+    return found;
+}
+
 extern "C" void DsqSubmit(void* self) {
     ScDsQueue* q = (ScDsQueue*)self;
     int copied = 0, refused = 0, fileSource = 0;
@@ -5270,15 +5405,6 @@ extern "C" void DsqSubmit(void* self) {
             const uint64_t hash = w[4];
             const uint64_t fileOffset = w[5];
             const uint32_t compSize = (uint32_t)w[6];
-            if (hash != kDsMeasuredHash) {
-                Log("dstorage",
-                    "Submit[%d] refused: unresolvable source hash "
-                    "0x%016llx (options=0x%016llx dest=%p destSize=%u "
-                    "offset=0x%llx compSize=%u) -> E_NOTIMPL",
-                    i, (unsigned long long)hash, (unsigned long long)options,
-                    dest, destSize, (unsigned long long)fileOffset, compSize);
-                continue;
-            }
             if (compSize == 0 || destSize == 0 ||
                 !ScRangeCommitted(dest, destSize)) {
                 Log("dstorage",
@@ -5289,6 +5415,20 @@ extern "C" void DsqSubmit(void* self) {
                     (unsigned long long)fileOffset, compSize);
                 continue;
             }
+            // Resolve the hash to its RPF (probes + caches; the measured
+            // shaders.rpf hash is a fast path). Refuse only if no pack
+            // holds a zlib stream at this offset inflating to destSize.
+            const char* packPath = ScDsResolvePack(hash, fileOffset,
+                                                   compSize, destSize);
+            if (!packPath) {
+                Log("dstorage",
+                    "Submit[%d] refused: unresolvable source hash "
+                    "0x%016llx (options=0x%016llx dest=%p destSize=%u "
+                    "offset=0x%llx compSize=%u) -> E_NOTIMPL",
+                    i, (unsigned long long)hash, (unsigned long long)options,
+                    dest, destSize, (unsigned long long)fileOffset, compSize);
+                continue;
+            }
             static bool dsInit = false;
             if (!dsInit) {
                 ScOptDsPath dsPath = SC_OPT_DS_PATH_OVERLAPPED;
@@ -5297,13 +5437,13 @@ extern "C" void DsqSubmit(void* self) {
             }
             uint8_t* comp = nullptr;
             uint32_t got = 0;
-            if (ScOpt_DStorageReadFile(ScDsPackPath(), fileOffset, compSize,
+            if (ScOpt_DStorageReadFile(packPath, fileOffset, compSize,
                                        &comp, &got) != S_OK ||
                 !comp || got != compSize) {
                 Log("dstorage",
                     "Submit[%d] refused: pack read failed (path=%s offset=0x%llx "
                     "compSize=%u got=%u) -> E_FAIL",
-                    i, ScDsPackPath(), (unsigned long long)fileOffset,
+                    i, packPath, (unsigned long long)fileOffset,
                     compSize, got);
                 free(comp);
                 continue;

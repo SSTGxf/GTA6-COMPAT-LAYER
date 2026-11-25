@@ -200,7 +200,7 @@ subsystem, not a dead harness.
 
 **GTA VI boots on PC through this layer: the real exe loads, init returns TRUE, and the game runs to PSO creation territory (172 boots). No game frame yet, no menu yet.**
 
-**Progress: ~44% proven toward first menu (GPU-copy path for CBV sources PROVEN in boot #177 — all 8 unaligned CBVs now carry real data via a READBACK-staged GPU copy, 16,084 lines, the game passed the 0x1425A087D read crash; CBV unaligned-location fix PROVEN in boot #172 — the game passed the DEVICE_REMOVED assert at 0x142474606 and ran 16,079 log lines, nearly 4x further than boots #169/#170; TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; game still hammering slot 86 for PSO creation, 28,000+ calls/boot in #162; slot 86 still E_NOTIMPL, no frame yet; current stop is an int3 at 0x141DAC734 in boot #177, after DStorage refuses an unresolvable source hash — the hash gate).**
+**Progress: ~44% proven toward first menu (slot 86 CreatePipelineState implemented — forwards the D3D12 stream to the desktop device (Codex branch ee9d3fd5); hash-gate resolver implemented — probes RPFs for the pack whose zlib stream inflates to destSize, proven offline for 0xb76e17e552 -> data.rpf; GPU-copy path for CBV sources PROVEN in boot #177 — all 8 unaligned CBVs now carry real data via a READBACK-staged GPU copy, 16,084 lines, the game passed the 0x1425A087D read crash; CBV unaligned-location fix PROVEN in boot #172 — the game passed the DEVICE_REMOVED assert at 0x142474606 and ran 16,079 log lines, nearly 4x further than boots #169/#170; TEXTURE1D fixed, 0x1424840C5 crash cleared in boot #113, layout 258 done in boot #158, BCPack B1 + B2 done, depth fix in boots #163/#164, layout 256 done in boot #168; boot #178 was a flaky early crash (0x142215C35, same as #171), boot #179 pending to verify slot 86 + hash gate; no frame yet).**
 
 | Milestone | Status | Evidence |
 |---|---|---|
@@ -245,6 +245,7 @@ subsystem, not a dead harness.
 | Shader Phase 8: mesh-as-compute (CPU reference model) | ✅ | Entry 29, commit 51d86fe9, 79 checks, order-independent validator |
 | Link contract (no-DXC link smoke test) | ✅ | Entry 29, commit 51d86fe9, LNK2019 without emitter, clean link + run with it |
 | CBV unaligned-location fix (slot 17 copies to aligned scratch) | ✅ | Boot #172, 8 unaligned CBVs repointed to aligned scratch buffers, 0x142474606 absent (0 occurrences in 16,079 lines), game runs ~4x further than #169/#170; boot #177, GPU-copy path PROVEN — all 8 CBVs (copied) with real data via READBACK staging, game past 0x1425A087D |
+| Slot 86 CreatePipelineState (forwards D3D12 stream to desktop device) | ✅ | Implemented (Codex branch ee9d3fd5); builds clean, boot #179 pending to verify the game gets past the PSO wall |
 | Hash gate in Submit | ❌ | After slots 4/6 + overrun |
 | PSO creation (slots 86/16) | ❌ | E_NOTIMPL, no pipeline yet |
 | Real shader translation from corpus | ❌ | No corpus yet (slots 86/16 don't create PSOs), no game shader translated |
