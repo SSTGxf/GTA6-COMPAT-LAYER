@@ -744,12 +744,14 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
 
 // Walk the chunk stream the way the gate frames it (BE fourcc + BE length) and
 // log the sequence once per distinct buffer, so the rejection point is named.
-static void ScLogChunkWalk(const void* buf, uint32_t size) {
+static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
     static const void* seen[8] = {};
+    bool logged = false;
     for (int i = 0; i < 8; ++i)
-        if (seen[i] == buf) return;
-    for (int i = 0; i < 8; ++i)
-        if (!seen[i]) { seen[i] = buf; break; }
+        if (seen[i] == buf) logged = true;
+    if (!logged)
+        for (int i = 0; i < 8; ++i)
+            if (!seen[i]) { seen[i] = buf; break; }
     char line[512] = {};
     size_t o = 0;
     uint32_t off = 0;
@@ -769,16 +771,30 @@ static void ScLogChunkWalk(const void* buf, uint32_t size) {
         if (len < 8 || len > size - off) break;
         off += len;
     }
-    Log("loader", "gate-probe walk size=%u chunks: %s", size, line);
+    if (!logged)
+        Log("loader", "gate-probe walk size=%u framedEnd=%u chunks: %s", size,
+            off, line);
+    return off;
 }
 
 static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
                         void* a5, void* a6) {
+    // Framing fix: the size the guest hands the parser is its DStorage request
+    // total (e.g. 139*65536 + 58896 = 9168400), not the stream's framed extent.
+    // The parser walks chunk headers, so bytes past the last chunk are read as a
+    // bogus header and rejected. Hand it the terminal chunk end the walk itself
+    // computes; streams that already end on a chunk boundary are unchanged.
+    // Boot #208 measured that trimming to the walked end does NOT help (the call
+    // still returned 0 with size=9168284), so the raw size is handed through
+    // unchanged: the stream really is 9,168,400 bytes and its trailing 116 bytes
+    // (LGID 8 + LRSC 0x58 + CHKS 0x14 = 116) are meant to be there but arrived as
+    // garbage, so the defect is in what the read path wrote, not in the length.
     ScLogChunkWalk(buf, size);
+    const uint32_t useSize = size;
     ScGateFn real = (ScGateFn)(uintptr_t)0x14407e700ull;
     ScLogGate("entry", obj, buf, size, flag, a5, a6, false, 0);
-    bool r = real(obj, buf, size, flag, a5, a6);
-    ScLogGate("return", obj, buf, size, flag, a5, a6, r, r ? 1 : 0);
+    bool r = real(obj, buf, useSize, flag, a5, a6);
+    ScLogGate("return", obj, buf, useSize, flag, a5, a6, r, r ? 1 : 0);
     return r;
 }
 

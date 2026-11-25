@@ -721,3 +721,26 @@ Restated cause (measured): framing — the buffer handed to the gate does not en
 a chunk boundary; 116 trailing bytes follow `LSNS` and are rejected. Whether those
 bytes belong to the stream (padding the parser should accept) or are extra bytes
 the loader should not have included is the open question.
+
+## §18 Framing hypothesis killed by measurement (boot #208) — the missing 116 bytes are the trailing chunks
+
+Boot #208 (`build_ga208`) handed the parser the walked framed extent instead of
+the request total:
+
+```
+gate-probe walk size=9168400 framedEnd=9168284 chunks: [0]PSIN(len=0x3340c0) [3358912]LSCH(len=0x4c8) [3360136]LENM(len=0xb0) [3360312]LSNS(len=0x589f64) [9168284]<garbage>(0x56d61794,len=0xb4e073cd)
+gate-probe return tid=804 ... size=9168284 fourcc='PSIN' beLen=0x3340c0 ... ret=0 al=0
+veh: exception 0x80000003 at 00000001409DFC18 thread 804
+```
+
+Reducing the length did **not** help: the gate still returns 0. So the parse size
+was not the defect and the trim is reverted (the raw size is passed through again).
+
+The real reading of the numbers: the small streams are
+`PSIN,LSCH,LENM,LSNS,LGID,LRSC,CHKS` and end on `CHKS`; the big stream stops at
+`LSNS` and its trailing 116 bytes are garbage. `LGID` (8) + `LRSC` (0x58 = 88) +
+`CHKS` (0x14 = 20) = **116** — exactly the shortfall. So the stream is meant to be
+fully 9,168,400 bytes and its final three chunks arrive as garbage: the defect is
+in what the read path wrote for that tail, not in the length handed to the gate.
+
+Open: which write leaves the last 116 bytes unwritten/garbage.
