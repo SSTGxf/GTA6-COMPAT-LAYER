@@ -1221,3 +1221,27 @@ New fact for the record: those bytes differ between boots (`42 00 00 00 00 00 00
 00 02 00` vs all zeros), so the region at the boundary is not written consistently —
 consistent with the copy covering only part of the extent, and further reason not to
 frame the tail.
+
+## §37 Boot #247 chunk accounting: the raw-copy path does not deliver this buffer
+
+Per-chunk delivery lines from `scarlett_boot247.log` (59 in total):
+
+```
+raw copy chunk dest=1cf52083770 src=1d23afd5590 destSize=16    compSize=16
+raw copy chunk dest=1cf4febaba0 src=1d23afd51f0 destSize=16    compSize=16
+raw copy chunk dest=1cf4e5de5c0 src=1d23b5c5010 destSize=65536 compSize=65536
+```
+
+Sizes are 16 or 65536; distinct destinations differ. 59 chunks cannot sum to
+9,168,400 (139 pages). **The 9,168,400-byte buffer is therefore not assembled through
+this raw-copy path** — extending `memcpy((void*)dest, comp, destSize)` could never fill
+its trailing 58,896 bytes, and the earlier plan to do so was based on a wrong
+assumption about which path delivers that member.
+
+Gate state on the same boot: `big=63`, `fwd=clamped-to-framed-end`,
+`gate-frame size=9168400 end=9168284 lgid=0xffffffff lrsc=0xffffffff chks=0xffffffff
+missing-CHKS`, and the guest re-offers the stream after each refusal.
+
+Open: which path populates that 9,168,400-byte buffer (guest-side file read into a
+mapped view, or a streaming path other than the raw-copy submit), and why its final
+116 bytes never contain the terminator. No stream byte was authored; clamp untouched.
