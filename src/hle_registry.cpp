@@ -2022,6 +2022,91 @@ static HRESULT WINAPI XboxDevice_CreateCommittedResource(
     return hr;
 }
 
+// Slot 41: CreateCommandSignature. Boot #106's new frontier (0x1424844A9)
+// was a null 3x72 table: the init at 0x142478440 calls device slot 41 and
+// takes `js 0x1424787A7` when it fails, skipping the table allocation at
+// 0x142479662; the later TLS path then wrote through the null table. The
+// stub logged `UNIMPLEMENTED slot 41 (vtable +0x148)` and returned
+// E_NOTIMPL. The guest passes (desc, pRootSignature=NULL, IID, out) with
+// IID_ID3D12CommandSignature (0xc36a797c-ec80-4f0a-8985-a7b2475082d1),
+// verified from the dump, so forward it to the real device.
+static HRESULT WINAPI XboxDevice_CreateCommandSignature(
+    XboxDeviceWrapper* self, const D3D12_COMMAND_SIGNATURE_DESC* pDesc,
+    ID3D12RootSignature* pRootSignature, REFIID riid,
+    void** ppvCommandSignature) {
+    if (!self || !self->real) return E_POINTER;
+    // Boot #108: the third signature is stride 12 with guest type code 0x69
+    // (105), which is not a desktop D3D12_INDIRECT_ARGUMENT_TYPE. The same
+    // guest builder prepares the standard DISPATCH (2) and DISPATCH_MESH (10)
+    // descs for the identical 12-byte layout (sizeof(D3D12_DISPATCH_ARGUMENTS)
+    // = 3 UINT), so 105 is the Xbox dispatch-family code for that layout.
+    // Translate it to desktop DISPATCH on a private copy: the guest's memory
+    // is left untouched and every other type passes through unchanged.
+    D3D12_INDIRECT_ARGUMENT_DESC argDescs[8];
+    D3D12_COMMAND_SIGNATURE_DESC xlatDesc;
+    const D3D12_COMMAND_SIGNATURE_DESC* pForward = pDesc;
+    bool translated = false;
+    if (pDesc && pDesc->pArgumentDescs && pDesc->NumArgumentDescs &&
+        pDesc->NumArgumentDescs <= 8) {
+        __try {
+            for (UINT i = 0; i < pDesc->NumArgumentDescs; ++i) {
+                argDescs[i] = pDesc->pArgumentDescs[i];
+                if ((UINT)argDescs[i].Type == 105u &&
+                    pDesc->ByteStride == sizeof(D3D12_DISPATCH_ARGUMENTS)) {
+                    argDescs[i].Type =
+                        D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+                    translated = true;
+                }
+            }
+            xlatDesc = *pDesc;
+            xlatDesc.pArgumentDescs = argDescs;
+            pForward = &xlatDesc;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            pForward = pDesc;
+            translated = false;
+        }
+    }
+    HRESULT hr = self->real->CreateCommandSignature(
+        pForward, pRootSignature, riid, ppvCommandSignature);
+    if (hr == E_NOINTERFACE && ppvCommandSignature) {
+        hr = self->real->CreateCommandSignature(
+            pForward, pRootSignature, __uuidof(ID3D12CommandSignature),
+            ppvCommandSignature);
+    }
+    // Boot #107: the third signature (stride 12, dispatch-shaped) came back
+    // E_INVALIDARG from the desktop, so log the argument desc itself — the
+    // guest's type code is what decides whether this is a layout mismatch.
+    unsigned argType = 0xFFFFFFFFu, a0 = 0, a1 = 0, a2 = 0;
+    const void* argPtr = nullptr;
+    if (pDesc) {
+        argPtr = pDesc->pArgumentDescs;
+        __try {
+            if (pDesc->pArgumentDescs && pDesc->NumArgumentDescs) {
+                const D3D12_INDIRECT_ARGUMENT_DESC* d =
+                    pDesc->pArgumentDescs;
+                argType = (unsigned)d->Type;
+                const UINT* raw = (const UINT*)&d->Constant;
+                a0 = raw[0];
+                a1 = raw[1];
+                a2 = raw[2];
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            argType = 0xFFFFFFFEu;
+        }
+    }
+    Log("xboxdev",
+        "CreateCommandSignature desc=%p stride=%u args=%u node=%u rs=%p "
+        "argdesc=%p type=%u u=%u/%u/%u xlat=%u -> hr=0x%08x sig=%p "
+        "ret=0x%llx",
+        (const void*)pDesc, pDesc ? pDesc->ByteStride : 0,
+        pDesc ? pDesc->NumArgumentDescs : 0, pDesc ? pDesc->NodeMask : 0,
+        (void*)pRootSignature, argPtr, argType, a0, a1, a2,
+        translated ? 1u : 0u, (unsigned)hr,
+        ppvCommandSignature ? *ppvCommandSignature : nullptr,
+        (unsigned long long)_ReturnAddress());
+    return hr;
+}
+
 // Slot 39: CreateQueryHeap. Boot #103's DR probe named this as the wall's
 // cause: the guest's container init (0x142481AA0, mode 1) calls
 // device[0x138] with D3D12_QUERY_HEAP_DESC{Type=0 (occlusion), Count=2460,
@@ -2331,6 +2416,52 @@ static UINT WINAPI XboxDevice_GetDescriptorHandleIncrementSize(
     Log("xboxdev", "GetDescriptorHandleIncrementSize type=%u -> %u",
         (unsigned)type, n);
     return n;
+}
+
+// Slot 16: CreateRootSignature. Boot #109 (#63 before it) logged four calls
+// from 0x140FA0B3B with the desktop argument order verbatim: nodeMask=1,
+// pBlob (a 92-byte serialized root signature), blobLength=0x5C, riid, ppv.
+// The slot had no layer entry, so every creation returned E_NOTIMPL; the
+// following PSO-cache lookup (0x141D65750) came back empty and the success
+// path dereferenced the null entry at 0x140B5A5F8. Forward it, retrying with
+// the desktop root-signature IID when the console IID is not understood.
+static HRESULT WINAPI XboxDevice_CreateRootSignature(
+    XboxDeviceWrapper* self, UINT nodeMask, const void* pBlob,
+    SIZE_T blobLength, REFIID riid, void** ppRootSignature) {
+    if (!self || !self->real) return E_POINTER;
+    HRESULT hr = self->real->CreateRootSignature(
+        nodeMask, pBlob, blobLength, riid, ppRootSignature);
+    if (hr == E_NOINTERFACE && ppRootSignature) {
+        hr = self->real->CreateRootSignature(
+            nodeMask, pBlob, blobLength, __uuidof(ID3D12RootSignature),
+            ppRootSignature);
+    }
+    Log("xboxdev",
+        "CreateRootSignature node=%u blob=%p len=%llu -> hr=0x%08x sig=%p "
+        "ret=0x%llx",
+        (unsigned)nodeMask, pBlob, (unsigned long long)blobLength,
+        (unsigned)hr, ppRootSignature ? *ppRootSignature : nullptr,
+        (unsigned long long)_ReturnAddress());
+    return hr;
+}
+
+// Slot 24: CopyDescriptorsSimple. Boot #109 logged (n=1, dest, src, type=1)
+// from 0x144ECC884. The desktop ABI is identical and the CPU descriptor
+// handles travel in registers, so forward directly.
+static void WINAPI XboxDevice_CopyDescriptorsSimple(
+    XboxDeviceWrapper* self, UINT numDescriptors,
+    D3D12_CPU_DESCRIPTOR_HANDLE destRangeStart,
+    D3D12_CPU_DESCRIPTOR_HANDLE srcRangeStart,
+    D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    if (!self || !self->real) return;
+    self->real->CopyDescriptorsSimple(numDescriptors, destRangeStart,
+                                     srcRangeStart, type);
+    Log("xboxdev",
+        "CopyDescriptorsSimple n=%u dest=0x%llx src=0x%llx type=%u "
+        "ret=0x%llx",
+        (unsigned)numDescriptors, (unsigned long long)destRangeStart.ptr,
+        (unsigned long long)srcRangeStart.ptr, (unsigned)type,
+        (unsigned long long)_ReturnAddress());
 }
 
 // Slot 78: SetFrameIntervalX(output, interval_us, latency, flags).
@@ -2697,17 +2828,20 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[9] = (void*)XboxDevice_CreateCommandAllocator;
     g_xboxDeviceVtable[14] = (void*)XboxDevice_CreateDescriptorHeap;
     g_xboxDeviceVtable[15] = (void*)XboxDevice_GetDescriptorHandleIncrementSize;
+    g_xboxDeviceVtable[16] = (void*)XboxDevice_CreateRootSignature;
     g_xboxDeviceVtable[17] = (void*)XboxDevice_CreateConstantBufferView;
     g_xboxDeviceVtable[18] = (void*)XboxDevice_CreateShaderResourceView;
     g_xboxDeviceVtable[19] = (void*)XboxDevice_CreateUnorderedAccessView;
     g_xboxDeviceVtable[20] = (void*)XboxDevice_CreateRenderTargetView;
     g_xboxDeviceVtable[21] = (void*)XboxDevice_CreateDepthStencilView;
+    g_xboxDeviceVtable[24] = (void*)XboxDevice_CopyDescriptorsSimple;
     g_xboxDeviceVtable[25] = (void*)XboxDevice_GetResourceAllocationInfo;
     g_xboxDeviceVtable[108] = (void*)XboxDevice_GetResourceAllocationInfo1;
     g_xboxDeviceVtable[26] = (void*)XboxDevice_GetCustomHeapProperties;
     g_xboxDeviceVtable[27] = (void*)XboxDevice_CreateCommittedResource;
     g_xboxDeviceVtable[36] = (void*)XboxDevice_CreateFence;
     g_xboxDeviceVtable[39] = (void*)XboxDevice_CreateQueryHeap;
+    g_xboxDeviceVtable[41] = (void*)XboxDevice_CreateCommandSignature;
     g_xboxDeviceVtable[48] = (void*)XboxDevice_CreateCommandQueue;
     g_xboxDeviceVtable[73] = (void*)XboxDevice_CreateCommandList;
     g_xboxDeviceVtable[74] = (void*)XboxDevice_RegisterPagePoolX;
