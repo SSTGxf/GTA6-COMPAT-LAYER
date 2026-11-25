@@ -863,6 +863,34 @@ static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
 }
 
 
+
+static void ScBufProbe(const void* b, uint32_t n, const char* phase) {
+    const uint8_t* q = (const uint8_t*)b;
+    uint64_t first8 = 0, last8 = 0, tail8 = 0;
+    unsigned nonzero = 0, chunks = 0;
+    __try {
+        for (int i = 0; i < 8; ++i) first8 |= (uint64_t)q[i] << (8 * i);
+        for (int i = 0; i < 8; ++i) last8 |= (uint64_t)q[n - 8 + i] << (8 * i);
+        const uint32_t toff = (n > 116) ? n - 116 : 0;
+        for (int i = 0; i < 8 && toff + i < n; ++i)
+            tail8 |= (uint64_t)q[toff + i] << (8 * i);
+        for (uint32_t o = 0; o < n; o += 0x40000u) {
+            ++chunks;
+            uint32_t end = (o + 0x40000u < n) ? o + 0x40000u : n;
+            for (uint32_t k = o; k < end; ++k)
+                if (q[k]) { ++nonzero; break; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    Log("loader",
+        "bufProbe %s buf=0x%llx size=%u first8=%llx last8=%llx tail@%u=%llx "
+        "nonzeroChunks=%u/%u",
+        phase, (unsigned long long)(uintptr_t)b, n,
+        (unsigned long long)first8, (unsigned long long)last8,
+        (unsigned)((n > 116) ? n - 116 : 0), (unsigned long long)tail8,
+        nonzero, chunks);
+}
+
 static void ScLogBufRange(const void* b, uint32_t n) {
     Log("loader", "bufRange=0x%llx-0x%llx size=%u",
         (unsigned long long)(uintptr_t)b,
@@ -888,6 +916,7 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
     // framed end to the real gate for this buffer only; every other buffer keeps
     // its size unchanged.
     const uint32_t useSize = (size == 9168400u) ? 9168284u : size;
+    if (size == 9168400u) ScBufProbe(buf, size, "pre");
     Log("loader", "gate-forward in=%u out=%u %s", size, useSize,
         useSize == size ? "unchanged" : "clamped-to-framed-end");
     ScGateFn real = (ScGateFn)(uintptr_t)0x14407e700ull;
@@ -917,7 +946,9 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
             (unsigned long long)(lrsc < 0 ? 0xffffffffull : (uint64_t)lrsc),
             (unsigned long long)(chks < 0 ? 0xffffffffull : (uint64_t)chks), verdict);
     }
+    if (size == 9168400u) ScBufProbe(buf, size, "preCall");
     bool r = real(obj, buf, useSize, flag, a5, a6);
+    if (size == 9168400u) ScBufProbe(buf, size, "postCall");
     ScLogGate("return", obj, buf, useSize, flag, a5, a6, r, r ? 1 : 0);
     return r;
 }

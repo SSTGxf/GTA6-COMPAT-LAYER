@@ -44,3 +44,23 @@ lists are short and complete.
 
 Verdict stands as **N** (no mapped view intersects
 `0x1c0da096bc0-0x1c0da9551d0`), now with import-level support rather than a bare count.
+
+### Framed buffer is mostly EMPTY at gate time (boot #262, build_ga250)
+
+`bufProbe` around the real gate call, 9,168,400-byte buffer:
+
+```
+bufProbe pre      buf=0x2411a07ac80 size=9168400 first8=c04033004e495350 last8=0
+                  tail@9168284=0 nonzeroChunks=14/35
+bufProbe postCall buf=0x2411a07ac80 size=9168400 first8=c04033004e495350 last8=0
+                  tail@9168284=0 nonzeroChunks=14/35
+```
+
+Reading `first8` little-endian: `50 53 49 4e 00 33 40 c0` = `PSIN` + beLen `0x3340c0`,
+so the header is genuine. But **only 14 of 35 sampled 256 KiB chunks contain a single
+non-zero byte**, `last8 = 0`, and `tail@9168284 = 0`. Pre and post are identical, so the
+gate mutates nothing.
+
+**Fault (one sentence):** the guest offers the gate a 9,168,400-byte buffer that is mostly
+zero — 21 of 35 chunks entirely zero and the whole tail region zero — so the terminator is
+missing because the *payload was never written*, not because a length field is wrong.
