@@ -50,7 +50,7 @@ echo [build] decoder + frontend, no emitter linked
 cl -nologo -std:c++17 -EHsc -W4 -DSC_FRONTEND_NO_DXC -Iinclude ^
    -Fe:out\shader_tests\sc_isa_test.exe ^
    -Fo:out\shader_tests\isa\ ^
-   %SRC% tests\shader\sc_isa_main.cpp
+   %SRC% src\shader\sc_wave.cpp tests\shader\sc_isa_main.cpp
 if errorlevel 1 (
     echo BUILD FAILED isa-build: the decoder must not depend on the emitter
     popd

@@ -10,6 +10,7 @@
 // The walk cases then cover every stop reason, including the settled MIMG stop,
 // and the last section goes through the Phase 3 frontend so the
 // frontend -> code region -> instruction stream seam is exercised end to end.
+#include "shader/sc_wave.h"
 #include "shader/sc_frontend.h"
 #include "shader/sc_isa.h"
 
@@ -91,7 +92,10 @@ void test_assembler_words() {
         // v_cmp_eq_f32_sdwa s105, v0, s105 -> [0xf9,0xd2,0x04,0x7c, 0x00,0xe9,0x06,0x86]
         {"v_cmp_eq_f32_sdwa s105, v0, s105", 0x7C04D2F9u, sc_isa_format::vopc, 2, true, 2, sc_isa_extra::sdwa},
         // flat_load_dword v1, v[3:4] -> [0x00,0x00,0x30,0xdc, 0x03,0x00,0x7d,0x01]
-        {"flat_load_dword v1, v[3:4]", 0xDC300000u, sc_isa_format::flat, 2, false, 0, sc_isa_extra::none},
+        // FLAT opcode is bits 24:18: the range that maps all 88 mnemonics of
+        // gfx10_asm_flat.s to exactly one value each (46 distinct values, since
+        // flat_/global_/scratch_ share an opcode). Here bits 24:18 = 0x0C = 12.
+        {"flat_load_dword v1, v[3:4]", 0xDC300000u, sc_isa_format::flat, 2, true, 12, sc_isa_extra::none},
         // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 2), 3
         //   gfx1010: [0x01,0x08,0x80,0xba,0x03,0x00,0x00,0x00]  -> 64-bit SOPK, opcode 0x15
         {"s_setreg_imm32_b32 hwreg(MODE,0,2), 3", 0xBA800801u, sc_isa_format::sopk, 2, true, 21,
@@ -195,7 +199,7 @@ void test_format_buckets() {
         {"ds", 0xD8000000u, sc_isa_format::ds, 2},       {"flat", 0xDC000000u, sc_isa_format::flat, 2},
         {"mubuf", 0xE0000000u, sc_isa_format::mubuf, 2}, {"mtbuf", 0xE8000000u, sc_isa_format::mtbuf, 2},
         {"smem", 0xF4000000u, sc_isa_format::smem, 2},   {"exp", 0xF8000000u, sc_isa_format::exp, 2},
-        {"mimg", 0xF0000000u, sc_isa_format::mimg, 0},   {"unknown", 0xFFFFFFFFu, sc_isa_format::unknown, 0},
+        {"mimg", 0xF0000000u, sc_isa_format::mimg, 2},   {"unknown", 0xFFFFFFFFu, sc_isa_format::unknown, 0},
     };
     for (const auto& b : buckets) {
         const sc_isa_instruction inst = sc_isa_decode_word(b.word);
@@ -413,21 +417,21 @@ void test_walk_cases() {
         CHECK(w.stop_offset == 4);
         std::printf("   trailing after terminator -> stop=%s at %u\n", sc_isa_stop_name(w.stop), w.stop_offset);
     }
-    // MIMG is the settled stop: the walk reports it and keeps the verified prefix.
+    // MIMG is sized from its dim field (bits 2:1): measured on all 232 text-bearing
+    // MIMG fixture rows as exactly one extra dword per dim code (0->2, 1->3, 2->4).
     {
-        const std::vector<uint8_t> img = u32s({0x7E000269u, 0xF0000000u, 0xBF810000u});
+        const std::vector<uint8_t> img = u32s({0xF0000000u, 0x00000000u, 0xBF810000u});
         const sc_isa_walk w = sc_isa_walk_stream(img.data(), img.size());
-        CHECK(!w.synced);
-        CHECK(w.stop == sc_isa_stop::mimg_unsupported);
-        CHECK(w.stop_offset == 4);
-        CHECK(w.instructions.size() == 1);
-        CHECK(w.bytes_covered == 4);
-        CHECK(w.stop_dword == 0xF0000000u);
-        std::printf("   mimg -> stop=%s at %u (verified prefix %u bytes, %zu instruction)\n",
-                    sc_isa_stop_name(w.stop), w.stop_offset, w.bytes_covered, w.instructions.size());
-        for (const auto& line : w.evidence) {
-            std::printf("      %s\n", line.c_str());
-        }
+        CHECK(w.synced);
+        CHECK(w.instructions.size() == 2);
+        CHECK(w.bytes_covered == 12);
+        CHECK(sc_isa_decode_word(0xF0000000u).words == 2);
+        CHECK(sc_isa_decode_word(0xF0000002u).words == 3);
+        CHECK(sc_isa_decode_word(0xF0000004u).words == 4);
+        std::printf("   mimg sized by dim: words=%u/%u/%u synced=%d",
+                    sc_isa_decode_word(0xF0000000u).words, sc_isa_decode_word(0xF0000002u).words,
+                    sc_isa_decode_word(0xF0000004u).words, w.synced ? 1 : 0);
+        std::printf("%c", 10);
     }
     // Unknown encoding.
     {
@@ -557,6 +561,153 @@ void test_json() {
 
 } // namespace
 
+// ------------------------------------------------------------ memory operands
+// Words copied from the fixture rows named below; every position was measured
+// over the whole harvested gfx10 set (measure_memory_operands.py).
+void test_memory_operands() {
+    banner("memory formats: the measured operand fields");
+    auto decode2 = [](uint32_t w0, uint32_t w1, sc_wave_decode& out) {
+        std::vector<uint8_t> bytes;
+        for (uint32_t w : {w0, w1}) {
+            for (int shift = 0; shift < 32; shift += 8) {
+                bytes.push_back(static_cast<uint8_t>((w >> shift) & 0xffu));
+            }
+        }
+        out = sc_decode_wave(sc_isa_walk_stream(bytes.data(), bytes.size()));
+    };
+    {
+        // gfx10_asm_mubuf.s: buffer_atomic_add v255, off, s[8:11], s3 offset:4095
+        sc_wave_decode d;
+        decode2(0xE0C80FFFu, 0x0302FF00u, d);
+        CHECK(!d.instructions.empty());
+        if (!d.instructions.empty()) {
+            const sc_instruction_operands& io = d.instructions[0];
+            CHECK(io.format == sc_isa_format::mubuf);
+            CHECK(io.has_mem_vdst && io.mem_vdst.file == sc_operand_file::vgpr &&
+                  io.mem_vdst.index == 255);
+            CHECK(io.has_mem_srsrc && io.mem_srsrc.index == 8);
+            // off -> 39:32 == 0; offset:4095 -> word0 11:0; s3 -> soffset 63:56.
+            CHECK(io.has_mem_mubuf_vaddr && io.mem_mubuf_vaddr == 0u);
+            CHECK(io.has_mem_mubuf_offset && io.mem_mubuf_offset == 0xFFFu);
+            CHECK(io.has_mem_soffset && io.mem_soffset == 3u);
+        }
+        // gfx10_asm_mubuf.s: buffer_atomic_add v5, off, s[12:15], s3 offset:4095
+        sc_wave_decode d2;
+        decode2(0xE0C80FFFu, 0x03030500u, d2);
+        CHECK(!d2.instructions.empty());
+        if (!d2.instructions.empty()) {
+            CHECK(d2.instructions[0].mem_vdst.index == 5);
+            CHECK(d2.instructions[0].mem_srsrc.index == 12);
+            CHECK(d2.instructions[0].mem_mubuf_vaddr == 0u);
+            CHECK(d2.instructions[0].mem_mubuf_offset == 0xFFFu);
+            CHECK(d2.instructions[0].mem_soffset == 3u);
+        }
+    }
+    {
+        // MIMG fixture rows decoded through sc_decode_instruction: the caller supplies
+        // the words and their count, so these assertions do not depend on the stream
+        // walker. vdst 47:40, vaddr 39:32, srsrc 52:48 (V# base / 4).
+        { // image_load v[1:4], [v2, v3], s[4:11] dmask:0xf dim:S
+            const uint32_t w[] = {0xF0001F0Au, 0x00010102u, 0x00000003u};
+            const sc_instruction_operands io = sc_decode_instruction(w, 3u);
+            CHECK(io.format == sc_isa_format::mimg);
+            CHECK(io.has_mem_vdst && io.mem_vdst.index == 1u);
+            CHECK(io.has_mem_vaddr && io.mem_vaddr.index == 2u);
+            CHECK(io.has_mem_srsrc && io.mem_srsrc.index == 4u);
+            CHECK(io.has_mem_dmask && io.mem_dmask == 0xFu);   // dmask:0xf, word0 11:8
+            CHECK(io.has_mem_nsa && io.mem_nsa_slots == 5u);   // dim 2:1 == 1: one extra dword
+            CHECK(io.mem_nsa_vgpr[0] == 2u && io.mem_nsa_vgpr[1] == 3u);
+        }
+        { // image_load v[0:3], [v4, v5, v6], s[8:15] dmask:0xf d
+            const uint32_t w[] = {0xF0001F12u, 0x00020004u, 0x00000605u};
+            const sc_instruction_operands io = sc_decode_instruction(w, 3u);
+            CHECK(io.format == sc_isa_format::mimg);
+            CHECK(io.has_mem_vdst && io.mem_vdst.index == 0u);
+            CHECK(io.has_mem_vaddr && io.mem_vaddr.index == 4u);
+            CHECK(io.has_mem_srsrc && io.mem_srsrc.index == 8u);
+            CHECK(io.has_mem_dmask && io.mem_dmask == 0xFu);   // dmask:0xf, word0 11:8
+            CHECK(io.has_mem_nsa && io.mem_nsa_slots == 5u);   // dim 2:1 == 1: one extra dword
+            CHECK(io.mem_nsa_vgpr[0] == 4u && io.mem_nsa_vgpr[1] == 5u && io.mem_nsa_vgpr[2] == 6u);
+        }
+        { // image_load v[0:3], [v4, v5, v6, v7], s[8:15] dmask:0
+            const uint32_t w[] = {0xF0001F3Au, 0x00020004u, 0x00070605u};
+            const sc_instruction_operands io = sc_decode_instruction(w, 3u);
+            CHECK(io.format == sc_isa_format::mimg);
+            CHECK(io.has_mem_vdst && io.mem_vdst.index == 0u);
+            CHECK(io.has_mem_vaddr && io.mem_vaddr.index == 4u);
+            CHECK(io.has_mem_srsrc && io.mem_srsrc.index == 8u);
+            CHECK(io.has_mem_dmask && io.mem_dmask == 0xFu);   // dmask:0xf, word0 11:8
+            CHECK(io.has_mem_nsa && io.mem_nsa_slots == 5u);   // dim 2:1 == 1: one extra dword
+            CHECK(io.mem_nsa_vgpr[0] == 4u && io.mem_nsa_vgpr[1] == 5u && io.mem_nsa_vgpr[2] == 6u);
+        }
+    }
+    {
+        // gfx10_asm_smem.s: s_atomic_add s5, s[2:3], 0x64
+        sc_wave_decode d;
+        decode2(0xF6080141u, 0xFA000064u, d);
+        CHECK(!d.instructions.empty());
+        if (!d.instructions.empty()) {
+            CHECK(d.instructions[0].has_mem_sdata && d.instructions[0].mem_sdata.index == 5);
+            // s[2:3] -> (word0 5:0) * 2; 0x64 -> dword1 20:0; the 0x7d at 31:25 is the
+            // offset-form marker, so no s[] soffset is claimed here.
+            CHECK(d.instructions[0].has_mem_sbase && d.instructions[0].mem_sbase == 2u);
+            CHECK(d.instructions[0].has_mem_smem_offset && d.instructions[0].mem_smem_offset == 0x64u);
+            CHECK(d.instructions[0].has_mem_smem_soffset && d.instructions[0].mem_smem_soffset == 0x7du);
+        }
+    }
+    {
+        // gfx10_asm_ds.s: ds_add_f32 v0, v1 offset:4660
+        sc_wave_decode d;
+        decode2(0xD8541234u, 0x00000100u, d);
+        CHECK(!d.instructions.empty());
+        if (!d.instructions.empty()) {
+            const sc_instruction_operands& io = d.instructions[0];
+            CHECK(io.has_mem_offset && io.mem_offset == 4660);
+            // Printed DS registers are dword1 bytes: ds_add_f32 v0, v1 is (7:0, 15:8).
+            CHECK(io.has_mem_ds_roles);
+            CHECK(io.mem_ds_role[0] == 0u && io.mem_ds_role[1] == 1u);
+            CHECK(!io.has_mem_vdst && !io.has_mem_vaddr);
+        }
+    }
+    {
+        // gfx10_asm_mimg.s:269  image_sample v[64:66], v32, s[4:11], s[100:103]
+        // dmask:0x7 dim:SQ_RSRC_IMG_1D -> 0xF0800700 0x03214020. The sampler is
+        // dword1 25:21 in 4-SGPR units: (0x03214020 >> 21) & 0x1F == 25 -> s100.
+        {
+            const uint32_t w[] = {0xF0800700u, 0x03214020u};
+            const sc_instruction_operands io = sc_decode_instruction(w, 2u);
+            CHECK(io.format == sc_isa_format::mimg);
+            CHECK(io.has_mem_srsrc && io.mem_srsrc.index == 4u);
+            CHECK(io.has_mem_ssamp && io.mem_ssamp == 100u);
+        }
+        // gfx10_asm_flat.s:200  flat_load_dword v5, v[1:2] -> 0xDC300000 0x057D0001:
+        // vdst 63:56 = 5, vaddr 39:32 = 1, saddr 55:48 = 0x7D (off).
+        {
+            const uint32_t w[] = {0xDC300000u, 0x057D0001u};
+            const sc_instruction_operands io = sc_decode_instruction(w, 2u);
+            CHECK(io.format == sc_isa_format::flat);
+            CHECK(io.has_mem_flat);
+            CHECK(io.mem_flat_vdst == 5u && io.mem_flat_vaddr == 1u);
+            CHECK(io.mem_flat_saddr == 0x7Du && io.mem_flat_saddr_off);
+        }
+        // gfx10_asm_flat.s:266  global_atomic_fcmpswap v5, v[1:2], v[2:3], off
+        // offset:-1 glc -> 0xDCF98FFF 0x057D0201: vdst 5, vaddr 1, vdata 2, saddr off.
+        {
+            const uint32_t w[] = {0xDCF98FFFu, 0x057D0201u};
+            const sc_instruction_operands io = sc_decode_instruction(w, 2u);
+            CHECK(io.format == sc_isa_format::flat);
+            CHECK(io.mem_flat_vdst == 5u && io.mem_flat_vaddr == 1u && io.mem_flat_vdata == 2u);
+            CHECK(io.mem_flat_saddr_off);
+        }
+    }
+    {
+        // gfx10_asm_exp.s: exp mrtz, v0, v0, v0, v0 - the target is bits 7:4 and
+        // varies per row, so `exp` has no opcode field: an operand, not an opcode.
+        // (MIMG operand words are asserted above through sc_decode_instruction, and
+        // the walker itself steps MIMG using the measured 2 + dim length.)
+        CHECK(!sc_isa_decode_word(0xF800008Fu).opcode_known);
+    }
+}
 int main(int argc, char** argv) {
     const std::string out_dir = (argc > 1) ? argv[1] : "out/shader_tests";
     std::printf("ScarlettCompat shader pipeline - Phase 4 (RDNA2 instruction decode)\n");
@@ -570,6 +721,7 @@ int main(int argc, char** argv) {
     test_walk_cases();
     test_region_and_seam();
     test_json();
+    test_memory_operands();
 
     std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

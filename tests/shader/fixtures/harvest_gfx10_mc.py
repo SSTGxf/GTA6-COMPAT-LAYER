@@ -45,9 +45,20 @@ RAW_CANDIDATES = [
 OUT = os.path.join(HERE, "gfx10_mc_fixtures.tsv")
 
 # // <PREFIX>: <instruction text> ; encoding: [0x..,...]
-ENC_INLINE = re.compile(r"^//\s*([A-Za-z0-9_-]+):\s*(.+?)\s*;\s*encoding:\s*\[([^\]]*)\]\s*$")
+# The image tests use `;` for their assertions instead of `//`.
+ENC_INLINE = re.compile(r"^(?://|;)\s*([A-Za-z0-9_-]+):\s*(.+?)\s*;\s*encoding:\s*\[([^\]]*)\]\s*$")
 # // <PREFIX>: encoding: [0x..,...]   or   // <PREFIX>: [0x..,...]
-ENC_ONLY = re.compile(r"^//\s*([A-Za-z0-9_-]+):\s*(?:encoding:\s*)?\[([^\]]*)\]\s*$")
+ENC_ONLY = re.compile(r"^(?://|;)\s*([A-Za-z0-9_-]+):\s*(?:encoding:\s*)?\[([^\]]*)\]\s*$")
+
+
+def prefix_allowed(label):
+    """Only gfx10 encodings: `GCN` is shared across targets, `GFX10*` covers
+    gfx1010..gfx1030. A file may also carry `GFX11:` lines for the same source
+    (gfx10-constant-bus.s does), and those encode different opcodes, so they are
+    dropped rather than mixed into the RDNA1/2 set."""
+    if label.startswith("GFX") and not label.startswith("GFX10"):
+        return False
+    return True
 
 
 def to_words(raw_field):
@@ -72,12 +83,13 @@ def harvest(path, kind):
             stripped = line.strip()
             if not stripped:
                 continue
-            if not stripped.startswith("//"):
-                if stripped.startswith("v_") or stripped.startswith("s_"):
+            if not (stripped.startswith("//") or stripped.startswith(";")):
+                if stripped.startswith(("v_", "s_", "image_", "buffer_", "ds_", "global_", "flat_", "scratch_",
+                                       "exp", "s_", "tbuffer_", "buffer_")):
                     pending = stripped
                 continue
             inline = ENC_INLINE.match(stripped)
-            if inline and "ERR" not in inline.group(1):
+            if inline and "ERR" not in inline.group(1) and prefix_allowed(inline.group(1)):
                 words = to_words(inline.group(3))
                 if words:
                     fixtures.append({
@@ -90,7 +102,7 @@ def harvest(path, kind):
                 pending = None
                 continue
             only = ENC_ONLY.match(stripped)
-            if only and "ERR" not in only.group(1):
+            if only and "ERR" not in only.group(1) and prefix_allowed(only.group(1)):
                 words = to_words(only.group(2))
                 if words and pending:
                     fixtures.append({
@@ -109,9 +121,14 @@ def main():
     if raw is None:
         sys.exit("raw LLVM tests missing; expected one of:\n  " + "\n  ".join(RAW_CANDIDATES))
 
-    names = sorted(n for n in os.listdir(raw) if n.startswith("gfx10_asm_") and n.endswith(".s"))
+    # Every gfx10 MC asm test, not just the gfx10_asm_* ones: ds/flat/exp/mimg/
+    # mubuf/smem live in gfx10_asm_*.s, while constant-bus, vop2be-literal,
+    # gfx1013 and the target-specific files use their own names. Only rows that
+    # actually carry an `encoding:` line are harvested, so the *_err and
+    # *_unsupported files contribute nothing where llvm-mc rejects the input.
+    names = sorted(n for n in os.listdir(raw) if n.startswith("gfx10") and n.endswith(".s"))
     if not names:
-        sys.exit("no raw gfx10_asm_*.s files found in " + raw)
+        sys.exit("no raw gfx10*.s files found in " + raw)
 
     rows = []
     seen = set()
@@ -121,7 +138,15 @@ def main():
         path = os.path.join(raw, name)
         digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
         hashes.append((name, digest))
-        kind = name[len("gfx10_asm_"):-len(".s")]
+        kind = name[:-len(".s")]
+        if kind.startswith("gfx10_asm_"):
+            kind = kind[len("gfx10_asm_"):]
+        elif kind.startswith("gfx10-"):
+            kind = kind[len("gfx10-"):]
+        elif kind.startswith("gfx10_"):
+            kind = kind[len("gfx10_"):]
+        elif kind.startswith("gfx10"):
+            kind = kind[len("gfx10"):]
         for fixture in harvest(path, kind):
             key = (tuple(fixture["words"]), fixture["text"])
             if key in seen:
@@ -139,7 +164,7 @@ def main():
 
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write("# ScarlettCompat GFX10 MC conformance fixtures -- GENERATED, do not edit.\n")
-        f.write("# Harvested from llvm/test/MC/AMDGPU/gfx10_asm_*.s (Apache-2.0 WITH LLVM-exception).\n")
+        f.write("# Harvested from llvm/test/MC/AMDGPU/gfx10*.s (Apache-2.0 WITH LLVM-exception).\n")
         f.write("# SYNTHETIC ground truth: llvm-mc output for RDNA1, not captured game data.\n")
         f.write("# Columns: source <TAB> line <TAB> family <TAB> text <TAB> dwords (0x........, space separated)\n")
         f.write("# fixtures=%d duplicates=%d\n" % (len(rows), duplicates))

@@ -113,7 +113,9 @@ struct sc_isa_instruction {
     sc_isa_terminator terminator = sc_isa_terminator::none;
     uint16_t opcode = 0;   // valid only when opcode_known
     bool opcode_known = false;
-    uint32_t dwords[2] = {0, 0}; // both words of a 64-bit form (literal value not kept)
+    uint32_t dwords[8] = {0, 0}; // both words of every 64-bit form; MIMG adds up to dim extra dwords
+    uint32_t literal_value = 0;  // the literal dword when extra == literal (dword 1
+                                 // for 32-bit forms, dword 2 for VOP3)
 
     bool is_terminator() const { return terminator != sc_isa_terminator::none; }
 };

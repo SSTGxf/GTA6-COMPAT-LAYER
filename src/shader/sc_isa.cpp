@@ -304,21 +304,68 @@ sc_isa_instruction sc_isa_decode_word(uint32_t word) {
             inst.opcode = static_cast<uint16_t>((word >> 16) & 0x3ffu);
             inst.opcode_known = true;
             break;
-        case 0x36u: inst.format = sc_isa_format::ds; inst.words = 2; break;
-        case 0x37u: inst.format = sc_isa_format::flat; inst.words = 2; break;
-        case 0x38u: inst.format = sc_isa_format::mubuf; inst.words = 2; break;
+        // The memory formats' opcode fields were located by measurement over the
+        // harvested gfx10 MC fixtures: for each family, the bit range that maps
+        // every printed mnemonic to exactly one value (and that is the narrowest
+        // such range). Each mnemonic appears with many different operands, so a
+        // stable value across those rows is evidence about the field, not a
+        // coincidence of one encoding.
+        //   ds     bits 25:18  154 mnemonics -> 154 distinct values
+        //   flat   bits 24:18   88 mnemonics ->  46 distinct values (the
+        //                       flat_/global_/scratch_ spellings of one opcode)
+        //   mubuf  bits 25:18   60 mnemonics ->  60 distinct values
+        //   mimg   bits 24:18   88 mnemonics ->  79 distinct values (image_* and
+        //                       image_msaa_* share an opcode)
+        //   smem   bits 25:18   68 mnemonics ->  68 distinct values
+        // Only the field position is claimed; the operand fields of these formats
+        // are still undecoded and counted as such by the conformance harness.
+        case 0x36u:
+            inst.format = sc_isa_format::ds;
+            inst.words = 2;
+            inst.opcode = static_cast<uint16_t>((word >> 18) & 0xffu);
+            inst.opcode_known = true;
+            break;
+        case 0x37u:
+            inst.format = sc_isa_format::flat;
+            inst.words = 2;
+            inst.opcode = static_cast<uint16_t>((word >> 18) & 0x7fu);
+            inst.opcode_known = true;
+            break;
+        case 0x38u:
+            inst.format = sc_isa_format::mubuf;
+            inst.words = 2;
+            inst.opcode = static_cast<uint16_t>((word >> 18) & 0xffu);
+            inst.opcode_known = true;
+            break;
         case 0x3Au: inst.format = sc_isa_format::mtbuf; inst.words = 2; break;
         case 0x3Cu:
             // 64-bit base plus one dword per extra non-sequential address
-            // component. The count is in the instruction's nsa field, whose bit
-            // position is not verified here, and in the image opcode's address
-            // count, which this module does not table. Length is therefore not
-            // determined from the word alone.
+            // component. Measured, not tabled: on all 232 text-bearing GFX10 MIMG
+            // fixture rows the field at bits 2:1 (dim) equals that extra count
+            // exactly - 0 -> 2 dwords, 1 -> 3 dwords, 2 -> 4 dwords - with no value
+            // splitting across lengths (tests/shader/fixtures/mimg_length.py).
             inst.format = sc_isa_format::mimg;
-            inst.words = 0;
+            inst.words = 2 + ((word >> 1) & 0x3u);
+            // Opcode: bits 24:18 (79 distinct values for 88 mnemonics, see above).
+            inst.opcode = static_cast<uint16_t>((word >> 18) & 0x7fu);
+            inst.opcode_known = true;
             break;
-        case 0x3Du: inst.format = sc_isa_format::smem; inst.words = 2; break;
-        case 0x3Eu: inst.format = sc_isa_format::exp; inst.words = 2; break;
+        case 0x3Du:
+            inst.format = sc_isa_format::smem;
+            inst.words = 2;
+            inst.opcode = static_cast<uint16_t>((word >> 18) & 0xffu);
+            inst.opcode_known = true;
+            break;
+        case 0x3Eu:
+            inst.format = sc_isa_format::exp;
+            inst.words = 2;
+            // EXP's four low bits carry the render-target selector (mrt0..mrt7 =
+            // 0..7, mrtz = 8, null = 9 in bits 7:4, measured over the 8 rows that
+            // print a named target). That is an *operand*, not an opcode: the same
+            // mnemonic `exp` covers every target, so exposing it here would make
+            // the harness's one-opcode-per-mnemonic check fail by construction.
+            // It stays out of `opcode` and is reported as an open item instead.
+            break;
         default:
             inst.format = sc_isa_format::unknown;
             inst.words = 0;
@@ -435,8 +482,8 @@ sc_isa_walk sc_isa_walk_stream(const void* code, size_t size) {
         "as two instructions: the bytes cannot distinguish it from `instruction; s_nop 0`, and both end at the "
         "same offset");
     walk.open_questions.push_back(
-        "MIMG is not stepped: its NSA address count is in a field whose bit position is unverified, so a "
-        "length here would be a guess");
+        "MIMG is stepped as 2 dwords plus its dim field (bits 2:1), measured on the fixture rows; an image "
+        "form whose dim code disagrees with its printed address count would break that length");
 
     if (code == nullptr || size == 0) {
         walk.stop = sc_isa_stop::empty;
@@ -472,17 +519,6 @@ sc_isa_walk sc_isa_walk_stream(const void* code, size_t size) {
                                     " has no GFX10 encoding field; stopped instead of guessing a length");
             break;
         }
-        if (inst.format == sc_isa_format::mimg) {
-            walk.stop = sc_isa_stop::mimg_unsupported;
-            walk.stop_offset = offset;
-            walk.stop_dword = word;
-            walk.evidence.push_back("inferred: word " + hex8(word) + " at byte " + std::to_string(offset) +
-                                    " is MIMG; stopping here rather than assuming an NSA address count");
-            walk.evidence.push_back("inferred: MIMG length is 2 dwords plus one per extra non-sequential address "
-                                    "component; the count's bit position is unverified, and real address dwords "
-                                    "(small VGPR numbers) decode as VOP2, so a length search would not be conclusive");
-            break;
-        }
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(inst.words) * 4ull > size) {
             walk.stop = sc_isa_stop::truncated;
             walk.stop_offset = offset;
@@ -492,7 +528,9 @@ sc_isa_walk sc_isa_walk_stream(const void* code, size_t size) {
                                     " words but the region ends first; the region bound or the encoding is wrong");
             break;
         }
-        if (inst.words == 2) {
+        if (inst.words >= 2) {
+            // The operand word is dword 1 on every multi-dword form, including the
+            // 3- and 4-dword MIMG shapes sized from their dim field.
             inst.dwords[1] = rd32(p + offset + 4);
         }
         const uint32_t total_words = sc_isa_length(inst, inst.dwords[1]);
@@ -510,6 +548,8 @@ sc_isa_walk sc_isa_walk_stream(const void* code, size_t size) {
         }
         if (inst.extra == sc_isa_extra::literal) {
             ++walk.literal_words;
+            // The literal dword is dword 1 on the 32-bit forms and dword 2 on VOP3.
+            inst.literal_value = (inst.words == 3) ? rd32(p + offset + 8) : inst.dwords[1];
         }
 
         const bool is_terminator = inst.is_terminator();

@@ -61,7 +61,7 @@ std::vector<uint8_t> u32s(std::initializer_list<uint32_t> values) {
 
 // ------------------------------------------------------------ operand fields
 void test_operand_fields() {
-    banner("9-bit source field: SGPR 0..105, VGPR 256+n, 0xFF literal");
+    banner("9-bit source field: SGPR 0..105, VGPR 256+n, 0xFF literal, inline constants");
 
     struct field_case {
         const char* label;
@@ -77,7 +77,8 @@ void test_operand_fields() {
         {"v2", 258, sc_operand_file::vgpr, 2, "v2"},
         {"v255", 511, sc_operand_file::vgpr, 255, "v255"},
         {"literal", 0xFF, sc_operand_file::literal, 0, "literal"},
-        {"0xC8 (beyond SGPRs, not transcribed)", 0xC8, sc_operand_file::unclassified, 0, "field:0xc8"},
+        {"0xC8 (inline constant -8)", 0xC8, sc_operand_file::constant, 0, "-8"},
+        {"109 (no fixture shows this field)", 109, sc_operand_file::unclassified, 0, "field:0x6d"},
     };
     for (const auto& c : cases) {
         const sc_operand op = sc_operand_from_src9(c.field);
@@ -120,8 +121,9 @@ void test_instruction_operands() {
         {"v_mov_b32 v1, v2", 0x7E020302u, sc_isa_format::vop1, "v1", "v2", "-"},
         // v_cvt_f32_i32_e32 v1, v2 (vop1.s): src0 = 258 -> v2
         {"v_cvt_f32_i32 v1, v2", 0x7E020B02u, sc_isa_format::vop1, "v1", "v2", "-"},
-        // v_mov_b32_sdwa: the low byte is a modifier selector, not a register.
-        {"v_mov_b32_sdwa v0, s105", 0x7E0002F9u, sc_isa_format::vop1, "v0", "-", "-"},
+        // v_mov_b32_sdwa: the low byte of the source field is a marker (0xF9); the
+        // register itself sits in the modifier dword (0x00861669 -> s105).
+        {"v_mov_b32_sdwa v0, s105", 0x7E0002F9u, sc_isa_format::vop1, "v0", "s105", "-"},
     };
     for (const auto& c : cases) {
         const std::vector<uint8_t> bytes =
@@ -164,12 +166,15 @@ void test_instruction_operands() {
 void test_paired_widths() {
     banner("paired-register widths: documented/verified forms only, rest unknown");
 
-    // Scalar field classification first: exec (126) and null (125) are not SGPRs
-    // this module names, so they stay unclassified rather than becoming "s126".
+    // Scalar field classification first: exec (126) is one of the special registers
+    // the fixtures print by name, while null (125) is not, so null stays
+    // unclassified rather than becoming "s125".
     CHECK(sc_operand_from_ssrc8(102).file == sc_operand_file::sgpr);
     CHECK(sc_operand_from_ssrc8(102).index == 102);
     CHECK(sc_operand_from_ssrc8(125).file == sc_operand_file::unclassified);
-    CHECK(sc_operand_from_ssrc8(126).file == sc_operand_file::unclassified);
+    CHECK(sc_operand_from_ssrc8(126).file == sc_operand_file::special);
+    CHECK(sc_operand_from_ssrc8(126).special == 126);
+    CHECK(sc_operand_name(sc_operand_from_ssrc8(126)) == "exec_lo");
     CHECK(sc_operand_from_ssrc8(0xFF).file == sc_operand_file::literal);
 
     struct width_case {
@@ -226,17 +231,17 @@ void test_paired_widths() {
                     sc_operand_width_name(io.src0.width));
     }
 
-    // exec as a destination: the field is understood, the register is not named,
-    // so no width is claimed for it while the source pair still is.
+    // exec as a destination: the field names the measured special register, but the
+    // printed pair form (`exec`) carries no decoded width, so none is claimed.
     {
         const std::vector<uint8_t> bytes = u32s({0xBEFE0402u, 0xBF810000u}); // s_mov_b64 exec, s[2:3]
         const sc_wave_decode d = sc_decode_wave(sc_isa_walk_stream(bytes.data(), bytes.size()));
-        CHECK(d.instructions[0].vdst.file == sc_operand_file::unclassified);
+        CHECK(d.instructions[0].vdst.file == sc_operand_file::special);
         CHECK(d.instructions[0].vdst.width == sc_operand_width::unknown);
         CHECK(d.instructions[0].src0.file == sc_operand_file::sgpr);
         CHECK(d.instructions[0].src0.index == 2);
         CHECK(d.instructions[0].src0.width == sc_operand_width::b64);
-        std::printf("   s_mov_b64 exec, s[2:3]            dst=unclassified/unknown src0=s2/b64\n");
+        std::printf("   s_mov_b64 exec, s[2:3]            dst=exec_lo/unknown src0=s2/b64\n");
     }
 
     // An inline constant on the 64-bit side gets no register width either.
@@ -246,9 +251,11 @@ void test_paired_widths() {
         const sc_wave_decode d = sc_decode_wave(sc_isa_walk_stream(bytes.data(), bytes.size()));
         CHECK(d.instructions[0].vdst.width == sc_operand_width::b64);
         CHECK(d.instructions[0].vdst.index == 222);
-        CHECK(d.instructions[0].src0.file == sc_operand_file::unclassified);
+        // 0xF2 (242) is the inline constant 1.0 (240..247 are the float half).
+        CHECK(d.instructions[0].src0.file == sc_operand_file::constant);
+        CHECK(d.instructions[0].src0.constant == 1.0);
         CHECK(d.instructions[0].src0.width == sc_operand_width::unknown);
-        std::printf("   v_cvt_f64_i32 v[222:223], 1.0     dst=v222/b64 src0=field:0xf2/unknown\n");
+        std::printf("   v_cvt_f64_i32 v[222:223], 1.0     dst=v222/b64 src0=1.0/unknown\n");
     }
 }
 
@@ -265,9 +272,11 @@ void test_census() {
     const sc_isa_walk w = sc_isa_walk_stream(bytes.data(), bytes.size());
     CHECK(w.synced);
     const sc_wave_decode d = sc_decode_wave(w);
-    CHECK(d.census.instructions == 3);
-    CHECK(d.census.sgpr_refs == 1);
-    // v0 (vdst), v1 (vdst), v2 (src0), v0 (sdwa vdst) -- the sdwa src0 is a modifier, not a register
+    // s_endpgm is a carried SOPP form, so the stream reports four instructions.
+    CHECK(d.census.instructions == 4);
+    // s105 from v_mov_b32 and s105 from the sdwa source field.
+    CHECK(d.census.sgpr_refs == 2);
+    // v0 (vdst), v1 (vdst), v2 (src0), v0 (sdwa vdst)
     CHECK(d.census.vgpr_refs == 4);
     CHECK(d.census.literal_refs == 0);
     CHECK(d.census.unclassified_refs == 0);
@@ -277,10 +286,13 @@ void test_census() {
     // here is width-unknown -- and the census says so instead of assuming 32-bit.
     CHECK(d.census.b32_refs == 0);
     CHECK(d.census.b64_refs == 0);
-    CHECK(d.census.width_unknown_refs == 5);
-    std::printf("   instructions=%u sgpr=%u vgpr=%u literal=%u unclassified=%u max_sgpr=%u max_vgpr=%u\n",
+    // v0/s105, v1/v2, the sdwa v0/s105: six operands, none of them tabulated.
+    CHECK(d.census.width_unknown_refs == 6);
+    std::printf("   instructions=%u sgpr=%u vgpr=%u literal=%u unclassified=%u max_sgpr=%u max_vgpr=%u"
+                "   width: b32=%u b64=%u unknown=%u\n",
                 d.census.instructions, d.census.sgpr_refs, d.census.vgpr_refs, d.census.literal_refs,
-                d.census.unclassified_refs, d.census.max_sgpr, d.census.max_vgpr);
+                d.census.unclassified_refs, d.census.max_sgpr, d.census.max_vgpr, d.census.b32_refs,
+                d.census.b64_refs, d.census.width_unknown_refs);
 }
 
 // ---------------------------------------------------------------- wave facts
@@ -344,7 +356,8 @@ void test_seam() {
     const sc_isa_walk w = sc_isa_walk_region(blob.data(), blob.size(), r.begin, r.end);
     CHECK(w.synced);
     const sc_wave_decode d = sc_decode_wave(w, 64, 64);
-    CHECK(d.census.instructions == 2);
+    // Two v_mov_b32, the SOPP word and s_endpgm: every instruction in the region.
+    CHECK(d.census.instructions == 4);
     CHECK(d.census.sgpr_refs == 1);
     CHECK(d.census.vgpr_refs == 3); // v0, v1, v2
     CHECK(!d.wave.wave_size_known);
