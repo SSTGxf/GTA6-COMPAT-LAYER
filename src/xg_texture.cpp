@@ -82,6 +82,17 @@ const uint32_t kGuest3DTileMode = 5;
 // mode 5), which is also the table every offset the guest sees through
 // the XG texture computer is computed from.
 const uint32_t kGuest4KBTileMode = 2;
+// Mode 0: the guest's base console tag, and the game's own data says it is
+// 64 KB tiles. Evidence: ttpf-viewer-reference (read-only), src/archive.rs
+// line 343 reads GTA's texture-table tile-mode nibble as
+//   `tile mode 0 = 64 KB tiles; 1-3 (and 9-12 on cube maps) = 4 KB tiles`
+// and picks Tile::T64K when that nibble is 0. Its src/tile.rs 64 KB bit
+// patterns, checked per element size against decoded textures, give exactly
+// this engine's 64 KiB geometry (1 byte 256x256, 2 256x128, 4 128x128,
+// 8 128x64, 16 64x64), so the tile shape is not a new number. Storage order
+// and the mip tail are the same Gfx10 chain already used for 0x102
+// (src/layout.rs), with max_in_tail 12 for 64 KB tiles instead of 8.
+const uint32_t kGuest64KTileMode = 0;
 const uint32_t kLayoutConsoleBit = 0x100;
 
 struct Layout {
@@ -130,7 +141,7 @@ static bool Readable(const void* p, uint64_t n) { return ProbedSpan(p, n, false)
 
 static bool TileGeometry(uint32_t bpe, uint32_t mode, uint32_t* tileW,
                          uint32_t* tileH, uint64_t* tileBytes) {
-    if (mode == kOwnTileMode) {
+    if (mode == kOwnTileMode || mode == kGuest64KTileMode) {
         *tileBytes = kTileBytes;
         switch (bpe) {
         case 1: *tileW = 256; *tileH = 256; return true;
@@ -164,7 +175,7 @@ static bool ValidLayout(uint32_t layout) {
     // clean rejection rather than an invented size.
     const uint32_t mode = layout & ~kLayoutConsoleBit;
     return mode == kOwnTileMode || mode == kGuest3DTileMode ||
-           mode == kGuest4KBTileMode;
+           mode == kGuest4KBTileMode || mode == kGuest64KTileMode;
 }
 
 // ---- layout 0x102: the Gfx10 4 KiB chain --------------------------------
@@ -201,8 +212,9 @@ static bool ValidLayout(uint32_t layout) {
 // Returns the tail level index (== mips when there is no tail), or UINT32_MAX
 // when it set an error status on *out.
 static uint32_t Build4KChain(const DescView& d, uint32_t tileW, uint32_t tileH,
-                             uint64_t tileBytes, ScXgLayoutInfo* out) {
-    const uint32_t kMaxTail = 8;  // layout.rs: max_in_tail for 4 KiB tiles
+                             uint64_t tileBytes, uint32_t maxInTail,
+                             ScXgLayoutInfo* out) {
+    const uint32_t kMaxTail = maxInTail;  // layout.rs: 8 (4 KiB), 12 (64 KiB)
     const uint32_t mips = d.mips;
     const uint32_t bpe = out->bpe;
     auto LevelW = [&](uint32_t i) {
@@ -365,7 +377,7 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
         return;
     }
     if (!linear && !is3D && mode != kOwnTileMode &&
-        mode != kGuest4KBTileMode) {
+        mode != kGuest4KBTileMode && mode != kGuest64KTileMode) {
         out->status = SC_XG_UNSUPPORTED_LAYOUT;
         return;
     }
@@ -397,21 +409,27 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
     out->slices = d.depthOrArray;
     out->baseAlign = tileBytes;
 
-    // Layout 0x102 is the console's 4 KiB Gfx10 chain, and the only mode whose
-    // storage order and mip tail are documented (see Build4KChain). The 4 KiB
-    // tile mode the guest tags 3D textures with (mode 5) keeps the established
-    // slab model that cleared boot #86 - it has no such evidence.
-    if (!linear && mode == kGuest4KBTileMode) {
-        const uint32_t tail = Build4KChain(d, tileW, tileH, tileBytes, out);
+    // 0x102 (4 KiB) and 0x100 (64 KiB, mode 0) are the console's Gfx10
+    // chains: the viewer that decodes this game's console textures walks both
+    // with one chain function that differs only in max_in_tail (see
+    // Build4KChain). The 4 KiB tile mode the guest tags 3D textures with
+    // (mode 5) keeps the established slab model that cleared boot #86 - it
+    // has no such evidence.
+    if (!linear && (mode == kGuest4KBTileMode || mode == kGuest64KTileMode)) {
+        const bool is64k = mode == kGuest64KTileMode;
+        const uint32_t tail = Build4KChain(d, tileW, tileH, tileBytes,
+                                           is64k ? 12 : 8, out);
         if (tail == UINT32_MAX) return;
-        static volatile LONG n4k = 0;
-        const LONG call = InterlockedIncrement(&n4k);
-        if (call <= 4 || (call % 64) == 0) {
+        static volatile LONG nchain = 0;
+        const LONG call = InterlockedIncrement(&nchain);
+        if (call <= 8 || (call % 64) == 0) {
             Log("xg",
-                "layout 0x102 (4KiB chain): %llux%u mips=%u tail=%s "
-                "tile=%ux%u slabs=%u size=%llu align=%llu - order+tail from "
-                "the Gfx10 reference; open: array-slice base, intra-tile "
-                "element order",
+                "layout 0x%x (%s chain): %llux%u mips=%u tail=%s "
+                "tile=%ux%u slabs=%u size=%llu align=%llu - console chain "
+                "(0x100 = 64 KB tiles from the game's texture metadata, "
+                "0x102 = 4 KiB); order+tail from the Gfx10 reference; open: "
+                "array-slice base, intra-tile element order",
+                (unsigned)d.layout, is64k ? "64KiB" : "4KiB",
                 (unsigned long long)d.width, (unsigned)d.height,
                 (unsigned)d.mips, tail < d.mips ? "shared-tile" : "none",
                 (unsigned)tileW, (unsigned)tileH, (unsigned)out->tileCount,
