@@ -732,14 +732,26 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+    static uint64_t g_gateSum = 0;
+    uint8_t hb[8] = {};
+    __try {
+        const uint8_t* q = (const uint8_t*)buf;
+        for (int i = 0; i < 8; ++i) hb[i] = q[i];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
     char fc[5] = {(char)(fourcc >> 24), (char)(fourcc >> 16),
                   (char)(fourcc >> 8), (char)fourcc, 0};
     Log("loader",
         "gate-probe %s tid=%lu obj=%p buf=%p size=%u flag=%u fourcc='%s' "
-        "(0x%08x) beLen=0x%x a5=%p a6=%p status=%s%u ret=%d al=%u",
+        "(0x%08x) beLen=0x%x a5=%p a6=%p status=%s%u ret=%d al=%u "
+        "head8=%02x%02x%02x%02x%02x%02x%02x%02x sumPrev=0x%llx sumNow=0x%llx",
         tag, (unsigned long)GetCurrentThreadId(), obj, buf, size, flag, fc,
         fourcc, blen, a5, a6, statusOk ? "" : "?", status, (int)ret,
-        (unsigned)al);
+        (unsigned)al,
+        hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7],
+        (unsigned long long)g_gateSum,
+        (unsigned long long)(g_gateSum + size));
+    g_gateSum += size;
 }
 
 // Walk the chunk stream the way the gate frames it (BE fourcc + BE length) and

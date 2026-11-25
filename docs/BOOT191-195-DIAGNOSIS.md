@@ -997,3 +997,27 @@ touch the gate). Measured: two stop kinds on effectively the same source.
 Open: `0x144FC21F5`'s `PAGE_NOACCESS` producer on region base `0x19b77849000`
 (size `0x3247000`) is still unnamed. #217's dump was deleted without archiving; from
 here every dump is copied to `D:\scarlett-dumps` before any delete.
+
+## §28 Boots #220/#221: deterministic size vs beLen mismatch
+
+Two boots of `build_ga220` (`BUILD_EXIT=0`, `B1 result: 149 checks, 0 failed -> PASS`,
+`=== verify exit code: 0 ===`), same binary:
+
+```
+#220 veh: exception 0x80000003 at 00000001409DFC18 thread 27192
+#221 veh: exception 0x80000003 at 00000001409DFC18 (different thread)
+size=9168400 flag=0 fourcc='PSIN' (0x5053494e) beLen=0x3340c0 head8=5053494e003340c0
+     status=?4294967295 ret=0   (identical in both boots)
+```
+
+`head8` proves the buffer starts with `PSIN` and its declared BE length is
+`0x3340c0` = 3,358,912, while the gate is handed `size = 0x8be2d0` = 9,168,400.
+The extent is 5,809,488 bytes longer than the stream's own length. `ret=0`.
+
+So (a) the 9,168,400-byte full-stream call IS reached, twice per boot; (b) the
+mismatch is between the extent and the declared stream length, not a
+not-yet-copied page set; (c) the stop is deterministic on this tree.
+
+Next step: decide which number is wrong in the producer (over-extended extent /
+page rounding / pack attribution, versus truncated stream header) and make the
+extent equal the declared length. No fix landed.
