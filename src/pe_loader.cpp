@@ -2985,6 +2985,62 @@ void* ScGuestGaViewBlock() {
 // pointer may be null. The answers decide the boot #13 fix: a count of
 // 0 means no mount was ever registered before pack-init; a non-empty
 // registry with no "packroot" entry means the wrong mounts registered.
+// Boot #283: diagnostics must never fault. They run inside the VEH handler,
+// where a fault is a NESTED exception during exception dispatch and SEH cannot
+// absorb it - the process dies in the probe instead of the guest. Boot #282
+// proved it: the "host callback" crash was ScarlettCompat.dll+0x9376 (reading
+// vtable slots) and +0x642e (reading a stream-context field). Validate every
+// range with VirtualQuery before touching guest memory.
+static bool ScProbeReadable(const void* p, size_t n) {
+    if (!p || !n) return false;
+    const uintptr_t a = (uintptr_t)p, end = a + n;
+    if (end < a) return false;
+    uintptr_t cur = a;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery((LPCVOID)cur, &mbi, sizeof(mbi)) != sizeof(mbi))
+            return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        const DWORD prot = mbi.Protect & 0xff;
+        if (prot != PAGE_READONLY && prot != PAGE_READWRITE &&
+            prot != PAGE_WRITECOPY && prot != PAGE_EXECUTE_READ &&
+            prot != PAGE_EXECUTE_READWRITE && prot != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const uintptr_t rEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (rEnd <= cur) return false;
+        cur = rEnd;
+    }
+    return true;
+}
+
+// Boot #282: the boot now dies in HOST code (0x7FFE99C791D1) with a corrupted
+// `this`, so the first question is which module owns that address and at what
+// RVA - the layer's own DLL, a system DLL, or a guest structure that a host
+// pointer was written into. Resolve it instead of inferring from the range.
+static void ScLogHostAddr(const char* tag, uint64_t addr) {
+    char name[260] = "?";
+    uint64_t base = 0;
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)(uintptr_t)addr, &mod) &&
+        mod) {
+        wchar_t full[MAX_PATH] = {0};
+        if (GetModuleFileNameW(mod, full, MAX_PATH)) {
+            const wchar_t* leaf = full;
+            for (const wchar_t* p = full; *p; ++p)
+                if (*p == L'\\') leaf = p + 1;
+            WideCharToMultiByte(CP_UTF8, 0, leaf, -1, name, sizeof(name),
+                                nullptr, nullptr);
+        }
+        base = (uint64_t)(uintptr_t)mod;
+    }
+    Log("loader", "%s addr=0x%llx module=%s base=0x%llx rva=0x%llx", tag,
+        (unsigned long long)addr, name, (unsigned long long)base,
+        (unsigned long long)(addr - base));
+}
+
 static void LogMountProbe() {
     uint8_t* base = (uint8_t*)g_guestBaseForVeh;
     if (!base) {
@@ -3112,6 +3168,10 @@ static void LogMountProbe() {
                     "mount-probe: defObj=%p vtable=%p slot28=%p "
                     "slot168=%p",
                     defObj, defVt, slot28, slot168);
+                ScLogHostAddr("mount-probe slot168",
+                              (uint64_t)(uintptr_t)slot168);
+                ScLogHostAddr("mount-probe defVt",
+                              (uint64_t)(uintptr_t)defVt);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("loader", "mount-probe: tls=<unreadable>");
@@ -3430,23 +3490,25 @@ static void LogStreamContextProbe(EXCEPTION_POINTERS* ep) {
     uint64_t ctx = (uint64_t)ep->ContextRecord->Rsi;
     uint64_t sub = (uint64_t)ep->ContextRecord->Rcx;
     uint64_t magic = 0, reg = 0;
-    __try {
-        reg = *(uint64_t*)(base + 0x79F6D70);
-        magic = ctx ? *(uint64_t*)ctx : 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (ScProbeReadable((const void*)(base + 0x79F6D70), 8))
+        reg = *(const uint64_t*)(base + 0x79F6D70);
+    if (!ScProbeReadable((const void*)(uintptr_t)ctx, 0x70)) {
         Log("loader", "ctx-probe: ctx=0x%llx <unreadable>",
             (unsigned long long)ctx);
         return;
     }
+    magic = *(const uint64_t*)(uintptr_t)ctx;
     Log("loader",
         "ctx-probe: fault=%p rsi(ctx)=0x%llx rcx(sub-object)=0x%llx "
         "magic=0x%llx registered=0x%llx",
         ep->ExceptionRecord->ExceptionAddress, (unsigned long long)ctx,
         (unsigned long long)sub, (unsigned long long)magic,
         (unsigned long long)reg);
+    ScLogHostAddr("ctx-probe fault-module",
+                  (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress);
     if (magic != 0x6D736473ull)
         return;
-    __try {
+    {
         uint32_t v08 = *(uint32_t*)(ctx + 0x08);
         uint32_t v0c = *(uint32_t*)(ctx + 0x0C);
         uint64_t v10 = *(uint64_t*)(ctx + 0x10);
@@ -3470,9 +3532,6 @@ static void LogStreamContextProbe(EXCEPTION_POINTERS* ep) {
         // backend field was never populated.
         Log("loader", "ctx-probe: fault-kind=%s",
             v18 ? "sub-object-present" : "sub-object-null");
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("loader", "ctx-probe: ctx=0x%llx fields=<unreadable>",
-            (unsigned long long)ctx);
     }
 }
 
@@ -3484,6 +3543,43 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     // Catch both so the mount probe + dump fire at the AV too — the
     // 0x80000003-only gate is why boot #25 produced no probe.
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Boot #284: the boot now stops on a guest int3 at 0x1422106E0, which is
+    // the bare abort thunk (`cc`, `c3`) that follows the previous function. The
+    // call site 0x14221964D is `lock; call qword ptr [rax+0x30]; unlock`, so an
+    // object's vtable slot 6 holds that thunk: a virtual dispatch on an object
+    // whose vtable is not the class the caller expects. Name the object, its
+    // vtable and the first slots once, bounded, with validated reads only.
+    static volatile LONG g_int3Logged = 0;
+    if (code == 0x80000003 &&
+        !(g_dispVa && (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress ==
+                          g_dispVa) &&
+        InterlockedExchange(&g_int3Logged, 1) == 0) {
+        CONTEXT* c = ep->ContextRecord;
+        Log("loader",
+            "int3: rip=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
+            "rsi=0x%llx rdi=0x%llx r8=0x%llx rsp=0x%llx",
+            (unsigned long long)c->Rip, (unsigned long long)c->Rax,
+            (unsigned long long)c->Rbx, (unsigned long long)c->Rcx,
+            (unsigned long long)c->Rdx, (unsigned long long)c->Rsi,
+            (unsigned long long)c->Rdi, (unsigned long long)c->R8,
+            (unsigned long long)c->Rsp);
+        for (int k = 0; k < 2; ++k) {
+            const uint64_t o = k ? (uint64_t)c->Rcx : (uint64_t)c->Rbx;
+            if (!ScProbeReadable((const void*)(uintptr_t)o, 0x20)) continue;
+            const uint64_t vt = *(const uint64_t*)(uintptr_t)o;
+            Log("loader", "int3 obj[%d]=0x%llx vt=0x%llx", k,
+                (unsigned long long)o, (unsigned long long)vt);
+            if (!ScProbeReadable((const void*)(uintptr_t)vt, 0x48)) continue;
+            const uint64_t* v = (const uint64_t*)(uintptr_t)vt;
+            Log("loader",
+                "int3 vt slots: %llx %llx %llx %llx %llx %llx %llx %llx %llx",
+                (unsigned long long)v[0], (unsigned long long)v[1],
+                (unsigned long long)v[2], (unsigned long long)v[3],
+                (unsigned long long)v[4], (unsigned long long)v[5],
+                (unsigned long long)v[6], (unsigned long long)v[7],
+                (unsigned long long)v[8]);
+        }
+    }
     // Dispatch probe trap: emulate `mov eax,[rdx+0x90]`, log the status
     // word, and continue. Every other int3 keeps the crash handling.
     if (code == 0x80000003 && g_dispVa &&
@@ -3494,10 +3590,9 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
         const uint64_t obj = (uint64_t)c->Rdx;
         uint64_t id = 0;
         bool ok = false;
-        __try {
+        if (ScProbeReadable((const void*)(uintptr_t)(obj + 0x90), 4)) {
             id = *(const uint32_t*)(uintptr_t)(obj + 0x90);
             ok = true;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
         if (ok) {
             g_dispLastId = (LONG64)id;
@@ -3520,14 +3615,17 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
             uint64_t hdr[16] = {};
             uint64_t vt[8] = {};
             uint64_t vtp = 0, ret = 0;
-            __try {
+            if (ScProbeReadable(
+                    (const void*)(uintptr_t)((uint64_t)c->Rsp + 0x68), 8))
                 ret = *(const uint64_t*)(uintptr_t)((uint64_t)c->Rsp + 0x68);
+            if (ScProbeReadable((const void*)(uintptr_t)obj, sizeof(hdr))) {
                 const uint64_t* q = (const uint64_t*)(uintptr_t)obj;
                 for (int i = 0; i < 16; ++i) hdr[i] = q[i];
                 vtp = hdr[0];
+            }
+            if (ScProbeReadable((const void*)(uintptr_t)vtp, sizeof(vt))) {
                 const uint64_t* v = (const uint64_t*)(uintptr_t)vtp;
                 for (int i = 0; i < 8; ++i) vt[i] = v[i];
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
             }
             Log("loader",
                 "dispatch-probe caller ret=0x%llx (rva 0x%llx) vtable=0x%llx",
@@ -3587,6 +3685,10 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
             q ? (unsigned long)mbi.Protect : 0ul,
             q ? (unsigned long long)(uintptr_t)mbi.BaseAddress : 0ull,
             q ? (unsigned long long)mbi.RegionSize : 0ull);
+        if (ep->ContextRecord->Rip >= 0x7ff000000000ull)
+            ScLogHostAddr("veh: av host", ep->ContextRecord->Rip);
+        if (fa >= 0x7ff000000000ull)
+            ScLogHostAddr("veh: av fault", fa);
         // Guest-reserved arenas are committed lazily. The guest reserves a large
         // VA range and touches it without an explicit commit, so commit the single
         // 64 KiB page containing the touched address and retry the instruction.

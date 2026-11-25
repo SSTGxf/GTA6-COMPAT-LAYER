@@ -637,3 +637,73 @@ stack carries `rd=0x6d726f6674616c70` at the host callback as well.
 The animation clip-set path is a pack asset, so this reading is consistent with the starvation above
 being the producer of the corrupted pointers rather than an unrelated bug. Boots after #280 decide
 whether the corruption persists once the pages are actually delivered.
+
+## 2026-11-25 (boots #282-#284): the "host callback" stop was our own probe
+
+Boot #282 resolved the crash address for the first time (`veh: av host ... module=ScarlettCompat.dll
+base=0x7ffe99c70000 rva=0x9376`). Disassembling the built DLL at those RVAs identified them as our
+own diagnostics, not guest code:
+
+```
+; ScarlettCompat.dll+0x9376 - the dispatch probe's vtable-slot copy
+0x18000936b: 4863c3   movsxd rax, ebx
+0x18000936e: 488d0cc5 lea    rcx, [rax*8]
+0x180009376: 488b0439 mov    rax, qword ptr [rcx + rdi]   <== fault
+; ScarlettCompat.dll+0x642e - LogStreamContextProbe's context field
+0x18000642c: 7405     je     0x180006433
+0x18000642e: 488b37   mov    rsi, qword ptr [rdi]         <== fault
+```
+
+Both probes dereferenced guest pointers **inside the VEH handler**, where a fault is a nested
+exception during exception dispatch and `__try/__except` cannot absorb it. So the boot was dying in
+the instrumentation ("host callback receiving a corrupted `this`"), not in the game.
+
+Fix (`src/pe_loader.cpp`): `ScProbeReadable()` validates a range with `VirtualQuery` (committed, not
+`PAGE_NOACCESS`/`PAGE_GUARD`, readable protection) before any read, and every probe read in the VEH
+path uses it. Boot #283, built from the edited tree (gate green):
+
+```
+=== our-dll faults: 0
+loader    ] guest crashed (veh-breakpoint): exception 0x80000003 at 00000001422106E0 ...
+```
+
+### The new stop is a guest virtual dispatch into an abort thunk
+
+Boot #284 dumps the int3 context, bounded and validated:
+
+```
+loader    ] int3: rip=0x1422106e0 rax=0x1462fc060 rbx=0x1471c1560 rcx=0x1471c1560 rdx=0xfffffffccf2c0a00 rsi=0x4 rdi=0xfffffffccf2c0a00 r8=0x4 rsp=0x42357fde68
+loader    ] int3 obj[0]=0x1471c1560 vt=0x1462fc060
+loader    ] int3 vt slots: 14004b940 141bf4790 144de7f20 140139780 142219bb0 14005a0f0 142219be0 142219bf0 14221a820
+```
+
+Decoded:
+
+```
+0x142219620: lea  r14, [rip + 0x4fa4fa8]     ; guard
+0x14221963c: call 0x140004b40                ; enter
+0x142219641: mov  rax, [rbx]                 ; vtable
+0x14221964d: call qword ptr [rax + 0x30]     ; slot 6, return addr 0x142219650 (int3 padding)
+0x142219be0: jmp  0x1422106e0                ; slot 6 is a tail thunk
+0x1422106e0: cc ; c3                        ; the abort stub itself (int3; ret)
+```
+
+`0x1471c1560` is the object recorded as `[view[0]+0x13a8]` in every crash TLS line, i.e. a
+subsystem singleton hung off the game block, and its class vtable `0x1462fc060` deliberately
+declares slot 6 as pure (`jmp` to the abort stub), with slot 7 returning a static
+(`0x142219bf0: lea rax,[rip+0x4ad44c1]`). The dispatch happens immediately after the 9,168,400-byte
+audio member is handed to the gate:
+
+```
+loader    ] gate-frame size=9168400 end=9168400 lgid=0x8be59c lrsc=0x8be5a4 chks=0x8be5fc framed-ok
+loader    ] bufProbe preCall buf=0x18a99802410 size=9168400 first8=c04033004e495350 last8=0 tail@9168284=80000004449474c nonzeroChunks=35/35
+loader    ] int3: rip=0x1422106e0 ...
+```
+
+No name string exists near the vtable in the image (`0x62fc060` and `0x6cee0b8` are both bare), so
+the class cannot be named from the binary alone; the arguments (`rdx=0xfffffffccf2c0a00`, `r8=4`)
+are a sign-extended 32-bit value, not a pointer.
+
+**Milestone status: not reached.** The boot still ends at this abort stub; there is no present,
+frame or menu line in boots #283/#284. The stop is guest-internal and cannot be skipped without
+leaving the subsystem uninitialised (explicitly out of scope).
