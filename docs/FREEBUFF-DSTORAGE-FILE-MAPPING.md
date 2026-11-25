@@ -379,3 +379,120 @@ bytes=768`. Committed as `docs/arena_fc2100.bin` with its decode in
 Build: BUILD_EXIT=0, 149 checks 0 failed PASS, verify exit 0. The slice file was produced
 (768 bytes), so the code region around the fault is now readable on disk rather than inferred;
 the fix for the bad pointer at `rip=0x144fc21f5` (access `0x1e954ab78c5`) is not yet applied.
+
+## 2026-11-25 (boot #272): 0x144fc21f5 decoded — the fault was our own lazy-commit round-down
+
+`docs/arena-0x144fc21f5.asm` is no longer a one-line decode. The slice base is mid-stream
+(byte 0 is `e9`, a jmp whose rel32 target `0x1229c4bed` is not guest code), so the listing now
+walks **function boundaries**: every run of `0xCC` padding starts a new function, and each
+function is decoded from that boundary. The walk from `0x144fc21f0` contains the fault:
+
+```
+0x144fc21d0: 4883ec28            sub   rsp, 0x28
+0x144fc21d4: e817000000          call  0x144fc21f0
+0x144fc21d9: 8d04c0              lea   eax, [rax + rax*8]   <-- the recorded stack[0]
+0x144fc21dc: 89c1                mov   ecx, eax
+0x144fc21de: c1e90b              shr   ecx, 0xb
+0x144fc21e1: 31c1                xor   ecx, eax
+0x144fc21e3: 89c8                mov   eax, ecx
+0x144fc21e5: c1e00f              shl   eax, 0xf
+0x144fc21e8: 01c8                add   eax, ecx
+0x144fc21ea: 4883c428            add   rsp, 0x28
+0x144fc21ee: c3                  ret
+0x144fc21f0: 4885c9              test  rcx, rcx
+0x144fc21f3: 7477                je    0x144fc226c
+0x144fc21f5: 440fb601            movzx r8d, byte ptr [rcx]     <-- FAULT
+```
+
+- **Faulting instruction**: `0x144fc21f5  movzx r8d, byte ptr [rcx]` — a one-byte **read**.
+- **Operand**: `[rcx]`; **`rcx` held `0x1e954ab78c5`** (the exception's `ExceptionInformation[1]`,
+  logged as `access=0x1e954ab78c5`).
+- The `0x144fc21d9` in `stack=[...]` is exactly the return address pushed by `call 0x144fc21f0`
+  at `0x144fc21d4`, so the frame is confirmed rather than inferred.
+- The routine is the Xbox name hash: skip `0x22` (`"`), byte table at `0x15f01a0`,
+  `h = h*0x401 + table[c]`, `h ^= h >> 6`, finalised by `*9 / ^(>>11) / <<15`. So `rcx` is a
+  **guest path string**, not a derived code pointer.
+
+### Cause: `fa & ~0xFFFF` left the reservation
+
+Boot #270 logged, in order:
+
+```
+veh: av rip=0x144fc21f5 tid=24856 faultAddr=0x1e9c5b10494 read=1 vq=48 state=0x2000 protect=0x0 base=0x1e9c5b10000 regionsize=0x3965d0000
+veh: lazy-commit page=000001E9C5B10000 ... -> 000001E9C5B10000 (err 0)
+veh: av rip=0x144fc21f5 ... faultAddr=0x1e9fddaa7cc ... base=0x1e9fddaa000 regionsize=0x35e336000
+veh: lazy-commit page=000001E9FDDA0000 ... -> 000001E9FDDA0000 (err 0)
+veh: av rip=0x144fc21f5 ... faultAddr=0x1e954ab78c5 ... base=0x1e954ab7000 regionsize=0x19a000
+veh: lazy-commit page=000001E954AB0000 in reserved region base=000001E954AB7000 size=0x19a000 -> 0000000000000000 (err 87)
+```
+
+`state=0x2000` is `MEM_RESERVE`: the guest's arenas are reserved-only and committed lazily as it
+touches them. The first two regions happened to start 64 KiB-aligned, so `fa & ~0xFFFF` stayed
+inside them and the commit succeeded. The third reservation starts at the 4 KiB-only address
+`0x1e954ab7000`, so `0x1e954ab78c5 & ~0xFFFF = 0x1e954ab0000` fell **below** the reservation:
+`MEM_COMMIT` there is not inside any reservation, returned NULL with `ERROR_INVALID_ADDRESS`
+(err 87), the AV was never resolved, and the retry killed the guest. The pointer was never bad —
+the commit was aimed outside the arena it was meant to populate.
+
+### Fix
+
+`src/pe_loader.cpp` (VEH, `MEM_RESERVE` read branch) now clamps the commit to the queried
+reservation instead of trusting the 64 KiB round-down:
+
+```
+resBase = mbi.BaseAddress; resEnd = resBase + mbi.RegionSize
+page  = fa & ~(pageSize-1)                  // system page, always inside
+wide  = fa & ~0xFFFF                        // keep the 64 KiB guest-page intent
+if (wide >= resBase && wide < resEnd) page = wide
+if (page < resBase) page = resBase
+want  = min(0x10000, resEnd - page)
+```
+
+Same behaviour for aligned arenas (the measured common case), correct for unaligned ones.
+
+### Verified: boot #274 (`docs/bootlogs/boot274.log`)
+
+Boot #272 was **not** a verification of this fix: `F:\ScarlettCompat\src` is a separate build
+tree and the clamp had not been copied into it, so #272 ran the old DLL. Its clean pass through
+0x144fc21f5 was path/timing, not the clamp (the same old binary also crashed there on #270). The
+chain that actually tests the fix:
+
+- `cp <repo>/src/pe_loader.cpp F:\ScarlettCompat\src\pe_loader.cpp` (diff was exactly the VEH
+  clamp plus the crash-stack16 probe, 49 lines)
+- build: `BUILD_RC=0`, `B1 result: 149 checks, 0 failed -> PASS`, `=== verify exit code: 0 ===`.
+  (One build after the copy printed `guest_proof FAILED`; running that suite directly,
+  `scarlett_verify.exe F:\ScarlettCompat\out\guest_proof.exe 120000`, gives `RC=0`,
+  `proof stages: 17/17 pass`, `60 frames ok ... present 60/60`, so the batch failure was
+  transient and the clean re-run of `build.bat` is the gate quoted above.)
+- boot #274, same binary as that build:
+  - `grep -c "rip=0x144fc21f5"` → **0**, `grep -c "lazy-commit"` → **0**
+  - `[dstorage  ] Submit[138] raw copy REFUSED (extent does not frame): hash 0x307c02cc9eb90000 offset=0x106939510 compSize=58896 pack=D:\game\game\packs.rpf`
+  - `[loader    ] gate-frame size=9168400 end=9168400 lgid=0x8be59c lrsc=0x8be5a4 chks=0x8be5fc framed-ok`
+  - `[loader    ] boot57-arena: G=2c80ae09040 Gsize=808000 arg0=3840 arg1=2160 arg2=28 loopcount=2`
+    (a 3840x2160 swapchain — the title is configuring a 4K present, not a test pattern)
+
+### New frontier (not fixed): the NULL singleton at 0x145a99c66
+
+```
+loader    ] veh: av rip=0x145a99c66 tid=20928 faultAddr=0x8 read=1 vq=48 state=0x10000 protect=0x1 base=0x0 regionsize=0x1c700000
+loader    ] crash-record code=0xc0000005 addr=0x145a99c66 rip=0x145a99c66 rsp=0xfa958fe390 stack=[0x0,0x0,0x8080808080808080,0x474cb064a] access=0x8
+loader    ] crash-stack16 rc=0x0 rd=0x51c000000001 2d43f0f9df0 2d43caa3d80 0 142bd0148 1f 2d43caa3d80 0 2d43caa3d80 f8 0 f8 1427578f3 4 1471c1560 2d43c90e7e0 14677cfaa 145a99c66
+```
+
+`0x145a99c66` is `cmp qword ptr [rcx + 8], 0` (RVA `0x5a99c66`) with `rcx = 0`. `0x142bd0148` in the
+recorded stack is the return address after `call 0x145a99c60`, which places the frame in the wrapper
+at `0x142bd0120`:
+
+```
+0x142bd0126: e8e5b5f102      call 0x145aeb710
+0x142bd012b: 488b3576f90005  mov  rsi, qword ptr [rip + 0x500f976]   ; -> 0x147bdfaa8 (NULL)
+0x142bd0134: e8b7422f03      call 0x145ec43f0
+0x142bd0139: 4889f1          mov  rcx, rsi
+0x142bd013c: 488935a539fa07  mov  qword ptr [rip + 0x7fa39a5], rsi
+0x142bd0143: e8189bec02      call 0x145a99c60                        ; cmp [rcx+8],0 with rcx=0
+```
+
+A strict decode of every rip-relative reference to `0x147bdfaa8` in `.text` leaves exactly two:
+the read above and a 16-byte clear, `vmovups xmmword ptr [rip + 0x504e0bb], xmm6` at `0x142b919e5`
+(target `0x147bdfaa8`). So the global is populated by a path that did not run on #274 — the next
+step is naming and satisfying that creator, not the swapchain or the hash routine.

@@ -2523,12 +2523,17 @@ static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* where) {
     if (ep && ep->ExceptionRecord) {
         const EXCEPTION_RECORD* er = ep->ExceptionRecord;
         uint64_t ip = 0, sp = 0, st0 = 0, st1 = 0, st2 = 0, st3 = 0;
+        uint64_t more[16] = {};  // bounded deeper stack, plain C (no unwinding)
         if (ep->ContextRecord) {
             ip = (uint64_t)ep->ContextRecord->Rip;
             sp = (uint64_t)ep->ContextRecord->Rsp;
             __try {
                 const uint64_t* st = (const uint64_t*)(uintptr_t)sp;
                 st0 = st[0]; st1 = st[1]; st2 = st[2]; st3 = st[3];
+                // Boot #272's stop (0x145a99c66, rcx=0) is one frame above the
+                // guest wrapper; four qwords end before any caller return
+                // address, so the next sixteen are recorded to name the caller.
+                for (int i = 0; i < 16; ++i) more[i] = st[4 + i];
             } __except (EXCEPTION_EXECUTE_HANDLER) {
             }
         }
@@ -2542,6 +2547,21 @@ static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* where) {
             (unsigned long long)st2, (unsigned long long)st3,
             (unsigned long long)(er->NumberParameters > 1
                                      ? (uint64_t)er->ExceptionInformation[1] : 0));
+        Log("loader",
+            "crash-stack16 rc=0x%llx rd=0x%llx %llx %llx %llx %llx %llx %llx "
+            "%llx %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx",
+            (unsigned long long)(ep->ContextRecord
+                                     ? (uint64_t)ep->ContextRecord->Rcx : 0),
+            (unsigned long long)(ep->ContextRecord
+                                     ? (uint64_t)ep->ContextRecord->Rdx : 0),
+            (unsigned long long)more[0], (unsigned long long)more[1],
+            (unsigned long long)more[2], (unsigned long long)more[3],
+            (unsigned long long)more[4], (unsigned long long)more[5],
+            (unsigned long long)more[6], (unsigned long long)more[7],
+            (unsigned long long)more[8], (unsigned long long)more[9],
+            (unsigned long long)more[10], (unsigned long long)more[11],
+            (unsigned long long)more[12], (unsigned long long)more[13],
+            (unsigned long long)more[14], (unsigned long long)more[15]);
     }
     BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
                                 hFile, MiniDumpNormal, &mei,
@@ -3427,10 +3447,29 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
         // 64 KiB page containing the touched address and retry the instruction.
         // Scoped to MEM_RESERVE regions only: committed pages, our own mappings and
         // every other fault keep their existing handling.
+        // Boot #270 (0x144fc21f5, read of 0x1e954ab78c5): the 64 KiB round-down
+        // was applied to the fault address, but the reservation itself started
+        // at a 4 KiB-only address (base=0x1e954ab7000, regionsize=0x19a000), so
+        // fa & ~0xFFFF = 0x1e954ab0000 fell BELOW the reservation and the commit
+        // returned NULL (err 87). The AV was therefore never resolved and the
+        // guest died on the retry. Keep the 64 KiB intent (guest pages are
+        // 64 KiB), but never leave the queried reservation: clamp both the base
+        // and the length to [mbi.BaseAddress, mbi.BaseAddress + RegionSize).
         if (q && mbi.State == MEM_RESERVE &&
             ep->ExceptionRecord->ExceptionInformation[0] == 0) {
-            void* page = (void*)(uintptr_t)(fa & ~(uint64_t)0xFFFF);
-            void* c = VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE);
+            SYSTEM_INFO si = {};
+            GetSystemInfo(&si);
+            const uintptr_t pageSize = (uintptr_t)si.dwPageSize;
+            const uintptr_t resBase = (uintptr_t)mbi.BaseAddress;
+            const uintptr_t resEnd = resBase + (uintptr_t)mbi.RegionSize;
+            uintptr_t page = fa & ~(uintptr_t)(pageSize - 1);
+            uintptr_t wide = fa & ~(uintptr_t)0xFFFF;
+            if (wide >= resBase && wide < resEnd) page = wide;
+            if (page < resBase) page = resBase;
+            SIZE_T want = 0x10000;
+            if (page + want > resEnd) want = (SIZE_T)(resEnd - page);
+            void* c = VirtualAlloc((void*)page, want, MEM_COMMIT,
+                                  PAGE_READWRITE);
             Log("loader",
                 "veh: lazy-commit page=%p in reserved region base=%p size=0x%llx "
                 "-> %p (err %lu)",
