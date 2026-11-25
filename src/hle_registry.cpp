@@ -4879,6 +4879,8 @@ extern "C" HRESULT HleScOptDStorageReadFileBatch(const char* path,
                                                  uint32_t count,
                                                  uint8_t** datas,
                                                  uint32_t* bytesRead) {
+    Log("io", "io packreadbatch path=%s count=%llu", path ? path : "(null)",
+        (unsigned long long)count);
     return ScOpt_DStorageReadFileBatch(path, offsets, sizes, count, datas,
                                        bytesRead);
 }
