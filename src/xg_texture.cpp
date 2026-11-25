@@ -71,6 +71,17 @@ const uint64_t kTileBytes = 65536;
 const uint64_t kTileBytesMode5 = 4096;
 const uint32_t kOwnTileMode = 1;
 const uint32_t kGuest3DTileMode = 5;
+// Mode 2: the 2D 4 KiB swizzle the guest asks for with layout 0x102.
+// Evidence for the 4 KiB granularity is guest-side (0x140344113 sets
+// desc.Alignment = 0x1000 before slot 25 and 0x14034414D requires the
+// returned Alignment to be exactly 0x1000 for its small-resource path;
+// 0x140344190 then int3s when the size's high dword is non-zero). No
+// tile width/height table for this mode exists in the guest image, and
+// the GDK page that documents it is NDA-gated, so the shape is not a new
+// number: it reuses this engine's existing 4 KiB table (the one built for
+// mode 5), which is also the table every offset the guest sees through
+// the XG texture computer is computed from.
+const uint32_t kGuest4KBTileMode = 2;
 const uint32_t kLayoutConsoleBit = 0x100;
 
 struct Layout {
@@ -130,7 +141,7 @@ static bool TileGeometry(uint32_t bpe, uint32_t mode, uint32_t* tileW,
         default: return false;
         }
     }
-    if (mode == kGuest3DTileMode) {
+    if (mode == kGuest3DTileMode || mode == kGuest4KBTileMode) {
         *tileBytes = kTileBytesMode5;
         switch (bpe) {
         case 1: *tileW = 64; *tileH = 64; return true;   // 4096 texels x 1
@@ -152,7 +163,8 @@ static bool ValidLayout(uint32_t layout) {
     // Only the modes this layer models are accepted; any other mode is a
     // clean rejection rather than an invented size.
     const uint32_t mode = layout & ~kLayoutConsoleBit;
-    return mode == kOwnTileMode || mode == kGuest3DTileMode;
+    return mode == kOwnTileMode || mode == kGuest3DTileMode ||
+           mode == kGuest4KBTileMode;
 }
 
 // Build the layout for a descriptor. Fills *out completely in every case.
@@ -240,7 +252,8 @@ static void BuildLayout(const DescView& d, ScXgLayoutInfo* out) {
         out->status = SC_XG_UNSUPPORTED_LAYOUT;
         return;
     }
-    if (!linear && !is3D && mode != kOwnTileMode) {
+    if (!linear && !is3D && mode != kOwnTileMode &&
+        mode != kGuest4KBTileMode) {
         out->status = SC_XG_UNSUPPORTED_LAYOUT;
         return;
     }
