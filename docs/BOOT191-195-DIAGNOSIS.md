@@ -1162,3 +1162,38 @@ call varies per boot and no boot in the window wrote `tail32`.
 
 Constraints held throughout: no gate tolerance, assert byte, stream/pack byte or
 verification constant changed.
+
+## §35 Boot #230: tail32 captured — the stream does not end in CHKS
+
+Boot loop (`build_ga228` binary, tail32 instrument), per-boot counts:
+
+```
+229  size=9168400: 0   tail32: 0
+230  size=9168400: 3   tail32: 2
+```
+
+Captured bytes (last 32 of the 9,168,400-byte buffer, twice identical):
+
+```
+tail32 18000000 01000000 04080000 ffffffff 00000000 41000000 00030000 c8020000
+```
+
+Last four bytes are `c8 02 00 00` (= 0x2c8), **not** `43 48 4b 53` (`CHKS`).
+
+Our own walk for the same call:
+
+```
+walk size=9168400 framedEnd=9168284 ip=0000022ECD3C0770 ...
+```
+
+`framedEnd = 9,168,284 = size - 116`: the walk accounts for all but the final 116
+bytes and then returns 0. So the buffer is not a stream that terminates in `CHKS`
+within the extent handed over; 116 trailing bytes remain unparsed.
+
+Verdict from the bytes: **cause (a)/(boundary)** — the extent contains 116 bytes past
+the last chunk the walk can frame, and the tail is structured data (`0x18`, `0x10000`,
+`0x804`, `0xffffffff`, `0x41`, `0x300`, `0x2c8`) rather than a `CHKS` terminator. The
+gate's `ret=0` is therefore consistent with the bytes present; it is not a residency or
+race artefact.
+
+No gate tolerance, assert byte, stream/pack byte or verification constant changed.
