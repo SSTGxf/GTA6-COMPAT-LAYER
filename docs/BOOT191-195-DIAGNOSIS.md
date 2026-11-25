@@ -313,3 +313,59 @@ between boots (the raw-request context heuristic is order-dependent), not to a
 deterministic fix. Two consecutive boots now agree on the new stop, but the pack
 attribution should be made deterministic rather than left to the last-resolved
 pack ordering.
+
+## §9 Disassembly of the new stop: a thread with no TLS array (boots #197/#198)
+
+Fault PC `0x140004B5E`, exception `0xc0000005`, `params[0]=0` (read),
+`params[1]=0` (address 0), from `scarlett_crash_boot198.dmp`:
+
+```
+0x140004B40: push r15/r14/rsi/rdi/rbp/rbx; sub rsp,0x28
+0x140004B4C: mov  ebp, [rcx+0x1c]
+0x140004B4F: mov  rbx, [rcx]              ; lock word of the object
+0x140004B52: mov  rax, qword ptr gs:[0x58] ; TEB->ThreadLocalStoragePointer
+0x140004B5B: mov  rsi, rcx
+0x140004B5E: mov  rax, qword ptr [rax]     ; <-- FAULT, rax was 0
+0x140004B61: mov  edi, [rax+0x1454]        ; CRT per-thread field
+```
+
+Registers at the fault: `Rcx = Rsi = 0x149A62470` (the guest global object the
+caller passes with `lea rcx,[rip+...]`), `Rbx = 0xffffffff00000000` (the object's
+lock word, i.e. unlocked), `Rbp = 0x3e8`, `Rip = 0x140004B5E`. Caller frame
+`0x14185A884`, in the function at `0x14185A870`:
+
+```
+0x14185A870: push rsi; sub rsp,0x20; mov rsi,rcx
+0x14185A878: lea  rcx, [rip+0x8207bf1]   ; -> 0x149A62470
+0x14185A87F: call 0x140004B40            ; lock/enter
+0x14185A884: mov  rax, [rsi+8] ...       ; caller frame
+```
+
+So `0x140004B40` is a lock helper that, besides the object's lock word, reads the
+**current thread's TLS array** and then TLS slot 0 (`[rax]`) and a CRT field off it
+(`+0x1454`). `gs:[0x58]` is zero on this thread, i.e. the thread has **no TLS
+array at all**, which is exactly the documented loader gap: threads created
+through paths the loader does not hook never get guest TLS.
+
+Provenance of the null: it is **not** game data and not an HLE export. It is
+missing OS-thread state (`TEB->ThreadLocalStoragePointer == 0`) on a thread that
+is already executing guest code. On a console/GDK every thread that runs guest
+code has a CRT-initialised TLS array, so this is the loader's responsibility, not
+the title's.
+
+Why the obvious patch is not the fix: allocating an empty TLS array is not enough,
+because the very next access is `[rax]` — TLS **slot 0**, which the guest's CRT
+itself owns (its per-thread data). A blank array just moves the fault to
+`[0+0x1454]`. The correct fix is to run the guest CRT's per-thread initialisation
+for this thread (i.e. give it the same slot-0 block and thread id the CRT expects),
+or to stop the thread from running guest code without it — whichever the evidence
+for that specific thread shows.
+
+Next concrete step (evidence, not guess): the faulting thread id is 11868 (boot
+#197) / 27548 (boot #198); `scarlett_crash_boot198.dmp` has 64 thread contexts, so
+identify which creation path produced that thread (its stack base and the frames
+under `0x14185A870`) and initialise slot 0 for it the way the guest CRT's own
+thread wrapper does, instead of inventing a value.
+
+Status: no fix landed for this wall in this pass, and no reboot was spent —
+the two boots that agree on it are #197 and #198.
