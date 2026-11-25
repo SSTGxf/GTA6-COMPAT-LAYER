@@ -846,3 +846,32 @@ range. Everything up to 9,168,284 arrives correctly because the guest's own page
 requests happen to land inside the member.
 
 No code changed in this pass. No claim is made beyond the hex and sizes quoted.
+
+## §23 The size question answered by bytes: 9,168,400 is page-rounded, and the terminator is absent
+
+Decisive test 1 run against the archived 9,168,400-byte PSIN buffer
+(`D:\scarlett-dumps\psin_blob-195.bin`, exactly the size the gate is given):
+
+```
+len 9168400
+search for b'LGID' anywhere in the blob : []        <- none
+last 160 bytes: eac0c43f fe000000 00000000 ... 00000000   (~150 zero bytes)
+```
+
+So the buffer the gate parses contains **no LGID at all**, and its tail is
+`eac0c43f fe000000` followed by zero padding. Two conclusions follow directly:
+
+1. The full-stream buffer never contained the `LGID/LRSC/CHKS` terminator; it was
+   not clobbered into garbage, it was simply never fetched (and the region reads
+   as zeros / `0xffffffff` depending on the guard state).
+2. `9,168,400 = 139*65536 + 58896` is a **page-rounded request total**, not the
+   member's byte length. The member's real end is past what we copy; the honest
+   fix is to fetch the member's true byte range, which needs the container
+   directory (RPF9) — the same conclusion the earlier probes reached from the
+   other side.
+
+Measured: no terminator in the assembled stream; size is page-rounded. Inferred:
+the member is longer than 9,168,400 and the guest's descriptors stop short of its
+end for this variant.
+
+No code changed in this pass; nothing invented, nothing trimmed, gate untouched.
