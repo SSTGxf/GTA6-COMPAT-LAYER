@@ -912,3 +912,25 @@ process. That pointer is the value it was handed; the fix belongs where that
 pointer is produced/committed by the layer, not at the fault.
 
 No fix landed for 0x144FC21F5; one boot only; nothing forced or swallowed.
+
+## §25 0x144FC21F5: the faulting operand is mapped nowhere
+
+Dump evidence (minidump memory map, `F:\ScarlettCompat\out\scarlett_crash.dmp`
+from boot #216):
+
+```
+0x1f4f7511f24   -> unmapped (no memory range in the dump contains it)
+exception 0xc0000005 rip=0x144fc21f5 params=[0x0 (read), 0x1f4f7511f24]
+rcx = 0x1f4f7511f24  (the pointer being dereferenced)
+0x144fc21f5: movzx r8d, byte ptr [rcx]
+```
+
+So this is not a reserved-but-uncommitted region: the whole address is absent from
+the process map. Our allocation paths in `src/era_to_gdk.cpp` all request
+`MEM_RESERVE | MEM_COMMIT` (lines 288, 291, 368, 451, 539, 542), and
+`EraXMemAllocDefault` (line 122) is the default allocator entry, so the pointer did
+not come from a partially committed mapping of ours; it came from something that
+handed the guest an address this process never backs (a guest-computed pointer into
+a region we did not map, or an allocator answer we returned from a non-owning path).
+
+No fix landed. One boot (#216). Nothing swallowed, nothing forced.
