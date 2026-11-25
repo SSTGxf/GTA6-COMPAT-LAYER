@@ -5657,7 +5657,15 @@ extern "C" void DsqSubmit(void* self) {
                     (unsigned long long)destSize,
                     (unsigned long long)destSize,
                     (unsigned long long)destSize, (unsigned long)GetLastError());
+                Log("loader", "writer-enter name=ScDsRawCopy callSite=%p",
+                    _ReturnAddress());
                 memcpy((void*)dest, comp, destSize);
+                Log("loader",
+                    "writer-exit bytes=%llu dest=%llx src=%llx stop=%s",
+                    (unsigned long long)destSize,
+                    (unsigned long long)(uintptr_t)dest,
+                    (unsigned long long)(uintptr_t)comp,
+                    (destSize == compSize) ? "full-chunk" : "sized-by-caller");
                 g_dsLastResolvedPack = packPath;
                 free(comp);
                 Log("dstorage",

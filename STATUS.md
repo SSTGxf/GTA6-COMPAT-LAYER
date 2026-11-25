@@ -64,3 +64,22 @@ gate mutates nothing.
 **Fault (one sentence):** the guest offers the gate a 9,168,400-byte buffer that is mostly
 zero — 21 of 35 chunks entirely zero and the whole tail region zero — so the terminator is
 missing because the *payload was never written*, not because a length field is wrong.
+
+### Boot #263 (build_ga251): the raw-copy writer completes before the gate; it cannot fill the stream
+
+```
+writer-enter name=ScDsRawCopy callSite=00000001400E8950        (59 entries)
+writer-exit bytes=16    dest=199aae538c0 src=19c8926dd10 stop=full-chunk
+writer-exit bytes=65536 stop=full-chunk
+preCall_line=20086   last_writer_line=19572   gate offers of 9,168,400 = 67
+buf=0x2411a07ac80 size=9168400 nonzeroChunks=14/35 tail@9168284=0 last8=0
+```
+
+Ordering: the writer's last line (19572) precedes `bufProbe preCall` (20086), so the offer
+does not run ahead of the fill. Its exit sizes are 16 and 65536 — never 9,168,400 and never
+a partial tail — so `ScDsRawCopy` (call site 0x1400E8950) is excluded as the stream's
+writer. Every layer path is now excluded or shown complete: raw-copy submit (16/65536, before
+the gate), HleScOptDStorageReadFile (0 calls), batch pack read (0 calls), guest ReadFile (809
+page-granular reads outside the buffer), mapped views (verdict N).
+
+Gate outcome: no framed-ok; post-gate boots still end at the arena fault 0x144fc21f5.

@@ -162,3 +162,11 @@ See `docs/BOOT191-195-DIAGNOSIS.md` §4.
 `guestCreateFileW = 13` on the same boot: no map call, so no view overlap (verdict N).
 The 9,168,400-byte stream is assembled by the guest from page-granular reads, not mapped
 from the pack; the tail at 9,168,284 is the part never written.
+
+## 2026-11-25: ScDsRawCopy excluded as the 9,168,400-byte stream writer (boot #263)
+
+writer-enter/writer-exit lines at call site 0x1400E8950 show 59 deliveries of 16 bytes and
+some of 65536, all `stop=full-chunk`, finishing at log line 19572 — before bufProbe preCall
+at 20086. The framed buffer at 0x2411a07ac80 is therefore not written by this path; its
+payload is guest assembly, and at gate time it is still mostly zero
+(nonzeroChunks=14/35, last8=0, tail@9168284=0).
