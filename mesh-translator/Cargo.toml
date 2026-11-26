@@ -1,0 +1,11 @@
+[package]
+name = "victory-mesh"
+description = "Mesh-as-compute: meshlet tables to compute-shader vertex/index output (no host mesh shaders)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+thiserror = "2.0.21"
