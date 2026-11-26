@@ -1349,6 +1349,12 @@ static ID3D12DescriptorHeap* UnwrapXboxDescriptorHeap(void* p);
 // GameInput / DStorage factory stubs.
 static void* MakeStubComObject(const char* tag);
 
+// Forward declaration: the safe probe-write helper (defined below, in
+// the XApu section) is used by the cache-system slot implementations
+// to verify an out-param pointer is writable before filling it.
+static bool ScOutWritable(const void* p, size_t n);
+static bool ScWriteStubObject(void** ppOut, const char* tag);
+
 // The Xbox device IID the game requests
 // ({5405C344-D457-444E-B4DD-2366E45AEE39}).
 static const GUID kXboxDeviceIID = {
@@ -1452,6 +1458,251 @@ static HRESULT WINAPI XboxDevice_SlotUnimplemented(
             ScWatchRecordBackend());
     }
     return E_NOTIMPL;
+}
+
+// Slot 57 (vtable +0x1c8): cache registration. Boot #290 proved the
+// #289 S_OK-only fix was a REGRESSION: the game died at 0x14247a098
+// (null AddRef) even though slot 55 filled its out-param. Disassembly
+// of the call site (0x142477578) and the crash function (0x142479f40)
+// shows the real null source is THIS slot's out-param: a3 (r9 =
+// rsp+0xa8). After slot 57 returns S_OK the game reads [rsp+0xa8],
+// shifts it right by 1, and stores it into the new cache entry's
+// [entry+0x40]. The lookup function later doubles [entry+0x40] and
+// AddRefs it. With a3 unfilled, [entry+0x40]=0 -> the null AddRef.
+// With a3 = stub COM object pointer P (8-byte aligned), the game
+// stores P>>1 and the lookup recovers (P>>1)*2 = P, so AddRef works.
+// In boot #288 slot 57 returned E_NOTIMPL, so the game took the error
+// path (js 0x142477a07) and never read [rsp+0xa8] -- that is why #288
+// reached PSIN and #289/#290 (S_OK, unfilled a3) died here. Fill a3.
+static HRESULT WINAPI XboxDevice_Slot57(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self; (void)a1; (void)a2; (void)a4; (void)a5; (void)a6;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    bool filled = ScWriteStubObject((void**)a3, "Slot57CacheObject");
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 57 (vtable +0x1c8) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK filled=%d",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n,
+            filled ? 1 : 0);
+    }
+    return S_OK;
+}
+
+// ---- Boot #290 comprehensive fix (cache/registration system + all
+// other E_NOTIMPL device/queue/list methods the game actually calls).
+// Seth's direction: fix the whole thing in one pass, not one slot at a
+// time. The audit (boots #288/#289 logs + disassembly of every call
+// site) found the cache/registration system (binary key 0x1461e06b8)
+// spans device slots 55, 57, 62, 67 and 86, plus device slots 61, 70,
+// 81, queue slots 16/32/35, and 18 command-list slots. Boot #289
+// proved the failure mode: slot 55's out-param (a5) is read by the
+// game and returned/stored in the cache, and returning S_OK (or
+// E_NOTIMPL) without filling it leaves a NULL that the game later
+// AddRefs -> null read at 0x14247a098. So every cache-system slot
+// fills its out-param with a fresh stub COM object (MakeStubComObject:
+// real AddRef/Release, 64-slot S_OK vtable) and returns S_OK.
+// A stub object is strictly safer than NULL here; the remaining risk
+// (a real PSO for slot 86, real cache semantics) is noted in
+// SCARLETT-COMPREHENSIVE-FIX-BOOT.md.
+
+// Write a fresh stub COM object into *ppOut if ppOut is a writable
+// pointer. Returns true if written. Used by cache-system slots whose
+// out-param the game reads and stores (a NULL there becomes a null
+// AddRef crash at 0x14247a098).
+static bool ScWriteStubObject(void** ppOut, const char* tag) {
+    if (!ppOut) return false;
+    if (!ScOutWritable(ppOut, 8)) return false;
+    void* obj = MakeStubComObject(tag);
+    if (!obj) return false;
+    *ppOut = obj;
+    return true;
+}
+
+// Slot 55 (vtable +0x1b8): cache lookup. Call site 0x14247A5C8 passes
+// (rdx=rbx, r8=r14d, r9=rsp+0x50, [rsp+0x20]=key 0x1461e06b8,
+// [rsp+0x28]=rsp+0x48). After the call the game reads [rsp+0x48]
+// (a5) and returns it as the looked-up object, which it stores in the
+// cache and later AddRefs. Boot #289: E_NOTIMPL left *a5 NULL ->
+// null AddRef at 0x14247a098. Fill *a5 with a stub object, S_OK.
+static HRESULT WINAPI XboxDevice_Slot55(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self; (void)a1; (void)a2; (void)a3; (void)a4; (void)a6;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    bool filled = ScWriteStubObject((void**)a5, "Slot55CacheObject");
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 55 (vtable +0x1b8) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK filled=%d",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n,
+            filled ? 1 : 0);
+    }
+    return S_OK;
+}
+
+// Slot 61 (vtable +0x1e8): called 4x in #288 from 0x1412B981E (a thin
+// forwarding wrapper). No out-param could be determined from the call
+// site, and the game tolerates E_NOTIMPL here (it reached PSIN in
+// #288). Return S_OK, log args, write nothing.
+static HRESULT WINAPI XboxDevice_Slot61(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 61 (vtable +0x1e8) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n);
+    }
+    return S_OK;
+}
+
+// Slot 62 (vtable +0x1f0): cache lookup. Call site 0x14247FE6D passes
+// (rdx=rsp+0x40 [out-param], r8=0, r9=0, [rsp+0x20]=key,
+// [rsp+0x28]=struct). The game checks the HRESULT; a1 is an
+// uninitialised stack slot the method is expected to fill. Fill *a1
+// with a stub object, S_OK.
+static HRESULT WINAPI XboxDevice_Slot62(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self; (void)a2; (void)a3; (void)a4; (void)a6;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    // Boot #295: fill *a5 as well as *a1. Disassembly of the call site
+    // (0x14247FD30) shows a1 ([rsp+0x40]) is initialised pre-call and
+    // never read after, while a5 (&[rsi+0x120]) is the field the game
+    // caches (parallel direct-lookup path stores there; successor call
+    // 0x1402a1fb0 consumes it via [rsi+0x120]). The *a1-only fill was
+    // likely ineffective. Fill both; report each.
+    bool filled1 = ScWriteStubObject((void**)a1, "Slot62CacheObject");
+    bool filled5 = ScWriteStubObject((void**)a5, "Slot62CacheObject");
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 62 (vtable +0x1f0) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK filled1=%d filled5=%d",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n,
+            filled1 ? 1 : 0, filled5 ? 1 : 0);
+    }
+    return S_OK;
+}
+
+// Slot 67 (vtable +0x218): cache lookup. Call site 0x1424800DB passes
+// (rdx=entry, r8=key, r9=rsp+0x28 [out-param], ...). After the call
+// the game reads [rsp+0x28] (a3) and returns it if HRESULT >= 0.
+// Fill *a3 with a stub object, S_OK.
+static HRESULT WINAPI XboxDevice_Slot67(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self; (void)a1; (void)a2; (void)a4; (void)a5; (void)a6;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    bool filled = ScWriteStubObject((void**)a3, "Slot67CacheObject");
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 67 (vtable +0x218) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK filled=%d",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n,
+            filled ? 1 : 0);
+    }
+    return S_OK;
+}
+
+// Slot 70 (vtable +0x230): called 8x in #288 from 0x144ECC821 (thin
+// forwarding wrapper). No out-param could be determined from the call
+// site, and the game tolerates E_NOTIMPL here. Return S_OK, log args,
+// write nothing.
+static HRESULT WINAPI XboxDevice_Slot70(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 70 (vtable +0x230) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n);
+    }
+    return S_OK;
+}
+
+// Slot 81 (vtable +0x288): called 7x in #288 from 0x142482716
+// (a1 is an incrementing counter 2,3,4...; a2=0x11100). No out-param
+// could be determined; the game tolerates E_NOTIMPL here. Return
+// S_OK, log args, write nothing.
+static HRESULT WINAPI XboxDevice_Slot81(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    // Boot #295: fill the DWORD out-params. The game pre-writes
+    // [rsp+0x2c]=6 (a3) and checks it is non-zero after the call, then
+    // reads [rsp+0x30] (a4) and branches on it against 0x10000/0x1000.
+    // The layer filled neither. Leave a3 alone (game sets it to 6);
+    // write a defined 0 to *a4 so the branch is deterministic, and log
+    // pre/post values so the next audit can tell whether a4 is
+    // game-initialised. (Correct fill value for a4 is unknown; 0 is
+    // strictly safer than unwritten garbage.)
+    uint32_t pre3 = 0, pre4 = 0;
+    bool w3 = ScOutWritable((const void*)a3, 4);
+    bool w4 = ScOutWritable((const void*)a4, 4);
+    if (w3) pre3 = *(volatile uint32_t*)a3;
+    if (w4) pre4 = *(volatile uint32_t*)a4;
+    if (w4) *(volatile uint32_t*)a4 = 0;
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 81 (vtable +0x288) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK pre3=%u pre4=%u w3=%d w4=%d",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n, (unsigned)pre3, (unsigned)pre4, w3 ? 1 : 0, w4 ? 1 : 0);
+    }
+    return S_OK;
+}
+
+// Slot 86 (vtable +0x2b0): CreatePipelineState. Call site 0x142479A8D
+// passes (rdx=PSO desc struct, r8=key 0x1461e06b8, r9=rbp+0x658
+// [out-param for ID3D12PipelineState*]). The game expects a PSO
+// object in *a3 and stores it in the cache. A real PSO requires
+// translating the Xbox PSO desc to a desktop desc (follow-up work);
+// a stub COM object is strictly safer than NULL (the game AddRefs
+// the cached object). Fill *a3 with a stub object, S_OK.
+static HRESULT WINAPI XboxDevice_Slot86(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self; (void)a1; (void)a2; (void)a4; (void)a5; (void)a6;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    bool filled = ScWriteStubObject((void**)a3, "Slot86PsoObject");
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxdev",
+            "slot 86 (vtable +0x2b0) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK filled=%d",
+            _ReturnAddress(),
+            (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4,
+            (unsigned long long)a5, (unsigned long long)a6, (long)n,
+            filled ? 1 : 0);
+    }
+    return S_OK;
 }
 
 // Slot 26: GetCustomHeapProperties. Xbox struct-return convention with
@@ -2989,12 +3240,73 @@ static HRESULT WINAPI XboxQueue_SlotUnknown(void* self, uint64_t a1,
     return E_NOTIMPL;
 }
 
+// Queue slot 16 (vtable +0x80): Xbox-only queue method with no
+// desktop counterpart. Called 14x in #288 from 0x14248260E with an
+// incrementing counter in a2. The game tolerates E_NOTIMPL here;
+// return S_OK, log args, write nothing.
+static HRESULT WINAPI XboxQueue_Slot16(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 8 || (n % 64) == 0) {
+        Log("xboxdev",
+            "queue slot 16 (vtable +0x80) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK",
+            _ReturnAddress(), (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)a3,
+            (unsigned long long)a4, (unsigned long long)a5,
+            (unsigned long long)a6, (long)n);
+    }
+    return S_OK;
+}
+
+// Queue slot 32 (vtable +0x100): identified from call site
+// 0x1424824C7 (call *0x100). Return S_OK, log args.
+static HRESULT WINAPI XboxQueue_Slot32(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 8 || (n % 64) == 0) {
+        Log("xboxdev",
+            "queue slot 32 (vtable +0x100) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK",
+            _ReturnAddress(), (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)a3,
+            (unsigned long long)a4, (unsigned long long)a5,
+            (unsigned long long)a6, (long)n);
+    }
+    return S_OK;
+}
+
+// Queue slot 35 (vtable +0x118): identified from call sites
+// 0x14248268F and 0x1424821E3 (call *0x118). Return S_OK, log args.
+static HRESULT WINAPI XboxQueue_Slot35(
+    void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t a5, uint64_t a6) {
+    (void)self;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 8 || (n % 64) == 0) {
+        Log("xboxdev",
+            "queue slot 35 (vtable +0x118) from game %p args=%llx %llx %llx %llx %llx %llx (call #%ld) -> S_OK",
+            _ReturnAddress(), (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)a3,
+            (unsigned long long)a4, (unsigned long long)a5,
+            (unsigned long long)a6, (long)n);
+    }
+    return S_OK;
+}
+
 static void InitXboxQueueVtable() {
     if (g_xboxQueueVtableInit) return;
     for (int i = 0; i < 64; ++i)
         g_xboxQueueVtable[i] = (void*)XboxQueue_SlotUnknown;
-    g_xboxQueueVtable[16] = (void*)XboxQueue_SlotUnimplemented<16>;
+    g_xboxQueueVtable[16] = (void*)XboxQueue_Slot16;
     g_xboxQueueVtable[17] = (void*)XboxQueue_SlotUnimplemented<17>;
+    g_xboxQueueVtable[32] = (void*)XboxQueue_Slot32;
+    g_xboxQueueVtable[35] = (void*)XboxQueue_Slot35;
     g_xboxQueueVtable[0] = (void*)XboxQueue_QueryInterface;
     g_xboxQueueVtable[1] = (void*)XboxQueue_AddRef;
     g_xboxQueueVtable[2] = (void*)XboxQueue_Release;
@@ -3824,6 +4136,14 @@ static void InitXboxDeviceVtable() {
     g_xboxDeviceVtable[39] = (void*)XboxDevice_CreateQueryHeap;
     g_xboxDeviceVtable[41] = (void*)XboxDevice_CreateCommandSignature;
     g_xboxDeviceVtable[48] = (void*)XboxDevice_CreateCommandQueue;
+    g_xboxDeviceVtable[57] = (void*)XboxDevice_Slot57;
+    g_xboxDeviceVtable[55] = (void*)XboxDevice_Slot55;
+    g_xboxDeviceVtable[61] = (void*)XboxDevice_Slot61;
+    g_xboxDeviceVtable[62] = (void*)XboxDevice_Slot62;
+    g_xboxDeviceVtable[67] = (void*)XboxDevice_Slot67;
+    g_xboxDeviceVtable[70] = (void*)XboxDevice_Slot70;
+    g_xboxDeviceVtable[81] = (void*)XboxDevice_Slot81;
+    g_xboxDeviceVtable[86] = (void*)XboxDevice_Slot86;
     g_xboxDeviceVtable[73] = (void*)XboxDevice_CreateCommandList;
     g_xboxDeviceVtable[74] = (void*)XboxDevice_RegisterPagePoolX;
     g_xboxDeviceVtable[75] = (void*)XboxDevice_UnregisterPagePoolX;
@@ -3922,6 +4242,29 @@ static HRESULT WINAPI XboxList_Unimplemented(XboxCommandListWrapper* self,
         (unsigned long long)a, (unsigned long long)b,
         (unsigned long long)c);
     return E_NOTIMPL;
+}
+
+// Generic S_OK stub for Xbox command-list slots the game actually
+// calls (identified from the call sites in boot #288: slots 20, 21,
+// 22, 23, 24, 34, 36, 44, 47, 48, 50, 52, 70, 74, 75, 126, 142,
+// 146). Command-list methods are void or HRESULT-returning (they
+// record commands; they do not return objects), so S_OK is safe;
+// the game already tolerates E_NOTIMPL on these (it reached PSIN in
+// #288). Logs the slot and the first args.
+template <int Slot>
+static HRESULT WINAPI XboxList_SlotSok(XboxCommandListWrapper* self,
+                                       UINT64 a, UINT64 b, UINT64 c) {
+    (void)self; (void)a; (void)b; (void)c;
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 4 || (n % 64) == 0) {
+        Log("xboxlist",
+            "list slot %d (vtable +0x%x) from game %p a=0x%llx b=0x%llx c=0x%llx (call #%ld) -> S_OK",
+            Slot, Slot * 8, _ReturnAddress(),
+            (unsigned long long)a, (unsigned long long)b,
+            (unsigned long long)c, (long)n);
+    }
+    return S_OK;
 }
 
 // Slot 9: Close. Desktop ID3D12GraphicsCommandList slot 9 is also Close,
@@ -4105,6 +4448,31 @@ static void InitXboxCommandListVtable() {
     g_xboxCommandListVtable[131] = (void*)XboxList_Stub131;
     g_xboxCommandListVtable[132] = (void*)XboxList_Stub132;
     g_xboxCommandListVtable[139] = (void*)XboxList_Reset;
+    // Boot #290: the 18 command-list slots the game actually calls
+    // (identified from the call sites in boot #288). S_OK stubs.
+    g_xboxCommandListVtable[20] = (void*)XboxList_SlotSok<20>;
+    g_xboxCommandListVtable[21] = (void*)XboxList_SlotSok<21>;
+    g_xboxCommandListVtable[22] = (void*)XboxList_SlotSok<22>;
+    g_xboxCommandListVtable[23] = (void*)XboxList_SlotSok<23>;
+    g_xboxCommandListVtable[24] = (void*)XboxList_SlotSok<24>;
+    g_xboxCommandListVtable[34] = (void*)XboxList_SlotSok<34>;
+    g_xboxCommandListVtable[36] = (void*)XboxList_SlotSok<36>;
+    g_xboxCommandListVtable[44] = (void*)XboxList_SlotSok<44>;
+    g_xboxCommandListVtable[47] = (void*)XboxList_SlotSok<47>;
+    g_xboxCommandListVtable[48] = (void*)XboxList_SlotSok<48>;
+    g_xboxCommandListVtable[50] = (void*)XboxList_SlotSok<50>;
+    g_xboxCommandListVtable[52] = (void*)XboxList_SlotSok<52>;
+    g_xboxCommandListVtable[70] = (void*)XboxList_SlotSok<70>;
+    g_xboxCommandListVtable[74] = (void*)XboxList_SlotSok<74>;
+    g_xboxCommandListVtable[75] = (void*)XboxList_SlotSok<75>;
+    g_xboxCommandListVtable[126] = (void*)XboxList_SlotSok<126>;
+    g_xboxCommandListVtable[142] = (void*)XboxList_SlotSok<142>;
+    g_xboxCommandListVtable[146] = (void*)XboxList_SlotSok<146>;
+    // Boot #292: two more command-list slots the game calls (1,274x in
+    // #291). Slot 12 from call site 0x1400BFF06 (call [rax+0x60], args
+    // 3,1,0,0); slot 25 from call site 0x1400327BC (call [rax+0xc8]).
+    g_xboxCommandListVtable[12] = (void*)XboxList_SlotSok<12>;
+    g_xboxCommandListVtable[25] = (void*)XboxList_SlotSok<25>;
     g_xboxCommandListVtableInit = true;
 }
 
@@ -6159,10 +6527,58 @@ SC_DEFINE_SOK_STUB("ffx", ffxQuery)
 
 // xapu.dll — S_OK stubs (audio DSP / texture computer / FSR loader / audio APU).
 SC_DEFINE_SOK_STUB("xapu", XApuConnect)
-SC_DEFINE_SOK_STUB("xapu", XApuDequeueResult)
 SC_DEFINE_SOK_STUB("xapu", XApuDisconnect)
 SC_DEFINE_SOK_STUB("xapu", XApuEnqueueCommand)
-SC_DEFINE_SOK_STUB("xapu", XApuGetResultCount)
+// Boot #287: the result-queue stubs returned S_OK without touching their
+// out-params, so the guest read an uninitialised count and dispatched on it
+// (the posted argument differed every boot: 0xfffffffccf2c0a00 in #284,
+// 0xfffffffc349ed880 in #285). A stub that claims success must also report
+// "no results" instead of leaving its out-params untouched.
+static bool ScOutWritable(const void* p, size_t n) {
+    if (!p || !n) return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD | PAGE_READONLY)) return false;
+    const uintptr_t a = (uintptr_t)p;
+    const uintptr_t rEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    return a + n <= rEnd;
+}
+
+// Boot #289: XApuGetResultCount no longer zeroes its arguments.
+// The game reads the return value (eax) as the result count, so there is
+// no count out-param to zero. The old "zero all writable args" pattern
+// corrupted the work-queue table: arg `a` is the table pointer itself
+// (a writable heap allocation), so the stub wrote 0 into the table's
+// first 4 bytes. Return S_OK (count 0 = "no results") and write nothing.
+extern "C" HRESULT XApuGetResultCount(void* a, void* b, void* c, void* d) {
+    static LONG calls = 0;
+    LONG n = InterlockedIncrement(&calls);
+    if (n <= 4) {
+        Log("xapu", "XApuGetResultCount() args=%p %p %p %p -> S_OK count=0 (no write)", a, b, c, d);
+    } else if ((n % 64) == 0) {
+        Log("xapu", "XApuGetResultCount() -> S_OK count=0 (call #%ld)", (long)n);
+    }
+    return S_OK;
+}
+
+// Boot #289: XApuDequeueResult writes a valid empty result instead of a
+// bare S_OK. The game reads type (offset 0) and index (offset 4) from the
+// result buffer after the call; leaving it uninitialised lets the game
+// dispatch on garbage. Arg `a` is the handle (never touched); the result
+// buffer is among args b-d -- zero any writable one.
+extern "C" HRESULT XApuDequeueResult(void* a, void* b, void* c, void* d) {
+    (void)a; // handle -- never zeroed
+    void* args[3] = {b, c, d};
+    int zeroed = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (!ScOutWritable(args[i], 8)) continue;
+        *(uint64_t*)args[i] = 0;
+        ++zeroed;
+    }
+    Log("xapu", "XApuDequeueResult() -> S_OK zeroed=%d (empty result)", zeroed);
+    return S_OK;
+}
 
 // libHttpClient.GDK.dll — S_OK stubs (HTTP client; the game does no HTTP at boot, but the imports must resolve).
 SC_DEFINE_SOK_STUB("http", HCCleanupAsync)
@@ -7843,7 +8259,10 @@ static const Export kExports[] = {
     {"xapu.dll", "XApuEnqueueCommand", Status::kStub,
      (void*)XApuEnqueueCommand, "STUB (real-exe import, 2026-11-23)."},
     {"xapu.dll", "XApuGetResultCount", Status::kStub,
-     (void*)XApuGetResultCount, "STUB (real-exe import, 2026-11-23)."},
+     (void*)XApuGetResultCount,
+     "S_OK with zeroed writable out-params (boot #287): reporting no results "
+     "instead of leaving an uninitialised count for the caller to dispatch "
+     "on."},
 
     // libHttpClient.GDK.dll — S_OK stubs.
     {"libHttpClient.GDK.dll", "HCCleanupAsync", Status::kStub,

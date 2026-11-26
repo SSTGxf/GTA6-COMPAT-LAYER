@@ -219,6 +219,45 @@ void ApplyScarlettVtablePatch(void* base, const IMAGE_NT_HEADERS64* nt) {
         "scarlett vtable patch: slot6 0x%llx -> base stub 0x%llx "
         "(was int3 trap)",
         (unsigned long long)old, (unsigned long long)*slot);
+
+    // Fix 1 (boot #288): second vtable patch for the F abort wall
+    // (boots #283-#286). F calls vtable 0x1462fc060 slot 6, which is
+    // `jmp 0x1422106e0` (the int3 trap). Same pattern as the boot #3
+    // patch above, but for this second vtable. Fingerprint-gated:
+    //   slot 6 qword  VA 0x1462fc090 -> RVA 0x62fc090
+    //   jmp target    VA 0x142219be0 -> RVA 0x2219be0, bytes e9 fb 6a ff ff
+    //   base stub     VA 0x140004810 -> RVA 0x4810, bytes 31 c0 c3
+    const uint32_t kSlot2Rva = 0x62fc090;
+    const uint32_t kJmpRva = 0x2219be0;
+    if ((SIZE_T)kSlot2Rva + 8 <= imageSize &&
+        (SIZE_T)kJmpRva + 5 <= imageSize) {
+        uint64_t* slot2 = (uint64_t*)(img + kSlot2Rva);
+        const uint8_t* jmp = img + kJmpRva;
+        const uint64_t expectedJmp = (uint64_t)img + kJmpRva;
+        static const uint8_t kExpectedJmp[5] = {0xe9, 0xfb, 0x6a, 0xff, 0xff};
+        bool jmpOk = true;
+        for (size_t i = 0; i < 5; ++i) {
+            if (jmp[i] != kExpectedJmp[i]) { jmpOk = false; break; }
+        }
+        if (*slot2 == expectedJmp && jmpOk &&
+            stub[0] == 0x31 && stub[1] == 0xc0 && stub[2] == 0xc3) {
+            const uint64_t old2 = *slot2;
+            *slot2 = (uint64_t)img + kStubRva;
+            Log("loader",
+                "scarlett vtable patch #2: slot6 0x%llx -> base stub 0x%llx "
+                "(vtable 0x1462fc060, was jmp to int3 trap)",
+                (unsigned long long)old2, (unsigned long long)*slot2);
+        } else {
+            Log("loader",
+                "scarlett vtable patch #2: fingerprint mismatch, skipped "
+                "(slot 0x%llx, want 0x%llx; jmp bytes %02x %02x %02x %02x %02x)",
+                (unsigned long long)*slot2, (unsigned long long)expectedJmp,
+                jmp[0], jmp[1], jmp[2], jmp[3], jmp[4]);
+        }
+    } else {
+        Log("loader",
+            "scarlett vtable patch #2: out of bounds, skipped");
+    }
     // Boot #5: NOP F's own int3 so the patched slot-6 return does not
     // die inside F. Fingerprint: the byte must be 0xcc, preceded by
     // `call qword ptr [rax+0x30]` (FF 50 30) and followed by
@@ -893,6 +932,17 @@ static void ScSynthesizeFramedTail(void* b, uint32_t n) {
         t[4] = 0; t[5] = 0; t[6] = 0; t[7] = 8;
         memcpy(t + 8, "LRSC", 4);
         t[12] = 0; t[13] = 0; t[14] = 0; t[15] = 0x54;
+        // Boot #296: the LRSC payload (t+16..t+96) is left as the file's
+        // garbage bytes by the code above, but the game's fixup
+        // (0x1420acb90) memcpys it into sub+0x10 and reads the three u16
+        // counts at payload offsets 0x38/0x3a/0x3c (t+0x48/t+0x4a/t+0x4c)
+        // as loop bounds. A garbage count makes the LENM loop overrun by
+        // one (or many) entries and write a heap pointer over LSNS+0 -
+        // boot #295 proved LSNS+0 is count=1 before the parser and a heap
+        // pointer at crash time. Zero the three counts so the fixup loops
+        // do not run on garbage. This only touches the layer's own
+        // host-authored tail region; it does not synthesize game data.
+        memset(t + 0x48, 0, 6);
         memcpy(t + 96, "CHKS", 4);
         memset(t + 100, 0, 16);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1009,6 +1059,44 @@ extern "C" bool ScFramedBufferOverlaps(const void* p, size_t n) {
     return a < gb && ga < b;
 }
 
+// Boot #295: LSNS corruption probe (input-trace, 2026-11-26). Boots #291-#293
+// die at 0x14043051d because the count at [LSNS+0] (PSIN buf+0x334640) is an
+// 8-byte heap pointer, not a count, while [LSNS+8]=0x589f50 is intact and fits
+// count=1. Prime suspect: the LENM fixup loop in 0x1420acb90 overruns by one
+// entry (LENM holds 7x24-byte entries; entry 7 would write at exactly LSNS+0)
+// if the LRSC-derived count [sub+0x4a] is 8. This probe logs LSNS+0 (16 bytes)
+// and the three LRSC u16 counts (LSCH/32B, LENM/24B, 16B) before and after the
+// parser, so one boot decides whether the corruption predates parsing (fill
+// path) or is written by the parser's fixup (LENM overrun). Diagnostic only;
+// it writes nothing. Do NOT clamp the count and do NOT synthesize count=1.
+static void ScLogLsnsProbe(const void* b, const char* phase) {
+    const uint8_t* q = (const uint8_t*)b;
+    uint32_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    uint16_t c48 = 0, c4a = 0, c4c = 0;
+    __try {
+        const uint8_t* lsns = q + 0x334640;
+        d0 = *(const uint32_t*)(lsns + 0);
+        d1 = *(const uint32_t*)(lsns + 4);
+        d2 = *(const uint32_t*)(lsns + 8);
+        d3 = *(const uint32_t*)(lsns + 12);
+        // LRSC payload at buf+9168300 (chunk at 9168292 + 8 header); counts
+        // at payload offsets 0x38/0x3a/0x3c hex (=56/58/60) ->
+        // buf+9168356/9168358/9168360. (Boot #295 read the wrong bytes
+        // 9168338/9168340/9168342 - decimal 38/40/42 - and its LRSC
+        // readings are meaningless; the LSNS+0 finding stands.)
+        c48 = *(const uint16_t*)(q + 9168356);
+        c4a = *(const uint16_t*)(q + 9168358);
+        c4c = *(const uint16_t*)(q + 9168360);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    Log("loader",
+        "lsns-probe %s lsns+0=%08x %08x %08x %08x (u64=%llx) "
+        "lrsc counts lsch32=%u lenm24=%u tbl16=%u",
+        phase, d0, d1, d2, d3,
+        (unsigned long long)(((uint64_t)d1 << 32) | d0),
+        (unsigned)c48, (unsigned)c4a, (unsigned)c4c);
+}
+
 static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
                         void* a5, void* a6) {
     // Framing fix: the size the guest hands the parser is its DStorage request
@@ -1067,8 +1155,10 @@ static bool ScGateProbe(void* obj, const void* buf, uint32_t size, uint8_t flag,
             (unsigned long long)(chks < 0 ? 0xffffffffull : (uint64_t)chks), verdict);
     }
     if (size == 9168400u) ScBufProbe(buf, size, "preCall");
+    if (size == 9168400u) ScLogLsnsProbe(buf, "preCall");
     bool r = real(obj, buf, useSize, flag, a5, a6);
     if (size == 9168400u) ScBufProbe(buf, size, "postCall");
+    if (size == 9168400u) ScLogLsnsProbe(buf, "postCall");
     ScLogGate("return", obj, buf, useSize, flag, a5, a6, r, r ? 1 : 0);
     return r;
 }
@@ -1349,6 +1439,45 @@ static void PatchDispatchProbe(void* base) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("loader", "dispatch-probe: patch faulted 0x%08lx",
             GetExceptionCode());
+    }
+}
+
+// Count probe (boot #293): the crash at 0x14043051D walks a 0x8-byte-per-entry
+// array sized by a dword read from the struct P that 0x14407E600 receives in
+// rcx (P = [node+0x40], node = rsi of the caller at 0x140788C21). The int3 sits
+// on `mov rbx, rcx` at RVA 0x407E610 (3 bytes, 48 89 cb). The VEH emulates it
+// (rbx = rcx, rip += 3) and logs P, the dword at P, and the parent node, so the
+// first bad value is named at its first use. Bounded: the first 20 hits plus
+// hits whose count is at least 0x800000, capped at 300 lines.
+static uint8_t g_cntOrig[3] = {};
+static uint64_t g_cntVa = 0;
+static volatile LONG g_cntHits = 0;
+static volatile LONG g_cntLogged = 0;
+
+static void PatchCountProbe(void* base) {
+    const uint64_t rva = 0x407e610;  // mov rbx, rcx
+    __try {
+        uint8_t* p = (uint8_t*)base + rva;
+        static const uint8_t kWant[3] = {0x48, 0x89, 0xcb};
+        for (int i = 0; i < 3; ++i) {
+            if (p[i] != kWant[i]) {
+                Log("loader",
+                    "count-probe: byte %d is 0x%02x not 0x%02x; skipped",
+                    i, p[i], kWant[i]);
+                return;
+            }
+        }
+        memcpy(g_cntOrig, p, 3);
+        DWORD old = 0;
+        VirtualProtect(p, 8, PAGE_EXECUTE_READWRITE, &old);
+        p[0] = 0xCC;
+        FlushInstructionCache(GetCurrentProcess(), p, 8);
+        VirtualProtect(p, 8, old ? old : PAGE_EXECUTE_READ, &old);
+        g_cntVa = (uint64_t)(uintptr_t)p;
+        Log("loader", "count-probe armed at=0x%llx (mov rbx,rcx, int3 + emulate)",
+            (unsigned long long)g_cntVa);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader", "count-probe: patch faulted 0x%08lx", GetExceptionCode());
     }
 }
 
@@ -2507,6 +2636,7 @@ bool LoadXboxPe(const wchar_t* path, LoadedPe* out, char* err, size_t errSize) {
     PatchGaTlsReads(base, nt);
     PatchGateProbe(base);
     PatchDispatchProbe(base);
+    PatchCountProbe(base);
 
     // Final page protections: per-section (text XR, rodata R, data RW).
     // Applied AFTER relocations + imports, which write into the image.
@@ -3566,6 +3696,8 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
     if (code == 0x80000003 &&
         !(g_dispVa && (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress ==
                           g_dispVa) &&
+        !(g_cntVa && (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress ==
+                          g_cntVa) &&
         InterlockedExchange(&g_int3Logged, 1) == 0) {
         CONTEXT* c = ep->ContextRecord;
         Log("loader",
@@ -3598,13 +3730,38 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
             Log("loader", "int3 cache=%llx factory=%llx default=%llx",
                 (unsigned long long)cached, (unsigned long long)fac,
                 (unsigned long long)dflt);
-            if (fac && ScProbeReadable((const void*)(uintptr_t)fac, 8)) {
+            if (fac && ScProbeReadable((const void*)(uintptr_t)fac, 0x28)) {
                 const uint64_t fvt = *(const uint64_t*)(uintptr_t)fac;
                 uint64_t fs6 = 0;
                 if (ScProbeReadable((const void*)(uintptr_t)(fvt + 0x30), 8))
                     fs6 = *(const uint64_t*)(uintptr_t)(fvt + 0x30);
-                Log("loader", "int3 factory vt=%llx slot6=%llx",
-                    (unsigned long long)fvt, (unsigned long long)fs6);
+                // The derived slot 6 forwards to the +0x20 backend
+                // (mov rcx,[rcx+0x20]; mov rax,[rcx]; jmp [rax+0x30]).
+                // If that backend is null, selecting the derived provider
+                // would abort too, and the missing piece is the platform
+                // object the layer is supposed to supply.
+                const uint64_t sub = *(const uint64_t*)(uintptr_t)(fac + 0x20);
+                uint64_t svt = 0, ss6 = 0;
+                if (sub && ScProbeReadable((const void*)(uintptr_t)sub, 8)) {
+                    svt = *(const uint64_t*)(uintptr_t)sub;
+                    if (ScProbeReadable((const void*)(uintptr_t)(svt + 0x30), 8))
+                        ss6 = *(const uint64_t*)(uintptr_t)(svt + 0x30);
+                }
+                Log("loader", "int3 factory vt=%llx slot6=%llx sub=%llx "
+                              "subvt=%llx subs6=%llx",
+                    (unsigned long long)fvt, (unsigned long long)fs6,
+                    (unsigned long long)sub, (unsigned long long)svt,
+                    (unsigned long long)ss6);
+            }
+            {
+                const uint64_t teb = __readgsqword(0x58);
+                uint64_t gb = 0, field = 0;
+                if (teb && ScProbeReadable((const void*)(uintptr_t)teb, 8))
+                    gb = *(const uint64_t*)(uintptr_t)teb;
+                if (gb && ScProbeReadable((const void*)(uintptr_t)(gb + 0x13a8), 8))
+                    field = *(const uint64_t*)(uintptr_t)(gb + 0x13a8);
+                Log("loader", "int3 gameblock=%llx field13a8=%llx",
+                    (unsigned long long)gb, (unsigned long long)field);
             }
         }
         for (int k = 0; k < 2; ++k) {
@@ -3623,6 +3780,42 @@ static LONG CALLBACK ScarlettVehHandler(EXCEPTION_POINTERS* ep) {    if (!ep || 
                 (unsigned long long)v[6], (unsigned long long)v[7],
                 (unsigned long long)v[8]);
         }
+    }
+    // Count probe trap (see PatchCountProbe): emulate `mov rbx, rcx` and log
+    // the count struct P, the dword at P, and the parent node.
+    if (code == 0x80000003 && g_cntVa &&
+        (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress == g_cntVa) {
+        CONTEXT* c = ep->ContextRecord;
+        const LONG n = InterlockedIncrement(&g_cntHits);
+        const uint64_t P = (uint64_t)c->Rcx;
+        uint32_t cnt = 0;
+        const bool okP = ScProbeReadable((const void*)(uintptr_t)P, 8);
+        if (okP) cnt = *(const uint32_t*)(uintptr_t)P;
+        const uint64_t node = (uint64_t)c->Rsi;
+        uint64_t nodeP = 0, list = 0;
+        uint16_t kids = 0;
+        const bool okN = ScProbeReadable((const void*)(uintptr_t)node, 0x50);
+        if (okN) {
+            nodeP = *(const uint64_t*)(uintptr_t)(node + 0x40);
+            list = *(const uint64_t*)(uintptr_t)(node + 0x38);
+            kids = *(const uint16_t*)(uintptr_t)(node + 0x4c);
+        }
+        uint64_t ret = 0;
+        if (ScProbeReadable((const void*)(uintptr_t)((uint64_t)c->Rsp + 0x88), 8))
+            ret = *(const uint64_t*)(uintptr_t)((uint64_t)c->Rsp + 0x88);
+        if (InterlockedIncrement(&g_cntLogged) <= 2000) {
+            Log("loader",
+                "count-probe #%ld P=0x%llx cnt=0x%08x node=0x%llx node.P=0x%llx "
+                "match=%d kids=%u list=0x%llx ret=0x%llx (rva 0x%llx) tid=%lu",
+                n, (unsigned long long)P, cnt, (unsigned long long)node,
+                (unsigned long long)nodeP, (int)(nodeP == P), (unsigned)kids,
+                (unsigned long long)list, (unsigned long long)ret,
+                (unsigned long long)(ret - (uint64_t)(uintptr_t)g_guestBaseForVeh),
+                (unsigned long)GetCurrentThreadId());
+        }
+        c->Rbx = c->Rcx;  // mov rbx, rcx
+        c->Rip = g_cntVa + 3;
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
     // Dispatch probe trap: emulate `mov eax,[rdx+0x90]`, log the status
     // word, and continue. Every other int3 keeps the crash handling.
