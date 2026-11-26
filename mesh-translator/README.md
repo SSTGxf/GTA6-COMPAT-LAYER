@@ -33,11 +33,39 @@ signatures, dispatch, I/O, Phase 3 draw, verification).
   indices; totals 56/28, 2204/2572, 10785/13249).
 - HLSL emission verified: the generated compute shader compiles with
   `dxc -T cs_6_6` to valid DXIL.
-- The vertex interpolants (positions, texcoords) are still a zeros
-  stub in the emitted HLSL. They are a cbuffer transform of a 2D
-  attribute, not a raw vertex position — reproducing them is the DXIL
-  lift, which needs the captured CBV (the 48-byte CB0). The CBV
-  capture is in the game-client (`draw.rs`, `c{slot}d{i}.buf`).
+- **Menu interpolant lift done:** `src/interpolant.rs` + `emit_menu_hlsl()`
+  generate the menu shader's real 9-float interpolants (cbuffer transform
+  of a format-dispatched attribute, SNORM16 decode, colour byte / 255),
+  lifted from the captured DXIL. The emitted menu HLSL compiles with
+  `dxc -T cs_6_6` to valid DXIL (6,152 bytes). `cargo test` 7/7,
+  `cargo clippy --all-targets` clean. The shader takes one extra input,
+  `CBufferHeap` (t3): the 64 KiB heap cbuffer the host supplies. See
+  `MESH-INTERPOLANT-LIFT-FINDINGS.md` (in the parent docs) for the exact
+  cbuffer rows, the offset arithmetic, and the open items (heap-cbuffer
+  capture, Phase 3 wiring, world shaders).
+- The generic geometry layer (`emit_geometry_hlsl`) still writes a zeros
+  stub for the interpolants; use `emit_menu_hlsl()` for the menu shader.
+
+## Shader-translator files (`shader/`)
+
+Reference copies of the shader translator's mesh work (from
+`crates/victory-shader/src/emit/` in the game client). These are NOT
+part of the `victory-mesh` crate build — they depend on
+`victory-shader` types and are kept here as reference, not compiled
+by this crate's `Cargo.toml`.
+
+- `shader/bary.rs` — barycentrics emulation for a host without hardware
+  `SV_Barycentrics` (RX 5700 XT): the translated pixel shader reads the
+  weights as the ordinary input `BARY_SEMANTIC`, and the vertex side
+  puts out (1, 0, 0), (0, 1, 0), (0, 0, 1) at a triangle's three
+  corners. Fixes 4 refused pixel shaders and ~230 dropped draws/frame,
+  including the character's hair. (2026-11-26.)
+- `shader/mesh_compute.rs` — the general mesh-to-compute form: every mesh
+  shader is compiled as a compute shader that writes its vertices and
+  triangles into buffers, followed by an ordinary draw of those buffers.
+  Covers all mesh shaders at once (not one-at-a-time lifts). The reader
+  vertex shader (`reader_vs`) supplies the barycentric weights itself.
+  (2026-11-26.)
 
 ## Build and test
 

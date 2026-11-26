@@ -21,7 +21,10 @@
 //! values after a repack; the stored format is 7-bit.
 
 pub mod emit;
+pub mod interpolant;
 pub mod meshlet;
 
-pub use emit::emit_geometry_hlsl;
-pub use meshlet::{DrawIndexedArguments, MeshletError, MeshletRecord, MeshletTable};
+pub use emit::{emit_geometry_hlsl, emit_menu_hlsl};
+pub use meshlet::{
+    DrawIndexedArguments, MeshletError, MeshletRecord, MeshletTable, parse_table,
+};
