@@ -793,7 +793,7 @@ static void ScLogGate(const char* tag, void* obj, const void* buf,
 
 // Walk the chunk stream the way the gate frames it (BE fourcc + BE length) and
 // log the sequence once per distinct buffer, so the rejection point is named.
-static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
+static uint32_t ScLogChunkWalkUnchecked(const void* buf, uint32_t size) {
     static const void* seen[8] = {};
     bool logged = false;
     for (int i = 0; i < 8; ++i)
@@ -860,6 +860,19 @@ static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
             "n/a");
     }
     return off;
+}
+
+// This is diagnostic-only parsing of a guest-owned buffer. A malformed or
+// stale guest pointer must not turn the logging probe into the boot blocker.
+static uint32_t ScLogChunkWalk(const void* buf, uint32_t size) {
+    __try {
+        return ScLogChunkWalkUnchecked(buf, size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("loader",
+            "gate-probe walk trapped exception=0x%08lx buf=%p size=%u",
+            (unsigned long)GetExceptionCode(), buf, size);
+        return 0;
+    }
 }
 
 
